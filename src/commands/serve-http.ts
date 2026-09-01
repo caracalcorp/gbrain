@@ -19,6 +19,7 @@ import rateLimit from 'express-rate-limit';
 import { randomBytes, createHash, createHmac } from 'crypto';
 import { safeHexEqual } from '../core/timing-safe.ts';
 import { isValidRepoName } from '../core/github-source.ts';
+import { createMetricsCounters, metricsTrackingMiddleware, renderPrometheusMetrics } from './serve-http-metrics.ts';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -31,6 +32,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError, opAllowedForBoundClient } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { disabledOpsForPublishGates } from '../mcp/publish-gates.ts';
+import { GBRAIN_MCP_INSTRUCTIONS } from '../mcp/instructions.ts';
 import {
   GBrainOAuthProvider,
   validateTokenEndpointAuthMethod,
@@ -980,6 +982,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   app.use(cookieParser());
 
+  // #3893 (reimplemented from @y2688): request metrics. Mounted here, BEFORE
+  // every route — Express only applies `app.use` middleware to routes
+  // registered after it, and the original PR mounted the tracker after most
+  // routes, so they were never counted. The /metrics route itself lives
+  // below requireAdmin's definition.
+  const metricsCounters = createMetricsCounters();
+  app.use(metricsTrackingMiddleware(metricsCounters));
+
   // ---------------------------------------------------------------------------
   // CORS (v0.41.3, T7 — default-deny on every OAuth endpoint)
   // ---------------------------------------------------------------------------
@@ -1055,7 +1065,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     max: 10,
     standardHeaders: true,
     legacyHeaders: false,
-    message: 'Too many magic-link attempts. Wait a minute before trying again.',
+    // Object message → express-rate-limit serializes it as JSON, matching the
+    // other /admin routes. Neutral wording: the bucket is shared across
+    // /admin/login, /admin/api/issue-magic-link, AND /admin/auth/:token.
+    message: { error: 'rate_limited', message: 'Too many admin auth attempts. Try again shortly.' },
   });
 
   app.post('/token', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
@@ -1337,8 +1350,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   // v0.40 D15.5: safeHexEqual extracted to src/core/timing-safe.ts so the new
   // /webhooks/github HMAC verifier reuses the same constant-time compare.
-  // POST /admin/login — JSON body with token (for programmatic/UI login)
-  app.post('/admin/login', express.json(), (req, res) => {
+  // POST /admin/login — JSON body with token (for programmatic/UI login).
+  // Rate-limited (shared adminAuthRateLimiter bucket, 10/min/IP) so the
+  // bootstrap-token credential surface can't be hammered — same
+  // defense-in-depth posture as /admin/auth/:token below.
+  app.post('/admin/login', adminAuthRateLimiter, express.json(), (req, res) => {
     const token = req.body?.token;
     if (!token || typeof token !== 'string') {
       res.status(400).json({ error: 'Token required' });
@@ -1408,7 +1424,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   // POST /admin/api/issue-magic-link — agent-callable mint endpoint.
   // Auth: Authorization: Bearer <bootstrapToken>. Returns one-time nonce.
-  app.post('/admin/api/issue-magic-link', express.json(), (req: Request, res: Response) => {
+  // Rate-limited (shared adminAuthRateLimiter bucket, 10/min/IP): this route
+  // verifies the bootstrap token too, so it gets the same brute-force/DoS
+  // metering as /admin/login and /admin/auth/:token.
+  app.post('/admin/api/issue-magic-link', adminAuthRateLimiter, express.json(), (req: Request, res: Response) => {
     const auth = (req.headers.authorization || '') as string;
     const m = auth.match(/^Bearer\s+(\S+)$/i);
     if (!m) {
@@ -1485,6 +1504,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     }
     next();
   }
+
+  // #3893 (reimplemented from @y2688): Prometheus exposition. Admin-gated —
+  // request/error/latency series profile a personal brain's usage, so this
+  // is not a public surface (the original PR served it unauthenticated).
+  app.get('/metrics', requireAdmin, (_req: Request, res: Response) => {
+    res.set('Content-Type', 'text/plain; version=0.0.4');
+    res.send(renderPrometheusMetrics(metricsCounters));
+  });
 
   // ---------------------------------------------------------------------------
   // Admin API endpoints
@@ -2316,9 +2343,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // Create a fresh MCP server per request (stateless)
     const server = new Server(
       { name: 'gbrain', version: VERSION },
-      { capabilities: { tools: {} } },
+      { capabilities: { tools: {} }, instructions: GBRAIN_MCP_INSTRUCTIONS },
     );
-
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       // WP1 honest catalog: the advertised list is exactly what THIS token
       // can call. Three per-request filters, cheapest first:

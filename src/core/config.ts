@@ -4,6 +4,7 @@ import { homedir } from 'os';
 import type { EngineConfig, EmbeddingColumnConfig } from './types.ts';
 import { applyDbPlaneReadSideMerge, type DbPlaneEngineReader } from './config-db-merge.ts';
 import { loadConfigSnapshot } from './config-snapshot.ts';
+import { loadGbrainEnvFile } from './gbrain-env-file.ts';
 
 /**
  * Where is the active DB URL coming from? Pure introspection, no connection
@@ -33,6 +34,21 @@ export interface GBrainConfig {
    * `gbrain config set` routes these two dotted keys here, not to the DB. */
   push?: { allow_unverified_remote?: boolean };
   hooks?: { stop_push_debounce_min?: number | string };
+  /**
+   * Third-party integration gates, file-plane (read by engine-free hook
+   * children). `integrations.memorable.enabled` gates the optional
+   * session-end relay to a locally-installed `memorable` CLI — absent or
+   * anything other than literal `true` means OFF (fail-closed). The boolean
+   * alone is NOT sufficient: the gate also requires the gbrain-authored
+   * consent stamp (`~/.gbrain/integrations/hooks/memorable-consent.json`,
+   * written only by `gbrain config set`'s disclosure flow — deliberately
+   * outside this file, which the external CLI rewrites). See
+   * memorableGateAllowed in core/context/hook-heartbeat.ts.
+   */
+  integrations?: { memorable?: { enabled?: boolean } };
+  /** Monthly backup-coverage check (src/core/backup/). File-plane: read by
+   * engine-free render sites (hook children, the cli.ts startup rail). */
+  backup?: { check_enabled?: boolean | string; check_interval_days?: number | string };
   database_url?: string;
   database_path?: string;
   openai_api_key?: string;
@@ -76,6 +92,21 @@ export interface GBrainConfig {
    * voyage_api_key above.
    */
   dashscope_api_key?: string;
+  /**
+   * LiteLLM proxy API key. File-plane slot folded into the gateway env as
+   * LITELLM_API_KEY (optional in the litellm recipe — proxies may run
+   * unauthenticated locally). Closed alongside litellm's chat touchpoint
+   * (v0.42.61.0): once litellm became a full chat provider, daemon/launchd/
+   * MCP contexts hit the same config-plane gap voyage did (#2662). Same
+   * fold pattern (and same DB-plane caveat) as voyage_api_key above.
+   */
+  litellm_api_key?: string;
+  /**
+   * Together AI API key. File-plane slot folded into the gateway env as
+   * TOGETHER_API_KEY (required by the together recipe). Same fold pattern
+   * (and same DB-plane caveat) as voyage_api_key above.
+   */
+  together_api_key?: string;
   /**
    * Google Gemini API key (#3500). File-plane slot folded into the gateway
    * env as GOOGLE_GENERATIVE_AI_API_KEY (the name the google recipe reads).
@@ -635,7 +666,29 @@ export function effectiveEnvDatabaseUrl(dir: string = process.cwd()): string | u
   return url;
 }
 
+/**
+ * The #427 shadow predicate, single-homed: a bare DATABASE_URL exists in the
+ * process env but the cwd-.env guard excluded it (and GBRAIN_DATABASE_URL is
+ * unset) — the "init inside a web-app checkout" confusion shape. Consumers:
+ * engine-status, db-repair, the CLI's no-config marker site.
+ */
+export function envShadowDetected(dir: string = process.cwd()): boolean {
+  return (
+    typeof process.env.DATABASE_URL === 'string' &&
+    process.env.DATABASE_URL.length > 0 &&
+    !process.env.GBRAIN_DATABASE_URL &&
+    effectiveEnvDatabaseUrl(dir) === undefined
+  );
+}
+
 export function loadConfig(): GBrainConfig | null {
+  // #3893 (reimplemented from @y2688): fill process.env from the
+  // operator-owned ~/.gbrain/.env BEFORE the env-over-file merge below, so
+  // secrets can live outside config.json. Shell-exported env always wins
+  // (the loader never overrides an existing var), and cwd .env files stay
+  // untrusted (#427 guard above).
+  loadGbrainEnvFile(getConfigDir);
+
   let fileConfig: GBrainConfig | null = null;
   try {
     const raw = readFileSync(getConfigPath(), 'utf-8');
@@ -1109,6 +1162,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'openrouter_api_key',
   'voyage_api_key',
   'dashscope_api_key',
+  'litellm_api_key',
+  'together_api_key',
   'google_api_key',
   'azure_openai_api_key',
   'azure_openai_endpoint',
@@ -1121,6 +1176,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'chat_model',
   'chat_fallback_chain',
   'provider_base_urls',
+  // Integration gates (file-plane, hook-lane)
+  'integrations.memorable.enabled',
   // MEMORY_VERBS v1 (Cathedral 1)
   'mcp_surface',
   'protocol_installed_at',
@@ -1155,6 +1212,11 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // `config set` — engine-free hook/push children read loadConfigFileOnly).
   'push.allow_unverified_remote',
   'hooks.stop_push_debounce_min',
+  // File-plane backup-check keys (routed to ~/.gbrain/config.json by `config
+  // set` — the engine-free render sites read loadConfigFileOnly). Default ON /
+  // 30 days; interval clamps to >=1 day at read time (backup/status-file.ts).
+  'backup.check_enabled',
+  'backup.check_interval_days',
   // DB-plane (v0.32.3 search modes + related)
   'search.mode',
   'search.cache.enabled',
@@ -1214,6 +1276,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // `gbrain config set facts.extraction_enabled false` — which was rejected
   // as an unknown key until this registration.
   'facts.extraction_enabled',
+  // Open-loop engine kill switch: LLM commitment/decision extraction over
+  // google-source email pages (default ON for google sources; deterministic
+  // thread detection is unaffected). `gbrain config set loops.extraction_enabled false`.
+  'loops.extraction_enabled',
   // #2113: output-token cap for the per-turn facts extractor (default 4000).
   'facts.extraction_max_tokens',
   // [ENG-8] Brain-level default visibility for facts writes when the caller
@@ -1245,11 +1311,15 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // and inline-drain concurrency (default 1; clamped [1,8]; PGLite forced 1).
   'dream.synthesize.mode',
   'dream.synthesize.link_manifest',
+  'dream.synthesize.quote_verify',
   'dream.synthesize.inline_concurrency',
   // #4152 triage knobs. The triage model's preferred key is
   // `models.dream.triage` (models.* prefix, registered via the models.dream.*
   // family); these tune the gate + sampling + pass budget.
   'dream.triage.threshold',
+  'dream.triage.rescue_floor',
+  'dream.triage.rescue_min_segments',
+  'dream.triage.rescue_content_types',
   'dream.triage.max_chars',
   'dream.triage.max_tokens',
   'dream.triage.max_ms',
@@ -1306,13 +1376,15 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // Misc
   'artifacts_sync_mode',
   'cross_project_learnings',
-  // Link resolution (issue #972)
+  // Link resolution (issue #972; cross_source is issue #2589)
   'link_resolution',
   'link_resolution.global_basename',
+  'link_resolution.cross_source',
   // Spend controls (v0.42.42.0, issue #2139). Previously `--force`-only — the
   // operator had to discover these by reading source. Registered so `config
   // set` accepts them directly. See docs/operations/spend-controls.md.
   'spend.posture',
+  'pricing.overrides',
   // Life Chronicle (v0.42.56.0, #2390). The release notes' enable command is
   // `gbrain config set auto_chronicle true`, but the key was never registered
   // — so the documented command failed with "Unknown config key" and the
@@ -1345,6 +1417,13 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'sync.cost_gate_min_usd',
   'sync.federated_v2',
   'sync.include_working_tree',
+  // Persisted indexing scope (comma/newline-separated glob list; trailing '/'
+  // normalizes to a '/**' subtree glob). Read best-effort at the top of
+  // performSyncInner and UNIONED with any per-call --exclude so internal
+  // callers (autopilot, minion sync jobs, dream cycle) honor the same scope.
+  // Registering it here is what makes `gbrain config set sync.exclude ...`
+  // work — the operator path to the feature (unregistered-key class).
+  'sync.exclude',
   // #2179: clamp window for DCR-requested per-client token TTLs. Read by
   // `gbrain serve --http` at startup; unset min defaults to 300s, unset max
   // defaults fail-closed to max(--token-ttl, min).

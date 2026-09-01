@@ -15,6 +15,12 @@
  *   - synthesize: [EXPENSIVE prefix, annotations, clean `unavailable` with
  *     suggestion when no LLM is configured [c10]
  *   - forget: idempotency (expired:false), not_found with suggestion
+ *   - error-path envelopes [B6]: every error fixture's envelope carries
+ *     protocol_version: 1 + a non-empty suggestion (entity missing name,
+ *     context_pack malformed since, synthesize keyless unavailable — the
+ *     runner's expectErrorCode branch checks code + suggestion only, so the
+ *     protocol_version pin lives here), and a keyless --synthesize runner
+ *     pass exercises the synthesize error arm end-to-end
  *   - writeSingleFact supersession rule [X1] + degraded dedup (embed seam)
  *   - negative conformance self-test [F3]: the runner FAILS a lying server
  *   - fixture mirror drift guard (cases.json === embedded module)
@@ -181,6 +187,32 @@ describe('recall — G1B superset + budget packing', () => {
 });
 
 describe('remember — contract behavior', () => {
+  it("kind enum is frozen at the 5 protocol kinds — 'idea' is extractor/DB-only", () => {
+    // docs/protocol/MEMORY_VERBS_v1.md:39-41 — the remember verb's kind enum
+    // is a frozen protocol surface. The extractor/DB taxonomy gained 'idea'
+    // (engine.ts FactKind, migration v145); the protocol enum MUST NOT.
+    const kindEnum = operationsByName['remember'].params?.kind?.enum ?? [];
+    expect(kindEnum).toEqual(['event', 'preference', 'commitment', 'belief', 'fact']);
+    expect(kindEnum).not.toContain('idea');
+  });
+
+  it("recall's RESPONSE kind enum admits 'idea' — the reader must not be told a lie", () => {
+    // The INPUT freeze above is the protocol contract (a caller cannot WRITE
+    // an idea through the verb). The response side describes what the system
+    // actually RETURNS: the extractor and the facts table carry 'idea', so a
+    // stored idea fact flows back through recall. A response schema omitting
+    // it would declare a contract the system itself violates. Widening a
+    // response enum is strictly permissive for consumers.
+    const { RESPONSE_SCHEMAS } = require('../src/core/verbs.ts') as {
+      RESPONSE_SCHEMAS: Record<string, Record<string, unknown>>;
+    };
+    const facts = ((RESPONSE_SCHEMAS.recall as Record<string, Record<string, Record<string, unknown>>>)
+      .properties?.facts) as Record<string, Record<string, Record<string, Record<string, unknown>>>>;
+    const kindEnum = facts?.items?.properties?.kind?.enum as string[] | undefined;
+    expect(kindEnum).toEqual(['event', 'preference', 'commitment', 'belief', 'fact', 'idea']);
+    // ...while the remember INPUT enum stays frozen at five (asserted above).
+  });
+
   it('rejects empty provenance with provenance_required + a populated suggestion', async () => {
     const { isError, body } = await callRemote('remember', { fact: 'x', provenance: '   ' });
     expect(isError).toBe(true);
@@ -353,6 +385,16 @@ describe('entity — card, arms, zero LLM', () => {
     expect(body.card.backlink_count).toBe(0);
   });
 
+  it('[B6] missing required name is invalid_params with protocol_version 1 + a populated suggestion', async () => {
+    const { isError, body } = await callRemote('entity', {});
+    expect(isError).toBe(true);
+    expect(body.error).toBe('invalid_params');
+    expect(body.protocol_version).toBe(1);
+    expect(typeof body.suggestion).toBe('string');
+    expect(body.suggestion.trim().length).toBeGreaterThan(0);
+    expect(validateAgainstSchema(body, ERROR_SCHEMA)).toEqual([]);
+  });
+
   it('remote card never carries private commitment facts (fence test)', async () => {
     await seedEntityPage('people/fence-test', 'Fence Test Person');
     await callRemote('remember', {
@@ -406,6 +448,38 @@ describe('synthesize — marked expensive + unavailable conversion [c10]', () =>
     expect(Array.isArray(body.warnings)).toBe(true);
     const violations = validateAgainstSchema(body, RESPONSE_SCHEMAS.synthesize);
     expect(violations).toEqual([]);
+  });
+
+  it('[B6/c10] keyless synthesize is a clean unavailable error with protocol_version 1 + a populated suggestion', async () => {
+    // Forced-keyless hermetically: clear the module-global gateway (a prior
+    // configureGateway env snapshot would satisfy resolveAnthropicKey), drop
+    // the env var, and point GBRAIN_HOME at an empty dir so a dev machine's
+    // real ~/.gbrain/config.json key can't flip the assertion (see emptyHome).
+    resetGateway();
+    const { isError, body } = await withEnv(
+      { ANTHROPIC_API_KEY: undefined, GBRAIN_HOME: emptyHome() },
+      async () => callRemote('synthesize', { question: 'keyless error-path probe' }),
+    );
+    expect(isError).toBe(true);
+    expect(body.error).toBe('unavailable');
+    expect(body.protocol_version).toBe(1);
+    expect(typeof body.suggestion).toBe('string');
+    expect(body.suggestion.trim().length).toBeGreaterThan(0);
+    expect(validateAgainstSchema(body, ERROR_SCHEMA)).toEqual([]);
+  });
+});
+
+describe('context_pack — error-path envelope [B6]', () => {
+  it('malformed since is invalid_params with protocol_version 1 + an ISO 8601 fix in the suggestion', async () => {
+    const { isError, body } = await callRemote('context_pack', {
+      entities: 'people/nobody-here',
+      since: 'not-a-timestamp',
+    });
+    expect(isError).toBe(true);
+    expect(body.error).toBe('invalid_params');
+    expect(body.protocol_version).toBe(1);
+    expect(body.suggestion).toContain('ISO 8601');
+    expect(validateAgainstSchema(body, ERROR_SCHEMA)).toEqual([]);
   });
 });
 
@@ -613,6 +687,36 @@ describe('conformance runner — negative self-test [F3]', () => {
     expect(failures).toEqual([]);
   }, 20_000); // v0.45.7: two full runConformance passes now exercise 7 verbs;
   // the default 5s budget flakes under the parallel shard runner (red-team F6).
+
+  it('[B6] keyless self-cert with --synthesize passes via the unavailable error arm (cases run, never skip)', async () => {
+    // The synthesize fixtures are dual-mode (keyed servers answer, keyless
+    // servers must return the clean `unavailable` envelope). This run is the
+    // CI assertion of the ERROR arm: forced keyless (no gateway, no env key,
+    // empty config home — the chat transport seam is cleared by beforeEach)
+    // with the cost gate OPEN, both synthesize cases must EXECUTE and pass
+    // through the runner's unavailable+suggestion+ERROR_SCHEMA checks.
+    resetGateway();
+    const honest: ConformanceClient = {
+      listTools: async () =>
+        VERB_NAMES.map(name => ({
+          name,
+          description: name === 'synthesize' ? '[EXPENSIVE / SLOW] x' : `MEMORY VERB (v1): ${name}`,
+        })),
+      callTool: async (name, params) => {
+        const res = await dispatchToolCall(engine, name, params, {
+          remote: true, takesHoldersAllowList: ['world'], sourceId: 'default',
+        });
+        return { isError: res.isError, text: res.content[0].text };
+      },
+    };
+    const r = await withEnv({ ANTHROPIC_API_KEY: undefined, GBRAIN_HOME: emptyHome() }, async () =>
+      runConformance(honest, { marker: `keyless-${Date.now().toString(36)}`, synthesize: true }),
+    );
+    expect(r.results.filter(x => x.status === 'fail')).toEqual([]);
+    const synth = r.results.filter(x => x.verb === 'synthesize' && !x.name.startsWith('tools/list') && !x.name.startsWith('synthesize is marked'));
+    expect(synth.length).toBeGreaterThanOrEqual(2);
+    expect(synth.every(x => x.status === 'pass')).toBe(true);
+  }, 20_000);
 });
 
 describe('fixture mirror + surface invariants', () => {
