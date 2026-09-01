@@ -54,7 +54,18 @@ is valid semver, and it rejects it in FOUR independent places:
 | 3 | `scripts/check-bootstrap-tag.sh` stamp grep `[0-9A-Za-z.-]+` | the class excludes `+`, so a CORRECTLY stamped runbook reports as MISSING rather than mismatched. Regenerating cannot fix it |
 | 4 | the update/self-upgrade CLI paths built on (1) | `runCheckUpdate`, `runUpgradeDriftCheck`, `self-upgrade --check-only`, `checkSelfUpgradeHealth` |
 
-Failing jobs: `verify`, `serial-tests`, `test (4,5,6,7,9)`, `test-status`.
+| 5 | `test/e2e/self-upgrade-marker.test.ts` (via (1)) | 2 failures, which fail the whole `E2E Tests` workflow through its `Selected E2E (diff-relevant)` job |
+
+Failing jobs, measured at the `0.47.9.0+caracal.1` release: `verify`,
+`serial-tests`, `test (4,7,8,9)`, `test-status`, and the whole `E2E Tests`
+workflow. Shard NUMBERS drift between versions (0.46.32.0 showed 4,5,6,7,9) —
+match on the job NAMES and the assertion list, never on the shard indices.
+
+**`E2E Tests` was missing from the first version of this list.** It was written
+from the `Test` workflow alone, without checking E2E. That omission is the exact
+way a list-matching gate goes blind: the check below is "does the failure list
+MATCH", so a short list silently accepts a real regression in the workflow it
+forgot to name.
 
 Everything in (1) and (4) is self-update code, and `GBRAIN_SELF_UPGRADE_MODE=off`
 is set on all six brain workloads and asserted by `config.sh`, so none of it runs
