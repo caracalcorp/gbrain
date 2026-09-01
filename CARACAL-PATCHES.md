@@ -26,6 +26,7 @@ against VERSION, so bumping one alone fails the build job and publishes nothing.
 | `BOOTSTRAP_FOR_AGENTS.md` | one line: `<!-- gbrain-runbook-stamp: -->`, which upstream requires to equal VERSION |
 | `templates/bootstrap/template-repo/**` | regenerated: `bun run scripts/generate-template-repo.ts --out templates/bootstrap/template-repo --version "$(cat VERSION)"` |
 | `plugin/**`, `plugin-variants/**` | regenerated: `bun run scripts/generate-plugin-tree.ts --out plugin --variants-out plugin-variants` |
+| `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `openclaw.plugin.json` | version stamp only. The generator does NOT touch these three ROOT manifests — it stamps `plugin-variants/**` and leaves them, and upstream's `version lockstep` test then fails. Stamp them by hand every bump |
 | `CARACAL-PATCHES.md` | this file |
 
 The last three are vendored generator OUTPUT that upstream's own checks byte-diff
@@ -35,27 +36,35 @@ and every rebase — never hand-edit them.
 
 ## Known-red checks, and why we accept them
 
-Measured on the first release, 2026-09-01. All trace to ONE cause: upstream's
-tooling does not accept a `+` build-metadata suffix, which is valid semver.
+Measured on the first release, 2026-09-01: 26 failing assertions, all reducing to
+ONE cause. Upstream's tooling does not accept a `+` build-metadata suffix, which
+is valid semver, and it rejects it in FOUR independent places:
 
-| check | cause |
-|---|---|
-| `check:bootstrap-tag` | `check-bootstrap-tag.sh` extracts the stamp with `grep -oE '… [0-9A-Za-z.-]+ …'`. That class excludes `+`, so the match fails and it reports the stamp as MISSING rather than mismatched. Regeneration cannot fix it |
-| `serial-tests` (`check-update-refresh.serial.test.ts`), `checkSelfUpgradeHealth` | `src/core/semver.ts`'s `VERSION_RE` is `/^\d+\.\d+(?:\.\d+){0,2}$/`, so `parseSemver` returns null on our version and `refreshUpdateCache` throws `TypeError: null is not an object`. It does NOT fail open |
+| # | site | effect |
+|---|---|---|
+| 1 | `src/core/semver.ts` `VERSION_RE` = `/^\d+\.\d+(?:\.\d+){0,2}$/` | `parseSemver` returns null; `refreshUpdateCache` throws `TypeError: null is not an object`. It does NOT fail open |
+| 2 | `src/core/skillpack/manifest-v1.ts` `SEMVER_RE` | `gbrain_min_version must be semver shape; got "0.46.32.0+caracal.1"` — takes the whole skillpack manifest loader down |
+| 3 | `scripts/check-bootstrap-tag.sh` stamp grep `[0-9A-Za-z.-]+` | the class excludes `+`, so a CORRECTLY stamped runbook reports as MISSING rather than mismatched. Regenerating cannot fix it |
+| 4 | the update/self-upgrade CLI paths built on (1) | `runCheckUpdate`, `runUpgradeDriftCheck`, `self-upgrade --check-only`, `checkSelfUpgradeHealth` |
 
-Both are self-update code. `GBRAIN_SELF_UPGRADE_MODE=off` is set on all six brain
-workloads and asserted by `config.sh`, so neither path executes in our deployment.
+Failing jobs: `verify`, `serial-tests`, `test (4,5,6,7,9)`, `test-status`.
 
-Accepted deliberately so release #1 carries zero CODE delta — a first-boot failure
-then has to be infrastructure and cannot be our patch. Widening `VERSION_RE` to
-accept `+build` metadata, and the stamp regex with it, is patch #1 after first
-boot and has a clean upstream story: `+build` is valid semver and upstream rejects
-it.
+Everything in (1) and (4) is self-update code, and `GBRAIN_SELF_UPGRADE_MODE=off`
+is set on all six brain workloads and asserted by `config.sh`, so none of it runs
+for us. (2) affects the skillpack manifest loader, which the brain does use —
+**verify this at first boot** rather than assuming the tests over-state it.
 
-`osv-scan` is also red, for an unrelated and pre-existing reason: two High
-(CVSS 7.5) advisories in `browserslist@4.28.2` under `admin/bun.lock`, fixed in
-4.28.7. Build-time dependency, inherited from the pinned upstream tag, tracked in
-`caracalcorp/it` TODOS.md.
+Accepted deliberately so release #1 carries zero CODE delta: a first-boot failure
+then has to be infrastructure and cannot be our patch. Widening all four sites is
+fork patch #1, with a clean upstream story — `+build` is valid semver.
+
+**Beware the trap this list exists to prevent:** a permanently red badge is how a
+real failure gets ignored. The per-release check is "does the failure list MATCH",
+never "is it green".
+
+`osv-scan` is also red, unrelated and pre-existing: two High (CVSS 7.5) advisories
+in `browserslist@4.28.2` under `admin/bun.lock`, fixed in 4.28.7. Build-time
+dependency of the admin UI, inherited from the pinned upstream tag.
 
 ## The rule
 
