@@ -40,6 +40,7 @@ import type { SyncManifest, SyncFailure } from '../core/sync.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { loadConfig } from '../core/config.ts';
+import { DB_ACCESS_MARKER_PREFIX, shouldEmitDbAccessMarker } from '../core/pg-access-classify.ts';
 import {
   autoConcurrency,
   shouldRunParallel,
@@ -373,6 +374,13 @@ export interface SyncOpts {
    * the full-sync and incremental paths. Excluded files are never imported;
    * exclusion does NOT delete previously-imported pages (conservative,
    * matching the #1433 metafile posture).
+   *
+   * Unioned with the persisted `sync.exclude` config key (comma- or
+   * newline-separated; a trailing `/` is normalized to a `/**` subtree glob),
+   * so callers that never touch the CLI — autopilot, minion sync jobs, the
+   * dream cycle — inherit the same indexing scope. Union, not override: an
+   * ad-hoc flag narrows further but never silently re-opens a scope the
+   * operator persisted. Best-effort read, as with `sync.include_working_tree`.
    */
   exclude?: string[];
   /**
@@ -1300,6 +1308,16 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         const cfg = parseGitHubSourceConfig(rawCfg, fallbackDir);
         return await runGitHubSync(engine, srcId, cfg, opts);
       }
+      // v0.47: google source kind (Gmail/Calendar/Contacts). Same shape as
+      // the github branch: API-backed materializer, standard import pipeline.
+      if (rawCfg.kind === 'google') {
+        serr(`[gbrain phase] sync.google_materialize`);
+        const { parseGoogleSourceConfig, runGoogleSync } = await import('../core/google/google-source.ts');
+        const { defaultCloneDir } = await import('../core/sources-ops.ts');
+        const fallbackDir = cfgRows[0].local_path ?? defaultCloneDir(`${srcId}-google`);
+        const cfg = parseGoogleSourceConfig(rawCfg, fallbackDir);
+        return await runGoogleSync(engine, srcId, cfg, opts);
+      }
       if (opts.githubItem) {
         throw new Error(
           `github_item refresh requires a github-kind source, but "${srcId}" is not github-kind.`,
@@ -1646,6 +1664,47 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // covers the CLI path identically either way; the dream cycle not
   // calling it is a separate, pre-existing characteristic of the dream
   // cycle in general, not something this fix introduces or worsens).
+
+  // Same reasoning as the `sync.include_working_tree` config fallback further
+  // down, applied to the indexing scope: `--exclude` is a per-invocation flag,
+  // so only callers that go through the CLI can narrow what gets indexed.
+  // autopilot, minion sync jobs and the dream cycle call sync internally with
+  // no place to put exclusions — a repo whose indexing scope is narrower than
+  // its git tree is honored on one path and silently ignored on the others.
+  //
+  // Silently is the operative word: not excluding something is not an error
+  // for an indexer, so the gap surfaces as content quietly reappearing in the
+  // index, never as a failure. Resolving the config HERE gives every caller
+  // the same scope. The read is best-effort, exactly like that one.
+  //
+  // UNION rather than flag-wins, which is where this departs from that
+  // boolean: a persisted scope is a property of the repo ("this is not
+  // indexable material"), and an ad-hoc `--exclude tmp/` must not silently
+  // re-open it — that would reintroduce the very failure this closes. A
+  // boolean has no union; a pattern list does. Narrowing further always
+  // works; widening is deliberate, by editing the config.
+  //
+  // Directory prefixes are normalized to subtree globs (`raw/` → `raw/**`):
+  // without the `**` the pattern matches the directory entry and none of the
+  // files inside it, which is the same gap wearing a different shape.
+  //
+  // POSITION IS LOAD-BEARING: this union must run ABOVE the three
+  // performFullSync early returns below (gc'd anchor, first sync,
+  // --include-gitignored). The first sync is exactly where exclusion
+  // pollution is permanent — a full walk that ignores the persisted scope
+  // imports every excluded derivative file, and no later incremental sync
+  // ever revisits them.
+  try {
+    const stored = await engine.getConfig('sync.exclude');
+    const storedPatterns = (stored ?? '')
+      .split(/[\n,]/)
+      .map(p => p.trim())
+      .filter(Boolean)
+      .map(p => (p.endsWith('/') ? `${p}**` : p));
+    if (storedPatterns.length > 0) {
+      opts = { ...opts, exclude: [...new Set([...(opts.exclude ?? []), ...storedPatterns])] };
+    }
+  } catch { /* config unreadable — never break a sync over the scope read */ }
 
   // #1970: bookmark reachability. The ONLY thing that should force a full
   // reconcile is a truly-absent object; a present-but-non-ancestor bookmark
@@ -2153,8 +2212,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         if (opts.dryRun) {
           slog(`  [dry-run] would delete un-syncable page: ${slug}`);
         } else {
-          await engine.deletePage(slug, pageOpts);
-          slog(`  Deleted un-syncable page: ${slug}`);
+          // #4587: soft-delete (72h recovery window) instead of hard delete.
+          // Scope falls back to DEFAULT_SOURCE_ID to preserve deletePage's
+          // old 'default' fallback; softDeletePages requires an explicit
+          // sourceId. The purge phase owns the eventual hard delete.
+          await engine.softDeletePages([slug], { sourceId: opts.sourceId ?? DEFAULT_SOURCE_ID });
+          slog(`  Soft-deleted un-syncable page (recoverable 72h): ${slug}`);
         }
       }
     } catch { /* ignore */ }
@@ -2342,6 +2405,15 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] banked ${banked} file(s) this run; next 'gbrain sync' resumes from ` +
       `the checkpoint (last_commit unchanged at ${(lastCommit ?? '').slice(0, 8)}).`,
     );
+    // db-availability loop (4b): a dead checkpoint IS a DB-access failure by
+    // construction — the checkpoint writer only gives up after exhausting the
+    // retry-matcher's connection-class retries (#1794), so `conn_dropped` is
+    // asserted structurally, not parsed from an error. The marker lets the
+    // bundled skills/db-repair skill pick this up from an agent-run sync.
+    if (checkpointDead && shouldEmitDbAccessMarker()) {
+      serr(`${DB_ACCESS_MARKER_PREFIX} conn_dropped`);
+      serr('The sync checkpoint pool died mid-run. Run: gbrain db-repair');
+    }
     return buildPartialResult({
       fromCommit: lastCommit,
       toCommit: pin,
@@ -2404,14 +2476,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     typeWarningsEnabled = !(v === 'false' || v === '0' || v === 'off');
   } catch { /* config unavailable → default on */ }
 
-  // v0.18.0+ multi-source: scope deletePage so we only delete the source-A
-  // row, not every same-slug row across all sources.
-  const deleteOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
-
   // v0.41.19.0 (T2/D6/D7/D16/D18 via /plan-eng-review + codex outside-voice):
   // batched delete loop. Replaces the per-file N+1 that PR #1538 originally
   // batched on Postgres only. See plan file:
   //   ~/.claude/plans/system-instruction-you-are-working-ethereal-narwhal.md
+  // #4587: the lanes below SOFT-delete (deleted_at = now(), 72h recovery
+  // window) via softDeletePages; the autopilot purge phase owns the eventual
+  // hard delete and a re-import within the window revives via upsert.
   //
   // SHAPE (interleaved per-batch resolve + delete; caller owns chunking):
   //
@@ -2431,16 +2502,16 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   //       │
   //       ▼
   //   try {
-  //     deleted = engine.deletePages(slugs, opts)    ◀── 1 SQL round-trip
-  //     pagesAffected.push(...deleted)               ◀── D6: only confirmed
-  //   } catch {                                          deletes, not phantoms
-  //     // D7 decompose: per-slug deletePage,
-  //     // unrecoverable failures → failedFiles
+  //     deleted = engine.softDeletePages(slugs, opts) ◀── 1 SQL round-trip
+  //     pagesAffected.push(...deleted)                ◀── D6: only confirmed
+  //   } catch {                                           transitions, not phantoms
+  //     // D7 decompose: one-element softDeletePages per slug,
+  //     // unrecoverable failures → failedFiles, run continues
   //   }
   //
   // ROUND-TRIP COUNTS (73K deletes):
   //   pre-fix:   73,000 SELECTs + 73,000 DELETEs = 146,000 (~5 hours)
-  //   post-fix:     146 SELECTs +     146 DELETEs =     292 (~2 minutes)
+  //   post-fix:     146 SELECTs +     146 UPDATEs =     292 (~2 minutes)
   //
   // ATOMICITY (D3): each batch is one transaction. A mid-batch abort or
   // transient connection failure rolls back up to DELETE_BATCH_SIZE - 1
@@ -2479,25 +2550,32 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         const deletable = batch.filter(p => resolution.slugs.has(p));
         const slugs = deletable.map(p => resolution.slugs.get(p) as string);
 
-        // Phase B: batch delete (1 round-trip per batch).
+        // Phase B: batch soft-delete (1 round-trip per batch). #4587: the
+        // removed-file drain honors the 72h recovery window — deleted_at is
+        // set, the purge phase hard-deletes later, and a re-import within
+        // the window revives via putPage's upsert.
         try {
-          const deleted = await engine.deletePages(slugs, deleteScopedOpts);
-          // D6: only push slugs that were actually deleted. Filters phantom
-          // slugs (paths in filtered.deleted but with no DB row) so
-          // downstream extract/embed don't waste lookups.
+          const deleted = await engine.softDeletePages(slugs, deleteScopedOpts);
+          // D6: only push slugs that actually transitioned. Filters phantom
+          // slugs (paths in filtered.deleted but with no DB row — or rows
+          // already soft-deleted) so downstream extract/embed don't waste
+          // lookups.
           pagesAffected.push(...deleted);
           for (const s of deleted) deletedSlugs.add(s);
-          // v0.42.x (#1794): the whole batch is handled (deleted, already
-          // gone, or refused above); checkpoint every path so a resume skips it.
+          // v0.42.x (#1794): the whole batch is handled (soft-deleted,
+          // already gone, or refused above); checkpoint every path so a
+          // resume skips it.
           for (const p of deletable) await markCompleted(p);
         } catch (err) {
           // D7 decompose: a transient blip on this batch shouldn't lose all
-          // 500 deletes. Fall back to per-slug deletePage for THIS batch
-          // only; unrecoverable per-slug failures land in failedFiles
-          // (matching the existing import-loop pattern at sync.ts:~1350).
+          // 500 deletes. Fall back to one-element softDeletePages batches
+          // for THIS batch only (per-slug isolation, same primitive);
+          // unrecoverable per-slug failures land in failedFiles and the run
+          // CONTINUES (--skip-failed semantics), matching the existing
+          // import-loop pattern.
           for (let j = 0; j < slugs.length; j++) {
             try {
-              await engine.deletePage(slugs[j], deleteScopedOpts);
+              await engine.softDeletePages([slugs[j]], deleteScopedOpts);
               pagesAffected.push(slugs[j]);
               deletedSlugs.add(slugs[j]);
               await markCompleted(deletable[j]);
@@ -2531,7 +2609,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           continue;
         }
         try {
-          await engine.deletePage(slug, deleteOpts);
+          // #4587: soft-delete with the same 'default' fallback the old
+          // optional-opts deletePage call applied on this legacy lane
+          // (opts.sourceId is undefined here by construction).
+          await engine.softDeletePages([slug], { sourceId: opts.sourceId ?? DEFAULT_SOURCE_ID });
           pagesAffected.push(slug);
           deletedSlugs.add(slug);
           await markCompleted(path);
@@ -2753,6 +2834,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             // import; counting it as a failure would gate the bookmark forever.
             serr(`  Skipped (malformed filename): ${sanitizePathForDisplay(to)}`);
           } else if (result.status === 'skipped' && (result as { error?: string }).error) {
+            // An errored skip (frontmatter slug-authority rejection, invalid
+            // YAML, symlink refusal, oversize file, ...) means the
+            // destination never materialized — same as status 'error' below,
+            // this must gate the success sentinel + markCompleted(to), or a
+            // resumed sync would treat the rename as permanently done.
+            importErrored = true;
             failedFiles.push({ path: to, error: String((result as { error?: string }).error) });
           } else if (result.status === 'error') {
             // importImageFile (and importFile's frontmatter gate) report
@@ -2890,9 +2977,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
               // silently assumed safe.
               for (const s of staleSlugs) {
                 staleSlug = s;
-                await engine.deletePage(s, renameOpts);
+                // #4587: soft-delete the stale claimant (72h recovery) —
+                // candidates come from activeSlugsBySourcePath, so every s
+                // is an ACTIVE row and the flip always applies. Same scope
+                // fallback updateSlug/renameOpts use ('default' when the
+                // caller threads no sourceId).
+                await engine.softDeletePages([s], { sourceId: opts.sourceId ?? DEFAULT_SOURCE_ID });
                 deletedSlugs.add(s); // never hand a deleted slug to auto-embed
-                serr(`  [sync] rename reconciled: removed stale row ${s} (${from} -> ${to} fell back to add).`);
+                serr(`  [sync] rename reconciled: soft-deleted stale row ${s} (recoverable 72h; ${from} -> ${to} fell back to add).`);
               }
             } else if (candidates.length > 0) {
               serr(`  [sync] rename fallback: every active row with source_path ${from} was spared (live or unprovable); nothing stale to reconcile.`);
@@ -4144,19 +4236,23 @@ async function performFullSync(
       for (let i = 0; i < deletableSlugs.length; i += DELETE_BATCH_SIZE) {
         const batch = deletableSlugs.slice(i, i + DELETE_BATCH_SIZE);
         try {
-          const deleted = await engine.deletePages(batch, deleteScopedOpts);
+          // #4587: reconcile soft-deletes (72h recovery). Already-soft-
+          // deleted rows are excluded by the primitive's predicate, so the
+          // count only reports real transitions.
+          const deleted = await engine.softDeletePages(batch, deleteScopedOpts);
           reconciledDeletes += deleted.length;
         } catch {
           // Per-slug fallback on a batch blip (mirrors the incremental delete
-          // loop). A stale page that won't delete is best-effort, not fatal.
+          // loop's decompose). A stale page that won't delete is best-effort,
+          // not fatal — the run continues.
           for (const slug of batch) {
-            try { await engine.deletePage(slug, deleteScopedOpts); reconciledDeletes++; }
+            try { reconciledDeletes += (await engine.softDeletePages([slug], deleteScopedOpts)).length; }
             catch { /* best-effort */ }
           }
         }
       }
       if (reconciledDeletes > 0) {
-        slog(`  Reconciled ${reconciledDeletes} stale page(s) whose source file was removed.`);
+        slog(`  Reconciled ${reconciledDeletes} stale page(s) whose source file was removed (soft-deleted, recoverable 72h).`);
         if (malformedDeleted > 0) {
           slog(
             `  (${malformedDeleted} of them had malformed bracket/control-char filenames — ` +
@@ -4457,9 +4553,10 @@ See also:
     // gbrain-sync:default — absent — printed "nothing to break", exit 0, and
     // left the dead holder's row on gbrain-sync:<src>; the follow-up sync
     // then refused for the 60s takeover grace. Resolve the SAME source the
-    // sync would lock.
+    // sync would lock. Explicit --source keeps the resolver-free path (no
+    // assertSourceExists) so leftover locks of deleted sources stay breakable.
     const { resolveSourceWithTier: resolveBreakSource } = await import('../core/source-resolver.ts');
-    const sourceId = (await resolveBreakSource(engine, sourceArg || null)).source_id;
+    const sourceId = sourceArg ?? (await resolveBreakSource(engine, null)).source_id;
     const lockKey = `gbrain-sync:${sourceId}`;
     const exit = await runBreakLock(engine, lockKey, sourceId, {
       force: forceBreakLock,
@@ -5016,6 +5113,8 @@ See also:
     // v0.42.7 (#1696): brain-wide extraction-lag nudge after the --all wave.
     // Best-effort, stderr-only; skipped on dry-run.
     if (!dryRun) await maybeExtractionNudge(engine);
+    // Monthly backup-coverage stale-only refresh (trusted local engine holder).
+    if (!dryRun) await maybeBackupCoverageRefresh(engine);
 
     // #3068: any source wedged on a failed pull (partial/pull_failed) makes
     // the whole --all run non-zero — it will not self-heal on retry, so a
@@ -5131,6 +5230,10 @@ See also:
     // — NOT just 'synced'; a fresh/--full import (`first_sync`) is the biggest
     // un-extracted backlog. Scoped to this source; best-effort, stderr-only.
     if (shouldNudgeAfterSync(result.status)) await maybeExtractionNudge(engine, sourceId);
+    // Monthly backup-coverage: the sync CLI legitimately holds the engine
+    // (trusted local), so the stale-only compute piggybacks here — covering
+    // active CLI users without any serve involvement. Dry-run stays pure.
+    if (result.status !== 'dry_run') await maybeBackupCoverageRefresh(engine);
     // Issue #2 + eng-review pass-2 finding #1 + Codex P1: manage .gitignore ONLY
     // on successful sync. Skip on dry-run (don't mutate disk in preview mode)
     // and blocked_by_failures (sync state is inconsistent — defer .gitignore
@@ -5540,6 +5643,25 @@ export function manageGitignore(
 }
 
 /**
+ * Post-sync backup-coverage refresh (monthly, stale-only). The sync CLI is a
+ * trusted local engine holder (D4), so the compute piggybacks here; the
+ * shared choke point (getBackupStatus) makes a fresh cache a no-op file read.
+ * Best-effort — never blocks or fails a sync.
+ */
+async function maybeBackupCoverageRefresh(engine: BrainEngine): Promise<void> {
+  try {
+    const { backupCheckDisabled, isBackupStatusStale, loadBackupStatus } = await import(
+      '../core/backup/status-file.ts'
+    );
+    if (backupCheckDisabled() || !isBackupStatusStale(loadBackupStatus())) return;
+    const { getBackupStatus } = await import('../core/backup/coverage.ts');
+    await getBackupStatus(engine, { localGitProbes: true, computedBy: 'sync' });
+  } catch {
+    /* best-effort — never block sync on it */
+  }
+}
+
+/**
  * v0.42.7 (#1696): one-line end-of-sync nudge when the brain (or a source)
  * carries a meaningful link/timeline extraction backlog. Reuses the same warn
  * threshold (GBRAIN_EXTRACTION_LAG_WARN_PCT, default 20%) the doctor check uses
@@ -5597,7 +5719,7 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
       break;
     case 'synced':
       write(`Synced ${result.fromCommit?.slice(0, 8)}..${result.toCommit.slice(0, 8)}:`);
-      write(`  +${result.added} added, ~${result.modified} modified, -${result.deleted} deleted, R${result.renamed} renamed`);
+      write(`  +${result.added} added, ~${result.modified} modified, -${result.deleted} soft-deleted (recoverable 72h), R${result.renamed} renamed`);
       write(`  ${result.chunksCreated} chunks created${result.embedded > 0 ? `, ${result.embedded} pages embedded` : ''}`);
       if (result.uncommitted) writeUncommittedNote(result.uncommitted);
       break;

@@ -3,9 +3,16 @@
 **None.** No hand-written change to upstream source. Everything below is either a
 version string or a file GENERATED from one.
 
-Source-identical to upstream v0.46.32.0 (commit
-77bb9d8c2165a8eb3f15e117462fcf1164fc4c0a, verified against `garrytan/gbrain` at
-fork setup on 2026-09-01).
+Source-identical to upstream v0.47.9.0 (commit
+6bf8db908c8a7b60dcdde2f1c784d4b278f183e0, verified against `garrytan/gbrain`'s
+published tag on 2026-09-01 — peeled through the tag object, not read off the ref).
+
+Repinned from v0.46.32.0 the same day, once release #1 had proven the build and
+attestation chain end to end. A repin takes upstream's TREE onto a commit whose
+parent is our `master` (`git read-tree -u --reset <tag>`), never a rebase and
+never a branch based on the tag: a rebase conflicts on every stamped file by
+construction, and a tag-based branch is not a descendant of master, so GitHub
+marks the PR CONFLICTING and runs no checks at all.
 
 This repo is a **fork of `garrytan/gbrain` at full workflow parity**: all seven
 upstream workflows are present and unmodified, and `master` is upstream's own

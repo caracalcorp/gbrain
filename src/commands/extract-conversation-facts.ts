@@ -73,7 +73,7 @@ import {
   type ExtractedFact,
 } from '../core/facts/extract.ts';
 import { configureGatewayIfUninitialized, isAvailable, withBudgetTracker } from '../core/ai/gateway.ts';
-import { BudgetTracker, BudgetExhausted } from '../core/budget/budget-tracker.ts';
+import { BudgetTracker, BudgetExhausted, loadPricingOverrides } from '../core/budget/budget-tracker.ts';
 import { listSources } from '../core/sources-ops.ts';
 import {
   loadOpCheckpoint,
@@ -401,7 +401,7 @@ import {
 } from '../core/conversation-parser/parse.ts';
 import { readConversationBodyForParsing } from '../core/conversation-parser/body.ts';
 import { runLlmFallback } from '../core/conversation-parser/llm-fallback.ts';
-import { resolveModel } from '../core/model-config.ts';
+import { resolveModel, resolveTierDefault } from '../core/model-config.ts';
 
 /**
  * v0.41.13.0 — back-compat shape for direct callers + the existing
@@ -1352,7 +1352,8 @@ export async function runExtractConversationFactsCore(
   const llmFallbackModel = llmFallbackEnabled
     ? await resolveModel(engine, {
         tier: 'utility',
-        fallback: 'anthropic:claude-haiku-4-5-20251001',
+        // #3813: last-resort fallback stays key-aware, never hardcoded Anthropic.
+        fallback: resolveTierDefault('utility'),
       })
     : null;
 
@@ -1581,6 +1582,7 @@ export async function runExtractConversationFactsCore(
       const tracker = new BudgetTracker({
         maxCostUsd: opts.maxCostUsd ?? DEFAULT_MAX_COST_USD,
         label: `extract-conversation-facts:${sourceId}`,
+        pricingOverrides: await loadPricingOverrides(engine),
       });
       ownedTracker = tracker;
       try {
