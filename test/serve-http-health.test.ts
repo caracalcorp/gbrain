@@ -17,7 +17,12 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { HEALTH_TIMEOUT_MS, probeHealth, probeLiveness } from '../src/commands/serve-http.ts';
+import {
+  HEALTH_TIMEOUT_MS,
+  probeHealth,
+  probeLiveness,
+  probeProcessLiveness,
+} from '../src/commands/serve-http.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 /**
@@ -166,5 +171,25 @@ describe('probeLiveness (v0.28.10)', () => {
     // Loose bound: bun's internal handles can drift by a small amount across
     // many fetches; we only care that we don't ramp by ~100 leaked timers.
     expect(afterHandles - beforeHandles).toBeLessThan(20);
+  });
+});
+
+describe('probeProcessLiveness', () => {
+  test('returns 200-shaped ok + version without an engine', () => {
+    expect(probeProcessLiveness('0.27.1')).toEqual({ status: 'ok', version: '0.27.1' });
+  });
+
+  test('is synchronous — a liveness answer cannot wait on I/O', () => {
+    // A probe that returned a promise could be made to await something later;
+    // pinning the sync return keeps "answering at all" as the whole signal.
+    expect(probeProcessLiveness('0.27.1')).not.toBeInstanceOf(Promise);
+  });
+
+  test('takes no engine: arity 1, so no database handle is in scope', () => {
+    // This is the real guarantee behind /livez. If a later edit adds an engine
+    // parameter to reach the database, this fails — which is the point, because
+    // the whole purpose of the route is that a Postgres outage cannot make an
+    // orchestrator kill a healthy process.
+    expect(probeProcessLiveness.length).toBe(1);
   });
 });

@@ -473,6 +473,31 @@ export async function probeLiveness(
 }
 
 /**
+ * Process liveness: is this event loop still answering?
+ *
+ * Deliberately takes no engine and performs no I/O, and the SIGNATURE is the
+ * guarantee — there is no database handle in scope to reach for, so no later
+ * edit can quietly make "is the process alive?" depend on "is Postgres up?".
+ * Answering at all is the entire signal.
+ *
+ * Why this is not `probeLiveness` with the query removed: they answer
+ * different questions for different callers. `/health` tells a human or a
+ * dashboard whether the brain is USABLE, and a database outage must show
+ * there. An orchestrator's liveness probe asks whether to KILL the container,
+ * and a database outage must NOT show there — restarting the process does not
+ * fix Postgres, and doing it on every blip turns a recoverable dependency
+ * outage into a crash loop. Conflating them forces one endpoint to be wrong
+ * for one of its two consumers.
+ *
+ * Returns a plain object rather than {@link ProbeHealthResult}: that union's
+ * failure arm is unreachable here, and a 503 branch that cannot fire reads as
+ * a promise this probe does not make.
+ */
+export function probeProcessLiveness(version: string): { status: 'ok'; version: string } {
+  return { status: 'ok', version };
+}
+
+/**
  * Resolve `GBRAIN_HTTP_TRUST_PROXY` into a value Express's `app.set('trust
  * proxy', ...)` accepts. Pure function so the test surface is one place,
  * not the whole Express stack.
@@ -1343,6 +1368,17 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   app.get('/health', async (_req, res) => {
     const result = await probeLiveness(engine, config.engine || 'pglite', VERSION);
     res.status(result.status).json(result.body);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Process liveness — no database, no I/O. For orchestrator liveness probes
+  // (Kubernetes livenessProbe, Azure Container Apps Liveness), which must not
+  // restart the container because a dependency is down. See
+  // probeProcessLiveness above for why this is a second route and not a flag
+  // on /health.
+  // ---------------------------------------------------------------------------
+  app.get('/livez', (_req, res) => {
+    res.status(200).json(probeProcessLiveness(VERSION));
   });
 
   // ---------------------------------------------------------------------------
