@@ -9,6 +9,14 @@
  * Supports both 3-segment (`0.41.38`) and 4-segment (`0.42.3.0`) gbrain
  * version strings. The 4th `.MICRO` segment is gbrain's dot-suffix
  * follow-up channel; comparisons use it as a 4th ordering key.
+ *
+ * Also accepts semver BUILD METADATA (`+<identifiers>`, e.g. `0.42.3.0+caracal.1`)
+ * — a fork or downstream build tags its binary this way, and per the semver
+ * spec build metadata does not affect precedence, so it is validated and then
+ * dropped before parsing the numeric core. Rejecting it here previously meant
+ * `parseSemver` returned null for a fork's OWN version string, which silently
+ * disabled the self-upgrade marker and threw where a caller assumed a non-null
+ * result (`parseSemver(VERSION)!`) — see downstream forks' known-red notes.
  */
 
 /** A parsed gbrain version tuple (major, minor, patch, micro). Historical
@@ -19,20 +27,40 @@ export type SemverTuple = [number, number, number, number];
  * Accepts both 3-segment (`0.41.38`) and 4-segment (`0.42.3.0`) gbrain versions. */
 export const VERSION_RE = /^\d+\.\d+(?:\.\d+){0,2}$/;
 
-/** True iff `v` (optionally `v`-prefixed) is a plain numeric dotted version. */
+/** Semver build-metadata identifiers: dot-separated alphanumerics/hyphens, each non-empty. */
+const BUILD_METADATA_RE = /^[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*$/;
+
+/** Split `<core>[+<build>]`. Build metadata is optional and, when present,
+ * must be non-empty and match `BUILD_METADATA_RE`. Returns null on a
+ * malformed (present-but-invalid) build-metadata segment. */
+function splitBuildMetadata(v: string): { core: string; build: string | null } | null {
+  const i = v.indexOf('+');
+  if (i === -1) return { core: v, build: null };
+  const build = v.slice(i + 1);
+  if (!BUILD_METADATA_RE.test(build)) return null;
+  return { core: v.slice(0, i), build };
+}
+
+/** True iff `v` (optionally `v`-prefixed) is a plain numeric dotted version,
+ * optionally followed by valid `+build.metadata`. */
 export function isValidVersionString(v: string): boolean {
-  return VERSION_RE.test(v.replace(/^v/, ''));
+  const split = splitBuildMetadata(v.replace(/^v/, ''));
+  return !!split && VERSION_RE.test(split.core);
 }
 
 /**
  * Parse a version string into a (major, minor, patch, micro) tuple. Returns
- * null on any malformed input. Accepts a leading `v`; historical 3-segment
- * versions are padded with a zero micro segment.
+ * null on any malformed input. Accepts a leading `v` and trailing
+ * `+build.metadata` (dropped — semver build metadata never affects
+ * precedence); historical 3-segment versions are padded with a zero micro
+ * segment.
  */
 export function parseSemver(v: string): SemverTuple | null {
-  const clean = v.replace(/^v/, '');
-  if (!VERSION_RE.test(clean)) return null;
-  const parts = clean.split('.');
+  const split = splitBuildMetadata(v.replace(/^v/, ''));
+  if (!split) return null;
+  const { core } = split;
+  if (!VERSION_RE.test(core)) return null;
+  const parts = core.split('.');
   if (parts.length < 3) return null;
   const nums = parts.map(Number);
   if (nums.some((n) => !Number.isFinite(n))) return null;
