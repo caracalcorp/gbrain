@@ -91,6 +91,18 @@ over its ratchet ceiling). Not a `+`-suffix issue — the module-size guard was
 doing exactly what it's for. Fixed as *Patches* row 3
 (`scripts/module-size-limits.tsv`), first push.
 
+**A THIRD, still-open, unrelated cause hides behind `test (9)`'s job-name
+match, present since before `+caracal.1` and NOT fixed by this release:**
+`test/ai/sunset-warn.test.ts`, 3 of 5 tests, on a hardcoded 2026-09-04
+ZeroEntropy reranker sunset date that has since passed in wall-clock time —
+the production code correctly short-circuits past the sunset instead of
+warning, which is exactly what it should do; the TEST fixture is dated.
+Reproduces identically at the pristine `v0.47.9.0` tag with none of this
+fork's patches applied — pure upstream test rot, no upstream story of ours to
+carry, and not this release's to fix. Recorded here so `test (9)` staying red
+on a future release doesn't get re-diagnosed from scratch or silently accepted
+as "the same old known-red" without checking it is still only this.
+
 **The methodology, not just the count, is what changed.** Two releases running,
 `verify` and (once `+caracal.3` started) `serial-tests` matched their expected
 job NAME while each carried an undocumented second (`verify`: module-size) or
@@ -101,16 +113,19 @@ because each "should be green now" prediction got checked against a real run
 rather than assumed — the corrections above are the record of that, kept
 rather than silently overwritten, because the wrongness is the lesson.
 
-**Measured final state, `+caracal.3`, third push (`af0609810` +
-`site 3 widen`):** `verify` GREEN, `serial-tests` GREEN, `Selected E2E
-(diff-relevant)` GREEN (8/8, was 6/8), `test (1)`-`test (10)` all GREEN,
-`test-status` GREEN. `osv-scan` RED — unrelated, pre-existing
-`browserslist@4.28.2` advisory, deferred (TODOS.md W10). One further red item
-surfaced and was confirmed OUT OF SCOPE, not fixed: `test/ai/sunset-warn.test.ts`
-3/5 fails on a hardcoded 2026-09-04 ZeroEntropy sunset date that has since
-passed in wall-clock time — reproduces identically at the pristine `v0.47.9.0`
-tag with none of our patches applied, so it is pure upstream test rot, unrelated
-to the `+build` class, and not this release's to fix.
+**Measured final state, `+caracal.3`, third push (`e40ba347e`):** `verify`
+GREEN (54/54 `check:*` fans), `serial-tests` GREEN, `Selected E2E
+(diff-relevant)` GREEN (8/8, was 6/8), `test (1)`-`test (8)` and `test (10)`
+GREEN. `test (9)` and `test-status` still show RED, and that RED is real but
+OUT OF SCOPE: `test (9)`'s only failures are `test/ai/sunset-warn.test.ts`'s 3
+of 5 tests, on a hardcoded 2026-09-04 ZeroEntropy sunset date that has since
+passed in wall-clock time (`sunset_short_circuit` fires instead of the
+once-per-process warning the tests expect) — confirmed by checking out that
+one test file plus `src/core/ai/gateway.ts` at the pristine `v0.47.9.0` tag
+with every other file left at this branch's HEAD: same 3/5 failure, so it is
+pure upstream test rot unrelated to the `+build` class, present before any
+patch here and not this release's to fix. `osv-scan` RED — unrelated,
+pre-existing `browserslist@4.28.2` advisory, deferred (TODOS.md W10).
 
 Sites (1)-(3) and the CLI paths in (5) are self-update/skillpack code, and
 `GBRAIN_SELF_UPGRADE_MODE=off` is set on all six brain workloads and asserted by
