@@ -129,7 +129,10 @@ const REQUIRED_FIELDS = [
 ] as const;
 
 const NAME_RE = /^[a-z][a-z0-9-]{1,63}$/;
-const SEMVER_RE = /^\d+\.\d+\.\d+(?:\.\d+)?(?:-[A-Za-z0-9._-]+)?$/;
+// +build metadata (e.g. a fork's "0.47.9.0+caracal.3") is valid semver and
+// never affects precedence — widened so a fork's own VERSION passes
+// gbrain_min_version validation. See caracalcorp/gbrain CARACAL-PATCHES.md.
+const SEMVER_RE = /^\d+\.\d+\.\d+(?:\.\d+)?(?:-[A-Za-z0-9._-]+)?(?:\+[A-Za-z0-9.-]+)?$/;
 
 /**
  * Validate a parsed JSON object as a SkillpackManifest. Pure function;

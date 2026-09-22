@@ -92,7 +92,7 @@ if [ -f "$runbook" ]; then
     echo "SKIP: VERSION file absent — cannot check the runbook stamp"
   else
     version="$(tr -d '[:space:]' < "$version_file")"
-    stamp="$(grep -oE '<!-- gbrain-runbook-stamp: [0-9A-Za-z.-]+ -->' "$runbook" \
+    stamp="$(grep -oE '<!-- gbrain-runbook-stamp: [0-9A-Za-z.+-]+ -->' "$runbook" \
       | head -1 \
       | sed -E 's/<!-- gbrain-runbook-stamp: (.+) -->/\1/')"
     if [ -z "$stamp" ]; then
