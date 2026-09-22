@@ -41,12 +41,21 @@ export interface BrainIdentityShape {
 
 /**
  * Validate a version string before handing it to `compareVersions`. Accepts
- * 3-segment or 4-segment dotted-numeric forms (digits only, no suffix). Anything
- * else fails closed.
+ * 3-segment or 4-segment dotted-numeric forms, optionally followed by semver
+ * `+build.metadata` (e.g. a fork's `0.47.9.0+caracal.3` — build metadata never
+ * affects precedence, so it is validated and then stripped before the
+ * digit-only core check). Anything else fails closed.
  */
 function isValidSemverLike(v: string): boolean {
   if (typeof v !== 'string' || v.length === 0) return false;
-  const parts = v.split('.');
+  const plusIdx = v.indexOf('+');
+  let core = v;
+  if (plusIdx !== -1) {
+    const build = v.slice(plusIdx + 1);
+    if (!/^[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*$/.test(build)) return false;
+    core = v.slice(0, plusIdx);
+  }
+  const parts = core.split('.');
   if (parts.length < 3 || parts.length > 4) return false;
   for (const p of parts) {
     if (p.length === 0) return false;
