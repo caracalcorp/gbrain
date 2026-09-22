@@ -1,11 +1,12 @@
 # Caracal patches
 
-**None.** No hand-written change to upstream source. Everything below is either a
-version string or a file GENERATED from one.
+**One, as of `0.47.9.0+caracal.2`.** Everything else below is either a version
+string or a file GENERATED from one — see *Patches* for the one hand-written change.
 
 Source-identical to upstream v0.47.9.0 (commit
 6bf8db908c8a7b60dcdde2f1c784d4b278f183e0, verified against `garrytan/gbrain`'s
-published tag on 2026-09-01 — peeled through the tag object, not read off the ref).
+published tag on 2026-09-01 — peeled through the tag object, not read off the ref)
+through release `+caracal.1`.
 
 Repinned from v0.46.32.0 the same day, once release #1 had proven the build and
 attestation chain end to end. A repin takes upstream's TREE onto a commit whose
@@ -25,7 +26,20 @@ rather than tracking upstream's HEAD.
 `gbrain --version` reads package.json while release.yml's smoke test compares
 against VERSION, so bumping one alone fails the build job and publishes nothing.
 
-## Delta from upstream, and why none of it is a patch
+## Patches
+
+| # | what | why | upstream status | files |
+|---|---|---|---|---|
+| 1 | `probeProcessLiveness(version)` + `GET /livez` — a DB-free liveness route, additive, `/health` untouched | ACA's `tcpSocket` liveness probe cannot see a wedged event loop (W18); the DB-aware `/health` cannot be the liveness target without dying on every Postgres blip (W17). Splitting the two questions needs an endpoint upstream doesn't have | **not yet opened** — opening the PR against `garrytan/gbrain` is an operator call (`caracalcorp/it` TODOS.md W18 step 1), not automated by this release | `src/commands/serve-http.ts`, `test/serve-http-health.test.ts` |
+
+Cherry-picked from `feat/livez` (`f497a50e5`, cut off the `v0.47.9.0` tag per
+*Upstreaming* below) onto this release branch. `bun test test/serve-http-health.test.ts`
+is 11/11 and `tsc --noEmit` is clean on this patch alone — it does not touch any of
+the four `+`-suffix sites in *Known-red checks*, so it adds no new red job.
+Policy #1 (*each patch has an upstream issue or PR*) is open until the PR above
+exists; recorded here rather than silently satisfied.
+
+## Delta from upstream, and why the rest of it is not a patch
 
 | path | why |
 |---|---|
@@ -86,9 +100,13 @@ dependency of the admin UI, inherited from the pinned upstream tag.
 
 ## The rule
 
-Anything outside the table above is a real patch and needs a row here with an
-upstream issue or PR. Check before every release, do not assert it:
+Anything outside the *Patches* and *Delta from upstream* tables is a real patch and
+needs a row here with an upstream issue or PR. Check before every release, do not
+assert it:
 
     git diff --stat <upstream-tag>..master
+
+Checked for `+caracal.2` — the ten release paths, `CARACAL-PATCHES.md`, and exactly
+the two files in the *Patches* table above; nothing else moved.
 
 Runbook: `infra/brain/FORK.md` in `caracalcorp/it`.
