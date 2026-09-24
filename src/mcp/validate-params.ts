@@ -89,9 +89,12 @@ export function normalizeOptionalParams(op: Operation, params: Record<string, un
  * in the op's params: `_meta` is the MCP client metadata slot (several
  * clients fold it into `arguments`; dispatch reads `_meta.session_id` from
  * it), and `dry_run` is the contract-wide preview flag consumed by
- * buildOperationContext.
+ * buildOperationContext. `acting_user` is a caller-identity TAG some MCP
+ * memory clients (QM's memory-over-MCP provider) append to every routed
+ * read/write; it is accepted and IGNORED — nothing reads it, and it must
+ * never be used for authz (the bearer client credential is the identity).
  */
-export const UNKNOWN_PARAM_ALLOWLIST: ReadonlySet<string> = new Set(['_meta', 'dry_run']);
+export const UNKNOWN_PARAM_ALLOWLIST: ReadonlySet<string> = new Set(['_meta', 'dry_run', 'acting_user']);
 
 /**
  * `_meta.warnings` entry shape (amendment 13) — documented in
