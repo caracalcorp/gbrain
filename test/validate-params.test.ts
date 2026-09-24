@@ -210,14 +210,24 @@ describe('enum membership rejects in BOTH strict modes', () => {
 // ---------------------------------------------------------------------------
 
 describe('_meta / dry_run allowlist', () => {
-  test('the allowlist is exactly the two dispatch passthrough keys', () => {
-    expect([...UNKNOWN_PARAM_ALLOWLIST].sort()).toEqual(['_meta', 'dry_run']);
+  test('the allowlist is exactly the dispatch passthrough keys plus the ignored caller tag', () => {
+    expect([...UNKNOWN_PARAM_ALLOWLIST].sort()).toEqual(['_meta', 'acting_user', 'dry_run']);
+  });
+
+  test('acting_user is accepted and ignored under reject (caracal patch #4: QM interop)', async () => {
+    const out = await dispatchToolCall(stubEngine('reject'), 'resolve_slugs', {
+      partial: 'alice-ex',
+      acting_user: 'user-from-qm',
+    }, DISPATCH_OPTS);
+    expect(out.isError ?? false).toBe(false);
+    expect(out._meta?.warnings).toBeUndefined();
   });
 
   test('allowlisted keys are never flagged (op with an empty param schema)', async () => {
     const out = await dispatchToolCall(stubEngine('warn'), 'get_stats', {
       _meta: { session_id: 'topic-1' },
       dry_run: false,
+      acting_user: 'user-from-qm',
     }, DISPATCH_OPTS);
     expect(out.isError ?? false).toBe(false);
     expect(out._meta?.warnings).toBeUndefined();
