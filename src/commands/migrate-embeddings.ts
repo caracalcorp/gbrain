@@ -34,6 +34,7 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
+import type { GBrainConfig } from '../core/config.ts';
 import { serr, slog } from '../core/console-prefix.ts';
 import {
   planEmbeddingMigration,
@@ -386,7 +387,7 @@ export async function probeTargetReranker(
  * stuck behind `embedding_disabled` reads as stuck, not unconfigured.
  */
 function filePlaneSnapshot(
-  fileCfg: { embedding_model?: string; embedding_dimensions?: number; embedding_disabled?: boolean },
+  fileCfg: Pick<GBrainConfig, 'embedding_model' | 'embedding_dimensions' | 'embedding_disabled'>,
 ): FilePlaneSnapshot {
   return {
     model: fileCfg.embedding_model ?? null,
@@ -861,7 +862,7 @@ export async function runMigrateEmbeddings(
     console.log(`  Brain: ${identity.engine} (${identity.target}); scope: brain-wide (all sources)`);
     console.log(`  Env plane:  GBRAIN_EMBEDDING_MODEL=${envPresence.model ?? '(unset)'} GBRAIN_EMBEDDING_DIMENSIONS=${envPresence.dims ?? '(unset)'}`);
     console.log(`  Keys:       ${Object.entries(keyPresence).map(([k, v]) => `${k}=${v ? 'set' : 'unset'}`).join(' ')}`);
-    console.log(`  File plane: ${filePlane ? `${filePlane.model ?? '(none)'} @ ${filePlane.dims ?? '?'}d${filePlane.embedding_disabled ? ' (embedding_disabled set: migrate clears it)' : ''}` : '(no ~/.gbrain/config.json)'}`);
+    console.log(`  File plane: ${filePlane ? `${filePlane.model ?? '(none)'} @ ${filePlane.dims ?? '?'}d${filePlane.embedding_disabled ? ' (embedding_disabled set: a successful migrate clears it)' : ''}` : '(no ~/.gbrain/config.json)'}`);
     console.log(`  DB plane:   ${report.db_plane.model ?? '(none)'} @ ${report.db_plane.dims ?? '?'}d`);
     console.log(`  Column:     content_chunks.embedding ${report.column_dims === null ? 'absent/unreadable' : `${report.column_dims}d`}${report.pinned_widths.map((p) => `; ${p.table} ${p.dims === null ? '?' : `${p.dims}d`}`).join('')}`);
     console.log(`  Vectors:    ${report.missing_embeddings ?? '?'} chunk(s) missing; ${report.chunkless_pages ?? '?'} contentful page(s) without chunks; facts pending: ${report.facts_pending ?? 'n/a'}`);

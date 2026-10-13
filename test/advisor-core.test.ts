@@ -130,7 +130,11 @@ describe('collect-setup-smells', () => {
     const engine = { getConfig: async () => null };
     const c = ctx(engine as never, { config: { embedding_disabled: true } as AdvisorContext['config'] });
     const out = await collectSetupSmells.collect(c);
-    expect(out.find((f) => f.id === 'embeddings_disabled')).toBeDefined();
+    const finding = out.find((f) => f.id === 'embeddings_disabled');
+    expect(finding).toBeDefined();
+    // Both remediation paths: re-init for an empty brain, migrate once it has content.
+    expect(finding?.detail).toContain('gbrain init --force --embedding-model');
+    expect(finding?.detail).toContain('gbrain migrate embeddings --to');
   });
 });
 

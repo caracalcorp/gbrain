@@ -27,14 +27,16 @@ export const collectSetupSmells: AdvisorCollector = {
 
     // Embeddings disabled — deferred setup never completed. No command_argv:
     // `config set embedding_model` is hard-refused (schema-sizing file-plane
-    // key); the sanctioned path is a re-init.
+    // key); the sanctioned paths are a re-init (empty brain) or
+    // `migrate embeddings`, which embeds existing content and clears the flag.
     if (cfg.embedding_disabled === true) {
       findings.push({
         id: 'embeddings_disabled',
         severity: 'warn',
         title: 'Embeddings are disabled — semantic search and dedup are off.',
         detail:
-          'Enable with `gbrain init --force --embedding-model voyage:voyage-4` ' +
+          'Enable with `gbrain init --force --embedding-model voyage:voyage-4` on an empty brain, ' +
+          'or `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024` once it has content ' +
           '(set VOYAGE_API_KEY first).',
         fix: { command_argv: null },
         collector: 'setup-smells',

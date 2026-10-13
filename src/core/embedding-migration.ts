@@ -1019,6 +1019,8 @@ export interface MigrationVerify {
 
 /** File-plane embedding settings (no env merge); `embedding_disabled` = keyless-init sentinel set, no model live. */
 export type FilePlaneSnapshot = { model?: string | null; dims?: number | null; embedding_disabled?: true };
+export const FILE_PLANE_SENTINEL_BLOCKER = 'runtime config (file plane) has embedding_disabled set (deferred setup) — a successful migrate clears it';
+export const FILE_PLANE_OFF_TARGET_BLOCKER = 'runtime config (file plane) does not point at the target yet';
 
 export async function verifyMigrationComplete(
   engine: BrainEngine,
@@ -1138,11 +1140,7 @@ export async function verifyMigrationComplete(
     ? !fp.embedding_disabled && fp.model === target.toModel && Number(fp.dims) === target.toDims
     : opts.envMatchesTarget === true; // env-canonical mode: no file plane, env pins the target
   if (!filePlaneOk) {
-    blockers.push(
-      fp?.embedding_disabled
-        ? 'runtime config (file plane) has embedding_disabled set (deferred setup) — the run clears it'
-        : 'runtime config (file plane) does not point at the target yet',
-    );
+    blockers.push(fp?.embedding_disabled ? FILE_PLANE_SENTINEL_BLOCKER : FILE_PLANE_OFF_TARGET_BLOCKER);
   }
 
   return {

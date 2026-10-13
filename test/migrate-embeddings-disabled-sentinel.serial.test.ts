@@ -18,7 +18,11 @@ import {
   planMigrationFlow,
   runMigrateEmbeddings,
 } from '../src/commands/migrate-embeddings.ts';
-import { verifyMigrationComplete } from '../src/core/embedding-migration.ts';
+import {
+  FILE_PLANE_OFF_TARGET_BLOCKER,
+  FILE_PLANE_SENTINEL_BLOCKER,
+  verifyMigrationComplete,
+} from '../src/core/embedding-migration.ts';
 import {
   configureGateway,
   resetGateway,
@@ -36,6 +40,27 @@ function cfgPath(): string {
 }
 function readCfg(): Record<string, unknown> {
   return JSON.parse(readFileSync(cfgPath(), 'utf-8')) as Record<string, unknown>;
+}
+
+class ExitError extends Error {
+  constructor(public code: number) { super(`exit ${code}`); }
+}
+const exitSeam = (code: number): never => { throw new ExitError(code); };
+
+/** Run the CLI entry with console.log captured; returns its exit code and stdout. */
+async function runMigrate(engine: PGLiteEngine, args: string[]): Promise<{ code: number; out: string }> {
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...a: unknown[]) => { lines.push(a.map(String).join(' ')); };
+  try {
+    await runMigrateEmbeddings(engine, args, { exit: exitSeam });
+    throw new Error('runMigrateEmbeddings returned without exiting');
+  } catch (e) {
+    if (e instanceof ExitError) return { code: e.code, out: lines.join('\n') };
+    throw e;
+  } finally {
+    console.log = orig;
+  }
 }
 
 beforeAll(() => {
@@ -87,26 +112,6 @@ test('persistEmbeddingFileConfig clears the deferred-setup sentinel', async () =
  * seam=none (reached via planMigrationFlow + runMigrateEmbeddings CLI entry).
  */
 describe('stuck sentinel (model already at target)', () => {
-  class ExitError extends Error {
-    constructor(public code: number) { super(`exit ${code}`); }
-  }
-  const exitSeam = (code: number): never => { throw new ExitError(code); };
-
-  async function runMigrate(engine: PGLiteEngine, args: string[]): Promise<{ code: number; out: string }> {
-    const lines: string[] = [];
-    const orig = console.log;
-    console.log = (...a: unknown[]) => { lines.push(a.map(String).join(' ')); };
-    try {
-      await runMigrateEmbeddings(engine, args, { exit: exitSeam });
-      throw new Error('runMigrateEmbeddings returned without exiting');
-    } catch (e) {
-      if (e instanceof ExitError) return { code: e.code, out: lines.join('\n') };
-      throw e;
-    } finally {
-      console.log = orig;
-    }
-  }
-
   // Each group gets its own empty brain at the target width, so a group that
   // runs the migration can't leave state behind for another.
   function useFreshEngine(): () => PGLiteEngine {
@@ -183,7 +188,7 @@ describe('stuck sentinel (model already at target)', () => {
       expect(ctx.verify.complete).toBe(false);
       // The blocker names the sentinel, matching what --status shows.
       expect(ctx.verify.blockers).toContain(
-        'runtime config (file plane) has embedding_disabled set (deferred setup) — the run clears it',
+        FILE_PLANE_SENTINEL_BLOCKER,
       );
     }, 30000);
 
@@ -197,7 +202,7 @@ describe('stuck sentinel (model already at target)', () => {
     test('--status names the sentinel in the human file-plane line', async () => {
       const { code, out } = await runMigrate(engine(), ['--status']);
       expect(code).toBe(0);
-      expect(out).toContain(`File plane: ${TARGET} @ ${TARGET_DIMS}d (embedding_disabled set: migrate clears it)`);
+      expect(out).toContain(`File plane: ${TARGET} @ ${TARGET_DIMS}d (embedding_disabled set: a successful migrate clears it)`);
     }, 30000);
   });
 
@@ -225,27 +230,12 @@ describe('stuck sentinel (model already at target)', () => {
 });
 
 describe('file-plane conjunct edges', () => {
-  class ExitError extends Error {
-    constructor(public code: number) { super(`exit ${code}`); }
-  }
   let engine: PGLiteEngine;
 
   async function status(args: string[]): Promise<string> {
-    const lines: string[] = [];
-    const orig = console.log;
-    console.log = (...a: unknown[]) => { lines.push(a.map(String).join(' ')); };
-    try {
-      await runMigrateEmbeddings(engine, ['--status', ...args], {
-        exit: (code: number): never => { throw new ExitError(code); },
-      });
-      throw new Error('runMigrateEmbeddings returned without exiting');
-    } catch (e) {
-      if (!(e instanceof ExitError)) throw e;
-      expect(e.code).toBe(0);
-      return lines.join('\n');
-    } finally {
-      console.log = orig;
-    }
+    const { code, out } = await runMigrate(engine, ['--status', ...args]);
+    expect(code).toBe(0);
+    return out;
   }
 
   beforeAll(async () => {
@@ -274,8 +264,8 @@ describe('file-plane conjunct edges', () => {
    */
   test('verify: env-canonical and sentinel-precedence rows', async () => {
     const target = { toModel: TARGET, toDims: TARGET_DIMS };
-    const SENTINEL = 'runtime config (file plane) has embedding_disabled set (deferred setup) — the run clears it';
-    const OFF = 'runtime config (file plane) does not point at the target yet';
+    const SENTINEL = FILE_PLANE_SENTINEL_BLOCKER;
+    const OFF = FILE_PLANE_OFF_TARGET_BLOCKER;
     const rows: Array<{ name: string; opts: Parameters<typeof verifyMigrationComplete>[2]; ok: boolean; blocker?: string }> = [
       { name: 'no file plane, env pins target', opts: { filePlane: null, envMatchesTarget: true, envPresent: true }, ok: true },
       { name: 'no file plane, env does not pin', opts: { filePlane: null, envMatchesTarget: false, envPresent: false }, ok: false, blocker: OFF },
