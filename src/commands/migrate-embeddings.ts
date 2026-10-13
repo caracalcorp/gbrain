@@ -281,6 +281,13 @@ function renderApplySummary(
   return `  [migrate] schema ${schema}; ${result.invalidated} chunk(s) invalidated; query cache purged (${result.cache_cleared} row(s)).`;
 }
 
+/** Repeats the env-only provider settings note at the end, where a long drain can't scroll it away. */
+function renderEnvOnlyKeys(keys: string[] | undefined): string[] {
+  return keys?.length
+    ? [`  [migrate] NOTE: ${keys.join(', ')} came only from this shell's environment; later gbrain processes (cron, hooks) need it too.`]
+    : [];
+}
+
 function renderRerankerOutcome(outcome: RerankerOutcome): string[] {
   switch (outcome.action) {
     case 'switched':
@@ -458,20 +465,31 @@ export async function persistEmbeddingFileConfig(
   saveConfig(fileCfg);
   let envOnly: string[] = [];
   if (leavingKeylessMode) {
-    // Leaving keyless mode is durable, so the provider key must be too: a key
-    // passed only to this run would make every later embed (cron, hooks) fail
-    // where keyless mode exited quietly. Optional auth vars count when this
-    // run is actually using them from env.
+    // Leaving keyless mode is durable, so the provider settings must be too:
+    // one passed only to this run would make every later embed (cron, hooks)
+    // fail where keyless mode exited quietly. Optional vars count only when
+    // this run actually took them from env.
     const { getRecipe } = await import('../core/ai/recipes/index.ts');
     const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
+    const providerId = toModel.split(':')[0];
     const fileKeys = mergedProviderEnv(fileCfg, {});
-    const auth = getRecipe(toModel.split(':')[0])?.auth_env;
+    // Every env name the file plane CAN supply: mergedProviderEnv over a config
+    // whose every field is set.
+    const slotted = new Set(Object.keys(mergedProviderEnv(new Proxy({}, { get: () => 'x' }) as GBrainConfig, {})));
+    const stored = (k: string) =>
+      Boolean(fileKeys[k]) || (k.endsWith('_BASE_URL') && Boolean(fileCfg.provider_base_urls?.[providerId]));
+    const auth = getRecipe(providerId)?.auth_env;
     envOnly = [
-      ...(auth?.required ?? []).filter((k) => !fileKeys[k]),
-      ...(auth?.optional ?? []).filter((k) => process.env[k] && !fileKeys[k]),
-    ];
-    if (envOnly.length > 0) {
-      serr(`  [migrate] embedding_disabled cleared — ${envOnly.join(', ')} is not in ${configPath()}; make it available to every gbrain process (cron, hooks) or later embeds will fail.`);
+      ...(auth?.required ?? []),
+      ...(auth?.optional ?? []).filter((k) => process.env[k]),
+    ].filter((k) => !stored(k));
+    const storable = envOnly.filter((k) => slotted.has(k));
+    const noSlot = envOnly.filter((k) => !slotted.has(k));
+    if (storable.length > 0) {
+      serr(`  [migrate] embedding_disabled cleared — ${storable.join(', ')} is not in ${configPath()}; store it there (gbrain config set ${storable[0].toLowerCase()} <value>) or later embeds (cron, hooks) will fail.`);
+    }
+    if (noSlot.length > 0) {
+      serr(`  [migrate] embedding_disabled cleared — ${noSlot.join(', ')} can only come from the environment; export it for every gbrain process (cron, hooks) or later embeds will fail.`);
     }
   }
   // Reconfigure the in-process gateway from the MERGED view (env still wins
@@ -1101,6 +1119,7 @@ export async function runMigrateEmbeddings(
     case 'applied_no_embed': {
       serr(renderApplySummary(result, plan));
       for (const line of renderRerankerOutcome(result.reranker)) serr(line);
+      for (const line of renderEnvOnlyKeys(result.env_only_keys)) serr(line);
       if (!flags.json) console.log('Config + schema migrated. Re-embed deferred — run: gbrain embed --stale --catch-up --include-null-signature');
       exit(0);
       break;
@@ -1111,6 +1130,7 @@ export async function runMigrateEmbeddings(
         serr(`  [migrate] reconciled the embedding signature on ${result.signatures_reconciled} fully-embedded page(s) (batch-boundary pages).`);
       }
       for (const line of renderRerankerOutcome(result.reranker)) serr(line);
+      for (const line of renderEnvOnlyKeys(result.env_only_keys)) serr(line);
       // Honestly labeled: a smoke check (self-retrieval), not a recall eval —
       // BrainBench owns retrieval quality.
       if (result.verify_search.status === 'pass') {
@@ -1133,6 +1153,7 @@ export async function runMigrateEmbeddings(
     }
     case 'incomplete': {
       for (const line of renderRerankerOutcome(result.reranker)) serr(line);
+      for (const line of renderEnvOnlyKeys(result.env_only_keys)) serr(line);
       if (result.lock_lost) {
         serr(`Migration aborted: the single-flight lock was lost mid-drain (stolen or the heartbeat kept failing).`);
         serr(`${result.remaining} chunk(s) still stale; partial progress is banked. Re-run the same command once the other holder finishes.`);

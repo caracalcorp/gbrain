@@ -12,6 +12,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { loadConfig } from '../src/core/config.ts';
+import { getRecipe } from '../src/core/ai/recipes/index.ts';
 import { assertEmbeddingEnabled } from '../src/core/embedding-dim-check.ts';
 import {
   persistEmbeddingFileConfig,
@@ -65,7 +66,13 @@ async function runMigrate(engine: PGLiteEngine, args: string[]): Promise<{ code:
 }
 
 beforeAll(() => {
-  for (const k of ['GBRAIN_HOME', 'GBRAIN_EMBEDDING_MODEL', 'GBRAIN_EMBEDDING_DIMENSIONS', 'DATABASE_URL', 'OPENAI_API_KEY', 'VOYAGE_API_KEY', 'ZEROENTROPY_API_KEY']) {
+  // Every auth var (required + optional) of the recipes used here, so the
+  // env-only checks never see a developer's exported OPENAI_ORG_ID et al.
+  const recipeAuthVars = ['openai', 'voyage', 'azure-openai', 'ollama'].flatMap((id) => {
+    const auth = getRecipe(id)?.auth_env;
+    return [...(auth?.required ?? []), ...(auth?.optional ?? [])];
+  });
+  for (const k of ['GBRAIN_HOME', 'GBRAIN_EMBEDDING_MODEL', 'GBRAIN_EMBEDDING_DIMENSIONS', 'DATABASE_URL', 'ZEROENTROPY_API_KEY', ...recipeAuthVars]) {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }
@@ -110,7 +117,7 @@ test('persistEmbeddingFileConfig warns when the target key lives only in this pr
     const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('voyage:voyage-4', 1024); });
     expect(envOnly).toEqual(['VOYAGE_API_KEY']);
     // Names the config file gbrain actually reads (GBRAIN_HOME-relative), not a hardcoded path.
-    expect(err).toContain(`embedding_disabled cleared — VOYAGE_API_KEY is not in ${cfgPath()}`);
+    expect(err).toContain(`embedding_disabled cleared — VOYAGE_API_KEY is not in ${cfgPath()}; store it there (gbrain config set voyage_api_key <value>)`);
     expect(readCfg().embedding_disabled).toBeUndefined();
   } finally {
     delete process.env.VOYAGE_API_KEY;
@@ -137,6 +144,39 @@ test('persistEmbeddingFileConfig also flags optional auth vars this run takes fr
   } finally {
     if (saved === undefined) delete process.env.AZURE_OPENAI_API_KEY;
     else process.env.AZURE_OPENAI_API_KEY = saved;
+    writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
+  }
+});
+
+test('persistEmbeddingFileConfig: a base URL stored in provider_base_urls is not env-only', async () => {
+  writeFileSync(cfgPath(), JSON.stringify({
+    engine: 'pglite',
+    embedding_disabled: true,
+    provider_base_urls: { ollama: 'http://127.0.0.1:11434/v1' },
+  }, null, 2));
+  process.env.OLLAMA_BASE_URL = 'http://127.0.0.1:11434/v1';
+  try {
+    let envOnly: string[] = ['unset'];
+    const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('ollama:nomic-embed-text', 768); });
+    expect(envOnly).toEqual([]);
+    expect(err).not.toContain('embedding_disabled cleared');
+  } finally {
+    delete process.env.OLLAMA_BASE_URL;
+    writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
+  }
+});
+
+test('persistEmbeddingFileConfig: a setting config.json cannot hold gets export advice, not store advice', async () => {
+  writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, openai_api_key: 'sk-file' }, null, 2));
+  process.env.OPENAI_ORG_ID = 'org-env-only';
+  try {
+    let envOnly: string[] = [];
+    const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('openai:text-embedding-3-small', 1536); });
+    expect(envOnly).toEqual(['OPENAI_ORG_ID']);
+    expect(err).toContain('OPENAI_ORG_ID can only come from the environment; export it for every gbrain process');
+    expect(err).not.toContain('store it there');
+  } finally {
+    delete process.env.OPENAI_ORG_ID;
     writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
   }
 });
@@ -267,6 +307,24 @@ describe('stuck sentinel (model already at target)', () => {
       expect(report.keys.VOYAGE_API_KEY).toBe(false);
       expect(report.key_sources.VOYAGE_API_KEY).toBeNull();
       expect((await runMigrate(engine(), ['--status'])).out).toContain('OPENAI_API_KEY=set (file)');
+
+      // env-only and env+file
+      process.env.VOYAGE_API_KEY = 'pa-env';
+      process.env.OPENAI_API_KEY = 'sk-env';
+      try {
+        const both = JSON.parse((await runMigrate(engine(), ['--status', '--json'])).out) as {
+          keys: Record<string, boolean>; key_sources: Record<string, string | null>;
+        };
+        expect(both.key_sources.VOYAGE_API_KEY).toBe('env');
+        expect(both.key_sources.OPENAI_API_KEY).toBe('env+file');
+        expect(both.keys.VOYAGE_API_KEY).toBe(true);
+        const human = (await runMigrate(engine(), ['--status'])).out;
+        expect(human).toContain('VOYAGE_API_KEY=set (env)');
+        expect(human).toContain('OPENAI_API_KEY=set (env+file)');
+      } finally {
+        delete process.env.VOYAGE_API_KEY;
+        delete process.env.OPENAI_API_KEY;
+      }
     }, 30000);
 
     test('--status names the sentinel in the human file-plane line', async () => {
@@ -294,11 +352,16 @@ describe('stuck sentinel (model already at target)', () => {
     test('the migrate result reports the env-only key (CLI JSON and the MCP op share it)', async () => {
       process.env.OPENAI_API_KEY = 'sk-env-only';
       try {
-        const run = await runMigrate(engine(), ['--to', TARGET, '--dim', String(TARGET_DIMS), '--yes', '--json']);
+        let run = { code: -1, out: '' };
+        const err = await captureStderr(async () => {
+          run = await runMigrate(engine(), ['--to', TARGET, '--dim', String(TARGET_DIMS), '--yes', '--json']);
+        });
         expect(run.code).toBe(0);
         const report = JSON.parse(run.out) as { status: string; env_only_keys?: string[] };
         expect(report.status).toBe('completed');
         expect(report.env_only_keys).toEqual(['OPENAI_API_KEY']);
+        // Repeated in the final summary, after the drain, so it can't scroll away.
+        expect(err).toContain("[migrate] NOTE: OPENAI_API_KEY came only from this shell's environment");
       } finally {
         delete process.env.OPENAI_API_KEY;
       }

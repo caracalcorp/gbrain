@@ -135,8 +135,8 @@ export interface GBrainConfig {
   /**
    * v0.37 (D9): user opted into deferred-setup mode at init time via
    * `gbrain init --no-embedding`. When true, embed callsites and `gbrain
-   * import` refuse with a `gbrain config set embedding_model <id>` hint
-   * rather than proceeding with a default that may not match a real key.
+   * import` refuse with ENABLE_EMBEDDINGS_HINT (embedding-dim-check.ts) instead
+   * of a default that may not match a real key; a successful migrate clears it.
    * Mutually exclusive with `embedding_model` being set — init writes one
    * or the other, never both.
    */
