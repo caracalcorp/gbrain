@@ -1021,8 +1021,9 @@ export async function verifyMigrationComplete(
   engine: BrainEngine,
   target: { toModel: string; toDims: number },
   opts: {
-    /** File-plane config read WITHOUT env merge (loadConfigFileOnly). */
-    filePlane?: { model?: string | null; dims?: number | null } | null;
+    /** File-plane config read WITHOUT env merge (loadConfigFileOnly). A set
+     *  `embedding_disabled` (keyless-init sentinel) means no model is live. */
+    filePlane?: { model?: string | null; dims?: number | null; embedding_disabled?: boolean } | null;
     /** True when GBRAIN_EMBEDDING_* env exactly matches the target. */
     envMatchesTarget?: boolean;
     /** True when GBRAIN_EMBEDDING_* env is set at all. */
@@ -1132,10 +1133,14 @@ export async function verifyMigrationComplete(
 
   const fp = opts.filePlane;
   const filePlaneOk = fp
-    ? fp.model === target.toModel && Number(fp.dims) === target.toDims
+    ? !fp.embedding_disabled && fp.model === target.toModel && Number(fp.dims) === target.toDims
     : opts.envMatchesTarget === true; // env-canonical mode: no file plane, env pins the target
   if (!filePlaneOk) {
-    blockers.push('runtime config (file plane) does not point at the target yet');
+    blockers.push(
+      fp?.embedding_disabled
+        ? 'runtime config (file plane) has embedding_disabled set (deferred setup) — the run clears it'
+        : 'runtime config (file plane) does not point at the target yet',
+    );
   }
 
   return {

@@ -79,7 +79,8 @@ test('persistEmbeddingFileConfig clears the deferred-setup sentinel', async () =
  *   verified-skipping, with or without an embedding backlog;
  * fails_when=the verify file-plane read ignores embedding_disabled (verify says
  *   complete, a backlog-free run exits skipped_no_work, the sentinel stays on
- *   forever), or --status hides the sentinel behind a (none) model;
+ *   forever), --status hides the sentinel behind a (none) model, or the
+ *   sentinel marker leaks onto a clean config;
  * why_new=existing flow/hardening tests never seed embedding_disabled, and the
  *   persist test above only covers the write path, not the self-heal verdict;
  * seam=none (reached via planMigrationFlow + runMigrateEmbeddings CLI entry).
@@ -138,6 +139,13 @@ describe('stuck sentinel (model already at target)', () => {
     const second = await runMigrate(engine, ['--to', TARGET, '--dim', String(TARGET_DIMS), '--yes', '--json']);
     expect(second.code).toBe(0);
     expect((JSON.parse(second.out) as { status: string }).status).toBe('skipped_no_work');
+
+    // With the sentinel gone, --status carries no sentinel marker either way.
+    const statusJson = await runMigrate(engine, ['--status', '--json']);
+    expect((JSON.parse(statusJson.out) as { file_plane: unknown }).file_plane).toEqual({ model: TARGET, dims: TARGET_DIMS });
+    const statusHuman = await runMigrate(engine, ['--status']);
+    expect(statusHuman.out).toContain(`File plane: ${TARGET} @ ${TARGET_DIMS}d\n`);
+    expect(statusHuman.out).not.toContain('embedding_disabled');
   }
 
   // The file plane already names the target model, but the keyless sentinel
@@ -172,6 +180,10 @@ describe('stuck sentinel (model already at target)', () => {
       const ctx = await planMigrationFlow(engine(), { to: TARGET, dim: TARGET_DIMS });
       expect(ctx.verify.details.file_plane_ok).toBe(false);
       expect(ctx.verify.complete).toBe(false);
+      // The blocker names the sentinel, matching what --status shows.
+      expect(ctx.verify.blockers).toContain(
+        'runtime config (file plane) has embedding_disabled set (deferred setup) — the run clears it',
+      );
     }, 30000);
 
     test('--status --json shows the model and flags the sentinel', async () => {

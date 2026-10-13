@@ -380,15 +380,18 @@ export async function probeTargetReranker(
 }
 
 /**
- * The file plane's effective embedding target, as verify sees it. A persisted
- * deferred-setup sentinel (`embedding_disabled: true`) means no model is live,
- * whatever `embedding_model` says, so verify keeps the config step outstanding.
+ * The file plane's embedding settings as plan verify and `--status` read them:
+ * raw model/dims plus the keyless-init sentinel when it is set, so a brain
+ * stuck behind `embedding_disabled` reads as stuck, not unconfigured.
  */
-function filePlaneEmbedding(
+function filePlaneSnapshot(
   fileCfg: { embedding_model?: string; embedding_dimensions?: number; embedding_disabled?: boolean },
-): { model: string | null; dims: number | null } {
-  if (fileCfg.embedding_disabled) return { model: null, dims: null };
-  return { model: fileCfg.embedding_model ?? null, dims: fileCfg.embedding_dimensions ?? null };
+): { model: string | null; dims: number | null; embedding_disabled?: true } {
+  return {
+    model: fileCfg.embedding_model ?? null,
+    dims: fileCfg.embedding_dimensions ?? null,
+    ...(fileCfg.embedding_disabled ? { embedding_disabled: true as const } : {}),
+  };
 }
 
 /**
@@ -563,12 +566,12 @@ export async function planMigrationFlow(
   const envMatchesTarget = envFullyPinsTarget(plan.to_model, plan.to_dims);
 
   // File plane read WITHOUT env merge — verify must not be poisonable.
-  let filePlane: { model?: string | null; dims?: number | null } | null = null;
+  let filePlane: { model?: string | null; dims?: number | null; embedding_disabled?: true } | null = null;
   try {
     const { loadConfigFileOnly } = await import('../core/config.ts');
     const fileCfg = loadConfigFileOnly();
     filePlane = fileCfg
-      ? filePlaneEmbedding(fileCfg)
+      ? filePlaneSnapshot(fileCfg)
       : null;
   } catch { /* unreadable file plane = absent */ }
 
@@ -827,14 +830,8 @@ export async function runMigrateEmbeddings(
     try {
       const { loadConfigFileOnly, loadConfig } = await import('../core/config.ts');
       const fileCfg = loadConfigFileOnly();
-      // Status shows the raw model/dims plus the deferred-setup sentinel, so a
-      // brain stuck behind `embedding_disabled` reads as stuck, not unconfigured.
       filePlane = fileCfg
-        ? {
-            model: fileCfg.embedding_model ?? null,
-            dims: fileCfg.embedding_dimensions ?? null,
-            ...(fileCfg.embedding_disabled ? { embedding_disabled: true as const } : {}),
-          }
+        ? filePlaneSnapshot(fileCfg)
         : null;
       const cfg = loadConfig();
       if (cfg?.database_url) identity = { engine: 'postgres', target: redactPgUrl(cfg.database_url) };
