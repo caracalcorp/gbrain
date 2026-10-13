@@ -402,15 +402,16 @@ function filePlaneSnapshot(
  * in-process gateway. The gateway reads file/env config, not the DB plane —
  * without this the re-embed would silently run against the OLD provider.
  * Also clears the keyless-init `embedding_disabled` sentinel, warning when
- * the target's API key lives only in this process's env (no-op in
- * env-canonical mode, where there is no file plane to write).
+ * the target's API key lives only in this process's env, and returns those
+ * env-only key names (empty in env-canonical mode, where there is no file
+ * plane to write).
  * Shared by the CLI command and the `migrate_embeddings` op handler.
  */
 export async function persistEmbeddingFileConfig(
   toModel: string,
   toDims: number,
-): Promise<void> {
-  const { loadConfig, loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
+): Promise<string[]> {
+  const { loadConfig, loadConfigFileOnly, saveConfig, configPath } = await import('../core/config.ts');
   const { configureGateway } = await import('../core/ai/gateway.ts');
   const { buildGatewayConfig } = await import('../core/ai/build-gateway-config.ts');
   // Round-2 #2: read the FILE plane, not env-merged loadConfig(). Persisting
@@ -431,7 +432,7 @@ export async function persistEmbeddingFileConfig(
       serr('  [migrate] no ~/.gbrain/config.json — env-canonical mode: GBRAIN_EMBEDDING_* pins the target; keep it set for every gbrain process.');
       const merged = loadConfig();
       if (merged) configureGateway(buildGatewayConfig(merged));
-      return;
+      return [];
     }
     // REFUSE rather than warn-and-proceed. Without a file plane to write, the
     // switch would not survive this process: the next `gbrain` invocation
@@ -455,16 +456,22 @@ export async function persistEmbeddingFileConfig(
   const leavingKeylessMode = fileCfg.embedding_disabled === true;
   delete fileCfg.embedding_disabled;
   saveConfig(fileCfg);
+  let envOnly: string[] = [];
   if (leavingKeylessMode) {
     // Leaving keyless mode is durable, so the provider key must be too: a key
     // passed only to this run would make every later embed (cron, hooks) fail
-    // where keyless mode exited quietly.
+    // where keyless mode exited quietly. Optional auth vars count when this
+    // run is actually using them from env.
     const { getRecipe } = await import('../core/ai/recipes/index.ts');
     const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
     const fileKeys = mergedProviderEnv(fileCfg, {});
-    const envOnly = (getRecipe(toModel.split(':')[0])?.auth_env?.required ?? []).filter((k) => !fileKeys[k]);
+    const auth = getRecipe(toModel.split(':')[0])?.auth_env;
+    envOnly = [
+      ...(auth?.required ?? []).filter((k) => !fileKeys[k]),
+      ...(auth?.optional ?? []).filter((k) => process.env[k] && !fileKeys[k]),
+    ];
     if (envOnly.length > 0) {
-      serr(`  [migrate] embedding_disabled cleared — ${envOnly.join(', ')} is not in ~/.gbrain/config.json; make it available to every gbrain process (cron, hooks) or later embeds will fail.`);
+      serr(`  [migrate] embedding_disabled cleared — ${envOnly.join(', ')} is not in ${configPath()}; make it available to every gbrain process (cron, hooks) or later embeds will fail.`);
     }
   }
   // Reconfigure the in-process gateway from the MERGED view (env still wins
@@ -472,6 +479,7 @@ export async function persistEmbeddingFileConfig(
   // refused before apply).
   const merged = loadConfig();
   configureGateway(buildGatewayConfig(merged ?? fileCfg));
+  return envOnly;
 }
 
 // ============================================================================
@@ -533,6 +541,8 @@ export type MigrationFlowResult =
       invalidated: number; cache_cleared: number;
       schema_transitioned: boolean; pinned_repaired: string[];
       reranker: RerankerOutcome;
+      /** Provider keys this run read only from env (keyless-mode exit). */
+      env_only_keys?: string[];
     }
   | {
       status: 'completed';
@@ -541,6 +551,7 @@ export type MigrationFlowResult =
       schema_transitioned: boolean; pinned_repaired: string[];
       reranker: RerankerOutcome;
       verify_search: VerifySearchOutcome;
+      env_only_keys?: string[];
     }
   | {
       status: 'incomplete';
@@ -549,6 +560,7 @@ export type MigrationFlowResult =
       schema_transitioned: boolean; pinned_repaired: string[];
       reranker: RerankerOutcome;
       lock_skipped?: boolean; lock_lost?: boolean;
+      env_only_keys?: string[];
     };
 
 /**
@@ -717,11 +729,13 @@ export async function executeMigrationFlow(
     const probe = await probeTargetProvider(plan.to_model, plan.to_dims);
     if (!probe.ok) return { status: 'probe_failed', message: probe.message };
 
+    let envOnlyKeys: string[] = [];
     const applied = await applyEmbeddingMigration(engine, plan, {
       ignoreEnvOverride: opts.ignoreEnvOverride,
       forceSunsetTarget: opts.forceSunsetTarget,
-      persistConfig: (m, d) => persistEmbeddingFileConfig(m, d),
+      persistConfig: async (m, d) => { envOnlyKeys = await persistEmbeddingFileConfig(m, d); },
     });
+    const envOnlyField = envOnlyKeys.length > 0 ? { env_only_keys: envOnlyKeys } : {};
     if (applied.status === 'refused') return { status: 'refused_env', warning: applied.warning };
     if (applied.status === 'failed') return { status: 'apply_failed', reason: applied.reason };
 
@@ -755,6 +769,7 @@ export async function executeMigrationFlow(
         schema_transitioned: applied.schema_transitioned,
         pinned_repaired: applied.pinned_repaired,
         reranker,
+        ...envOnlyField,
       };
     }
 
@@ -786,6 +801,7 @@ export async function executeMigrationFlow(
       schema_transitioned: applied.schema_transitioned,
       pinned_repaired: applied.pinned_repaired,
       reranker,
+      ...envOnlyField,
     };
     if (remaining === 0 && !embedResult.lock_lost) {
       // Completion smoke check (D11): warn-don't-block self-retrieval. The
@@ -839,16 +855,23 @@ export async function runMigrateEmbeddings(
   if (args.includes('--status')) {
     const report = await readMigrationStatus(engine);
     const envPresence = detectEnvPresence();
-    // API-key PRESENCE only — never values (Section 3).
+    // API-key PRESENCE only — never values (Section 3). A key counts when
+    // either env or the config file supplies it; key_sources says which.
     const keyPresence: Record<string, boolean> = {};
-    for (const k of ['VOYAGE_API_KEY', 'OPENAI_API_KEY', 'ZEROENTROPY_API_KEY', 'OPENROUTER_API_KEY']) {
-      keyPresence[k] = Boolean(process.env[k]);
-    }
+    const keySources: Record<string, 'env' | 'file' | 'env+file' | null> = {};
     let filePlane: FilePlaneSnapshot | null = null;
     let identity = { engine: 'unknown', target: 'unknown' };
     try {
       const { loadConfigFileOnly, loadConfig } = await import('../core/config.ts');
+      const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
       const fileCfg = loadConfigFileOnly();
+      const fileKeys = mergedProviderEnv(fileCfg, {});
+      for (const k of ['VOYAGE_API_KEY', 'OPENAI_API_KEY', 'ZEROENTROPY_API_KEY', 'OPENROUTER_API_KEY']) {
+        const env = Boolean(process.env[k]);
+        const file = Boolean(fileKeys[k]);
+        keyPresence[k] = env || file;
+        keySources[k] = env && file ? 'env+file' : env ? 'env' : file ? 'file' : null;
+      }
       filePlane = fileCfg
         ? filePlaneSnapshot(fileCfg)
         : null;
@@ -868,6 +891,7 @@ export async function runMigrateEmbeddings(
         identity,
         env: { present: envPresence.present, model: envPresence.model, dims: envPresence.dims },
         keys: keyPresence,
+        key_sources: keySources,
         file_plane: filePlane,
         ...report,
         resume_command: resumeCmd,
@@ -878,7 +902,7 @@ export async function runMigrateEmbeddings(
     console.log('Embedding migration status');
     console.log(`  Brain: ${identity.engine} (${identity.target}); scope: brain-wide (all sources)`);
     console.log(`  Env plane:  GBRAIN_EMBEDDING_MODEL=${envPresence.model ?? '(unset)'} GBRAIN_EMBEDDING_DIMENSIONS=${envPresence.dims ?? '(unset)'}`);
-    console.log(`  Keys:       ${Object.entries(keyPresence).map(([k, v]) => `${k}=${v ? 'set' : 'unset'}`).join(' ')}`);
+    console.log(`  Keys:       ${Object.entries(keyPresence).map(([k, v]) => `${k}=${v ? `set (${keySources[k]})` : 'unset'}`).join(' ')}`);
     console.log(`  File plane: ${filePlane ? `${filePlane.model ?? '(none)'} @ ${filePlane.dims ?? '?'}d${filePlane.embedding_disabled ? ` (embedding_disabled set: ${FILE_PLANE_SENTINEL_HINT})` : ''}` : '(no ~/.gbrain/config.json)'}`);
     console.log(`  DB plane:   ${report.db_plane.model ?? '(none)'} @ ${report.db_plane.dims ?? '?'}d`);
     console.log(`  Column:     content_chunks.embedding ${report.column_dims === null ? 'absent/unreadable' : `${report.column_dims}d`}${report.pinned_widths.map((p) => `; ${p.table} ${p.dims === null ? '?' : `${p.dims}d`}`).join('')}`);

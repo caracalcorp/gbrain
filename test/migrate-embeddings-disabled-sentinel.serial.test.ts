@@ -106,8 +106,11 @@ test('persistEmbeddingFileConfig warns when the target key lives only in this pr
   writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true }, null, 2));
   process.env.VOYAGE_API_KEY = 'pa-env-only';
   try {
-    const err = await captureStderr(() => persistEmbeddingFileConfig('voyage:voyage-4', 1024));
-    expect(err).toContain('embedding_disabled cleared — VOYAGE_API_KEY is not in ~/.gbrain/config.json');
+    let envOnly: string[] = [];
+    const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('voyage:voyage-4', 1024); });
+    expect(envOnly).toEqual(['VOYAGE_API_KEY']);
+    // Names the config file gbrain actually reads (GBRAIN_HOME-relative), not a hardcoded path.
+    expect(err).toContain(`embedding_disabled cleared — VOYAGE_API_KEY is not in ${cfgPath()}`);
     expect(readCfg().embedding_disabled).toBeUndefined();
   } finally {
     delete process.env.VOYAGE_API_KEY;
@@ -116,9 +119,33 @@ test('persistEmbeddingFileConfig warns when the target key lives only in this pr
   }
 });
 
+test('persistEmbeddingFileConfig also flags optional auth vars this run takes from env', async () => {
+  // Azure: endpoint + deployment are required and stored; the API key is optional
+  // and here present only in env, so later processes would fall back without it.
+  writeFileSync(cfgPath(), JSON.stringify({
+    engine: 'pglite',
+    embedding_disabled: true,
+    azure_openai_endpoint: 'https://example.invalid',
+    azure_openai_deployment: 'embed',
+  }, null, 2));
+  const saved = process.env.AZURE_OPENAI_API_KEY;
+  process.env.AZURE_OPENAI_API_KEY = 'az-env-only';
+  try {
+    let envOnly: string[] = [];
+    await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('azure-openai:text-embedding-3-small', 1536); });
+    expect(envOnly).toEqual(['AZURE_OPENAI_API_KEY']);
+  } finally {
+    if (saved === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+    else process.env.AZURE_OPENAI_API_KEY = saved;
+    writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
+  }
+});
+
 test('persistEmbeddingFileConfig clears the deferred-setup sentinel', async () => {
   // The key is on the file plane, so leaving keyless mode is durable: no warning.
-  const err = await captureStderr(() => persistEmbeddingFileConfig('voyage:voyage-4', 1024));
+  let envOnly: string[] = ['unset'];
+  const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('voyage:voyage-4', 1024); });
+  expect(envOnly).toEqual([]);
   expect(err).not.toContain('embedding_disabled cleared');
   const cfg = readCfg();
   expect(cfg.embedding_model).toBe('voyage:voyage-4');
@@ -160,9 +187,11 @@ describe('stuck sentinel (model already at target)', () => {
   async function expectSelfHeal(engine: PGLiteEngine, expectedEmbedded: number): Promise<void> {
     const first = await runMigrate(engine, ['--to', TARGET, '--dim', String(TARGET_DIMS), '--yes', '--json']);
     expect(first.code).toBe(0);
-    const firstReport = JSON.parse(first.out) as { status: string; embedded: number };
+    const firstReport = JSON.parse(first.out) as { status: string; embedded: number; env_only_keys?: string[] };
     expect(firstReport.status).toBe('completed');
     expect(firstReport.embedded).toBe(expectedEmbedded);
+    // The key is on the file plane in these seeds, so nothing is env-only.
+    expect(firstReport.env_only_keys).toBeUndefined();
     expect(await engine.countStaleChunks()).toBe(0);
 
     const cfg = readCfg();
@@ -229,6 +258,17 @@ describe('stuck sentinel (model already at target)', () => {
       expect(report.file_plane).toEqual({ model: TARGET, dims: TARGET_DIMS, embedding_disabled: true });
     }, 30000);
 
+    test('--status counts a key stored in the config file and says where it came from', async () => {
+      const report = JSON.parse((await runMigrate(engine(), ['--status', '--json'])).out) as {
+        keys: Record<string, boolean>; key_sources: Record<string, string | null>;
+      };
+      expect(report.keys.OPENAI_API_KEY).toBe(true);
+      expect(report.key_sources.OPENAI_API_KEY).toBe('file');
+      expect(report.keys.VOYAGE_API_KEY).toBe(false);
+      expect(report.key_sources.VOYAGE_API_KEY).toBeNull();
+      expect((await runMigrate(engine(), ['--status'])).out).toContain('OPENAI_API_KEY=set (file)');
+    }, 30000);
+
     test('--status names the sentinel in the human file-plane line', async () => {
       const { code, out } = await runMigrate(engine(), ['--status']);
       expect(code).toBe(0);
@@ -242,6 +282,27 @@ describe('stuck sentinel (model already at target)', () => {
     test('does the config step instead of verified-skipping, then converges', async () => {
       expect(await engine().countStaleChunks()).toBe(0);
       await expectSelfHeal(engine(), 0);
+    }, 120000);
+  });
+
+  describe('fresh keyless-init brain, key only in this process env', () => {
+    const engine = useFreshEngine();
+    beforeEach(() => {
+      writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true }, null, 2));
+    });
+
+    test('the migrate result reports the env-only key (CLI JSON and the MCP op share it)', async () => {
+      process.env.OPENAI_API_KEY = 'sk-env-only';
+      try {
+        const run = await runMigrate(engine(), ['--to', TARGET, '--dim', String(TARGET_DIMS), '--yes', '--json']);
+        expect(run.code).toBe(0);
+        const report = JSON.parse(run.out) as { status: string; env_only_keys?: string[] };
+        expect(report.status).toBe('completed');
+        expect(report.env_only_keys).toEqual(['OPENAI_API_KEY']);
+      } finally {
+        delete process.env.OPENAI_API_KEY;
+      }
+      expect(readCfg().embedding_disabled).toBeUndefined();
     }, 120000);
   });
 
