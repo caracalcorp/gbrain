@@ -18,6 +18,7 @@ import {
   planMigrationFlow,
   runMigrateEmbeddings,
 } from '../src/commands/migrate-embeddings.ts';
+import { verifyMigrationComplete } from '../src/core/embedding-migration.ts';
 import {
   configureGateway,
   resetGateway,
@@ -221,4 +222,129 @@ describe('stuck sentinel (model already at target)', () => {
       await expectSelfHeal(engine(), 1);
     }, 120000);
   });
+});
+
+describe('file-plane conjunct edges', () => {
+  class ExitError extends Error {
+    constructor(public code: number) { super(`exit ${code}`); }
+  }
+  let engine: PGLiteEngine;
+
+  async function status(args: string[]): Promise<string> {
+    const lines: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => { lines.push(a.map(String).join(' ')); };
+    try {
+      await runMigrateEmbeddings(engine, ['--status', ...args], {
+        exit: (code: number): never => { throw new ExitError(code); },
+      });
+      throw new Error('runMigrateEmbeddings returned without exiting');
+    } catch (e) {
+      if (!(e instanceof ExitError)) throw e;
+      expect(e.code).toBe(0);
+      return lines.join('\n');
+    } finally {
+      console.log = orig;
+    }
+  }
+
+  beforeAll(async () => {
+    // Empty brain at the target width: the file-plane conjunct is the only
+    // thing that can block verify.
+    engine = new PGLiteEngine();
+    await engine.connect({ embedding_dimensions: TARGET_DIMS } as never);
+    await engine.initSchema();
+  }, 60000);
+  afterAll(async () => {
+    await engine?.disconnect();
+  });
+
+  /**
+   * Value: protects=the verify file-plane verdict across the no-config
+   *   env-canonical branch and the sentinel-plus-off-target combo (which
+   *   blocker text wins);
+   * fails_when=the no-file-plane branch stops honoring envMatchesTarget (an
+   *   env-pinned brain can never converge) or starts honoring it when false, or
+   *   the blocker check is reordered so a sentinel brain on the wrong model
+   *   gets the generic "does not point" message that hides the sentinel;
+   * why_new=existing verify calls always pass a file plane; the only
+   *   no-file-plane case (hardening, dims-only env) covers envMatchesTarget
+   *   false, and the sentinel tests only seed an on-target model;
+   * seam=none (verifyMigrationComplete is exported and already called directly).
+   */
+  test('verify: env-canonical and sentinel-precedence rows', async () => {
+    const target = { toModel: TARGET, toDims: TARGET_DIMS };
+    const SENTINEL = 'runtime config (file plane) has embedding_disabled set (deferred setup) — the run clears it';
+    const OFF = 'runtime config (file plane) does not point at the target yet';
+    const rows: Array<{ name: string; opts: Parameters<typeof verifyMigrationComplete>[2]; ok: boolean; blocker?: string }> = [
+      { name: 'no file plane, env pins target', opts: { filePlane: null, envMatchesTarget: true, envPresent: true }, ok: true },
+      { name: 'no file plane, env does not pin', opts: { filePlane: null, envMatchesTarget: false, envPresent: false }, ok: false, blocker: OFF },
+      {
+        name: 'sentinel on AND model off target',
+        opts: { filePlane: { model: 'voyage:voyage-4', dims: 1024, embedding_disabled: true }, envMatchesTarget: false },
+        ok: false,
+        blocker: SENTINEL,
+      },
+      { name: 'model off target, no sentinel', opts: { filePlane: { model: 'voyage:voyage-4', dims: 1024 } }, ok: false, blocker: OFF },
+    ];
+    for (const row of rows) {
+      const v = await verifyMigrationComplete(engine, target, row.opts);
+      expect({ name: row.name, ok: v.details.file_plane_ok }).toEqual({ name: row.name, ok: row.ok });
+      expect({ name: row.name, complete: v.complete }).toEqual({ name: row.name, complete: row.ok });
+      const fpBlockers = v.blockers.filter((b) => b.startsWith('runtime config (file plane)'));
+      expect({ name: row.name, fpBlockers }).toEqual({ name: row.name, fpBlockers: row.blocker ? [row.blocker] : [] });
+    }
+  }, 30000);
+
+  /**
+   * Value: protects=the --status file-plane snapshot shape for a falsy
+   *   sentinel and for a config with no embedding keys (null model/dims, the
+   *   "(none) @ ?d" human line);
+   * fails_when=the snapshot copies embedding_disabled verbatim (a false key
+   *   leaks into JSON and reads as a sentinel field), or drops the `?? null`
+   *   defaults so model/dims vanish from the JSON contract;
+   * why_new=existing status tests only seed configs with model+dims set and
+   *   the sentinel either true or absent;
+   * seam=none (runMigrateEmbeddings {exit} option is pre-existing).
+   */
+  test('--status snapshot: falsy sentinel omitted, missing model/dims are null', async () => {
+    const rows: Array<{ cfg: Record<string, unknown>; json: Record<string, unknown>; human: string }> = [
+      {
+        cfg: { engine: 'pglite', embedding_model: TARGET, embedding_dimensions: TARGET_DIMS, embedding_disabled: false },
+        json: { model: TARGET, dims: TARGET_DIMS },
+        human: `File plane: ${TARGET} @ ${TARGET_DIMS}d\n`,
+      },
+      {
+        cfg: { engine: 'pglite' },
+        json: { model: null, dims: null },
+        human: 'File plane: (none) @ ?d\n',
+      },
+    ];
+    for (const row of rows) {
+      writeFileSync(cfgPath(), JSON.stringify(row.cfg, null, 2));
+      const report = JSON.parse(await status(['--json'])) as { file_plane: Record<string, unknown> | null };
+      expect(report.file_plane).toEqual(row.json);
+      expect(Object.keys(report.file_plane ?? {}).sort()).toEqual(['dims', 'model']);
+      const human = await status([]);
+      expect(human).toContain(row.human);
+      expect(human).not.toContain('embedding_disabled');
+    }
+  }, 30000);
+
+  /**
+   * Value: protects=--status on a brain with no ~/.gbrain/config.json reports
+   *   the file plane as absent (JSON null, human "(no ~/.gbrain/config.json)");
+   * fails_when=a missing file is snapshotted as an empty object ({model:null,
+   *   dims:null}) or the human line renders "(none) @ ?d", making "no config
+   *   file" indistinguishable from "config without embedding keys";
+   * why_new=every existing --status test runs with a config file present;
+   * seam=none (runMigrateEmbeddings {exit} option is pre-existing).
+   */
+  test('--status with no config file reports the file plane absent', async () => {
+    rmSync(cfgPath(), { force: true });
+    const report = JSON.parse(await status(['--json'])) as { file_plane: unknown };
+    expect(report.file_plane).toBeNull();
+    const human = await status([]);
+    expect(human).toContain('File plane: (no ~/.gbrain/config.json)');
+  }, 30000);
 });
