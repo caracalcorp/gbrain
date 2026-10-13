@@ -6,14 +6,16 @@
  */
 
 import type { Operation } from './contract.ts';
-import { enforceClientSlugFence, sourceScopeOpts } from './context.ts';
-import { slugHiddenFromCaller } from '../search/private-visibility.ts';
+import { readPolicyOpts } from './context.ts';
+import { enforceClientSlugFence } from './context.ts';
 
 // --- Raw Data ---
 
 const put_raw_data: Operation = {
   name: 'put_raw_data',
-  description: 'Store raw API response data for a page',
+  idempotent: false,
+  outputRedaction: 'no_stored_text',
+  description: 'Store a raw provider payload (API response JSON) alongside a page, keyed by source. Use when keeping the original data an enrichment came from. Needs write scope. On page_not_found: create or resolve the page first.',
   params: {
     slug: { type: 'string', required: true, description: 'Slug of the page to attach the raw data to.' },
     source: { type: 'string', required: true, description: 'Data source (e.g., crustdata, happenstance)' },
@@ -33,17 +35,19 @@ const put_raw_data: Operation = {
 
 const get_raw_data: Operation = {
   name: 'get_raw_data',
-  description: 'Retrieve raw data for a page',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: { exempt: 'explicit raw sidecar read by slug; governed by page visibility (CEO-17 raw-read exception)' },
+  description: 'Retrieve raw data for a page. Raw data follows the page\'s soft-delete: a tombstoned (soft-deleted) page returns [] exactly like a missing page; restore_page brings the rows back, and get_page include_deleted: true verifies the tombstone.',
   params: {
     slug: { type: 'string', required: true, description: 'Slug of the page whose raw data to fetch.' },
     source: { type: 'string', description: 'Filter by source' },
   },
   handler: async (ctx, p) => {
-    const scope = sourceScopeOpts(ctx);
+    const scope = await readPolicyOpts(ctx);
     // #4352 remediation: a `visibility: private` page's raw data reads
     // exactly like a missing page's ([]) for untrusted callers — no
     // existence oracle.
-    if (await slugHiddenFromCaller(ctx.engine, ctx.remote, p.slug as string, scope)) return [];
     return ctx.engine.getRawData(p.slug as string, p.source as string | undefined, scope);
   },
   scope: 'read',

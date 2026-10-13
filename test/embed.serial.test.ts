@@ -1,4 +1,6 @@
+import { mockEmbedProjectionEngine as mockEngine, embeddingUpdates } from './helpers/embed-projection-mock.ts';
 import { describe, test, expect, mock, beforeEach, afterEach } from 'bun:test';
+import * as realEmbedding from '../src/core/embedding.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { DbLockHandle } from '../src/core/db-lock.ts';
 
@@ -15,6 +17,9 @@ let lastEmbedBatchOpts: unknown = undefined;
 let embedBatchBehavior: ((texts: string[], opts?: unknown) => Promise<Float32Array[]>) | null = null;
 
 mock.module('../src/core/embedding.ts', () => ({
+  // Import's withdrawal path also reaches query-side consumers. Keep the
+  // module's complete export surface while overriding the transport tested here.
+  ...realEmbedding,
   embedBatch: async (texts: string[], opts?: unknown) => {
     activeEmbedCalls++;
     totalEmbedCalls++;
@@ -56,22 +61,6 @@ const { __setEmbedTransportForTests } = await import('../src/core/ai/gateway.ts'
 __setEmbedTransportForTests(async () => ({ embeddings: [], usage: { tokens: 0 } } as any));
 
 // Proxy-based mock engine that matches test/import-file.test.ts pattern.
-function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
-  const calls: { method: string; args: any[] }[] = [];
-  const track = (method: string) => (...args: any[]) => {
-    calls.push({ method, args });
-    if (overrides[method]) return overrides[method](...args);
-    return Promise.resolve(null);
-  };
-  const engine = new Proxy({} as any, {
-    get(_, prop: string) {
-      if (prop === '_calls') return calls;
-      if (overrides[prop]) return overrides[prop];
-      return track(prop);
-    },
-  });
-  return engine;
-}
 
 beforeEach(() => {
   activeEmbedCalls = 0;
@@ -116,6 +105,30 @@ describe('runEmbed --all (parallel)', () => {
     expect(maxConcurrentEmbedCalls).toBeGreaterThan(1);
     // And stayed within the configured limit.
     expect(maxConcurrentEmbedCalls).toBeLessThanOrEqual(10);
+  });
+
+  test('#5183: on Postgres neither embed loop runs more workers than the client pool', async () => {
+    const pages = Array.from({ length: 20 }, (_, i) => ({ slug: `pool-${i}`, source_id: 'default' }));
+    const chunks = (slug: string) => [{ chunk_index: 0, chunk_text: `text for ${slug}`, chunk_source: 'compiled_truth', embedded_at: null, token_count: 4 }];
+    const stale = pages.map((p, i) => ({ slug: p.slug, chunk_index: 0, chunk_text: `text for ${p.slug}`, chunk_source: 'compiled_truth' as const,
+      model: null, token_count: null, source_id: 'default', page_id: i + 1 }));
+    const previousPool = process.env.GBRAIN_POOL_SIZE;
+    process.env.GBRAIN_EMBED_CONCURRENCY = '10';
+    process.env.GBRAIN_POOL_SIZE = '3';
+    try {
+      await runEmbed(mockEngine({ kind: 'postgres', listPages: async () => pages, getChunks: async (slug: string) => chunks(slug), upsertChunks: async () => {} }), ['--all']);
+      expect(totalEmbedCalls).toBe(20);
+      expect(maxConcurrentEmbedCalls).toBeGreaterThan(1);
+      expect(maxConcurrentEmbedCalls).toBeLessThanOrEqual(3);
+      totalEmbedCalls = 0; maxConcurrentEmbedCalls = 0;
+      await runEmbedCore(mockEngine({ kind: 'postgres', countStaleChunks: async () => stale.length, listStaleChunks: async () => stale,
+        getChunks: async (slug: string) => chunks(slug) }), { stale: true });
+      expect(totalEmbedCalls).toBe(20);
+      expect(maxConcurrentEmbedCalls).toBeGreaterThan(1);
+      expect(maxConcurrentEmbedCalls).toBeLessThanOrEqual(3);
+    } finally {
+      if (previousPool === undefined) delete process.env.GBRAIN_POOL_SIZE; else process.env.GBRAIN_POOL_SIZE = previousPool;
+    }
   });
 
   test('v0.41.31: stamps embedding_signature after embedding each page (--all)', async () => {
@@ -221,6 +234,7 @@ describe('runEmbed --all (parallel)', () => {
     const fakeLock: DbLockHandle = {
       id: 'fake-hanging-refresh',
       acquiredAt: '0',
+      acquisitionToken: '00000000-0000-4000-8000-000000000001',
       release: async () => {},
       refresh: async (opts?: { signal?: AbortSignal }) => {
         refreshCalls++;
@@ -543,13 +557,12 @@ describe('runEmbedCore --stale egress fix (SQL-side filter)', () => {
         { chunk_index: 2, chunk_text: 'z', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
       ],
     };
-    const upsertCalls: Array<{ slug: string; chunks: any[] }> = [];
     const engine = mockEngine({
       countStaleChunks: async () => 3,
       listStaleChunks: async () => stale,
       listPages: async () => { listPagesCalled = true; return []; },
       getChunks: async (slug: string) => fullChunks[slug] || [],
-      upsertChunks: async (slug: string, chunks: any[]) => { upsertCalls.push({ slug, chunks }); },
+      upsertChunks: async () => { throw new Error("Embedding must not replace canonical chunks"); },
     });
 
     const result = await runEmbedCore(engine, { stale: true });
@@ -561,18 +574,12 @@ describe('runEmbedCore --stale egress fix (SQL-side filter)', () => {
     expect(result.embedded).toBe(3);
     expect(result.pages_processed).toBe(2);
 
-    // page-b's upsert MUST include the fresh chunk (chunk_index=0) — otherwise
-    // it would be deleted by the upsertChunks != ALL filter. Critical regression check.
-    const pageBUpsert = upsertCalls.find(u => u.slug === 'page-b');
-    expect(pageBUpsert).toBeDefined();
-    const freshChunkInUpsert = pageBUpsert!.chunks.find((c: any) => c.chunk_index === 0);
-    expect(freshChunkInUpsert).toBeDefined();
-    // Fresh chunk has no `embedding` field (preserved via COALESCE in upsertChunks SQL).
-    expect(freshChunkInUpsert.embedding).toBeUndefined();
-    // Previously-stale chunks come through WITH a new embedding.
-    const staleChunkInUpsert = pageBUpsert!.chunks.find((c: any) => c.chunk_index === 1);
-    expect(staleChunkInUpsert.embedding).toBeDefined();
-    expect(staleChunkInUpsert.embedding).toBeInstanceOf(Float32Array);
+    const updates = embeddingUpdates(engine);
+    expect(updates).toHaveLength(3);
+    expect(updates.map((call: any) => call.args[1][5]).sort()).toEqual(['x', 'y', 'z']);
+    expect(updates.every((call: any) => JSON.parse(call.args[1][1]).length === 1536)).toBe(true);
+    expect(fullChunks['page-b'][0]).toMatchObject({ chunk_text: 'fresh', embedded_at: '2026-01-01' });
+    expect((engine as any)._calls.some((call: any) => call.method === 'upsertChunks')).toBe(false);
   });
 
   test('--stale dry-run: counts stale via countStaleChunks (no listStaleChunks call), no embedBatch or upsertChunks', async () => {
@@ -927,9 +934,13 @@ describe('#3374 — transient network retry branch', () => {
     const pageStore = new Map<string, any>();
     const tx = new Proxy({} as any, {
       get(_, prop: string) {
+        if (prop === 'getPage') return (...args: any[]) => (engine.getPage as any)(...args);
+        if (prop === 'readPageSnapshot') return (...args: any[]) => (engine.readPageSnapshot as any)(...args);
         if (prop === 'putPage') {
           return async (slug: string, page: any) => { pageStore.set(slug, page); };
         }
+        // Like a real engine, executeRaw always resolves to a row array.
+        if (prop === 'executeRaw') return () => Promise.resolve([]);
         return () => Promise.resolve(null);
       },
     });
@@ -1044,6 +1055,75 @@ describe('embedAllStale wall-clock budget end-to-end (D3 + D3a)', () => {
   });
 });
 
+// Large-brain ceiling (F4d): a 30-minute budget stop on a 52k-document brain
+// left 51,910 chunks unembedded with exit 0 and no error. A budget stop with
+// work left now reports reason, remaining count and the exact resume command,
+// and the CLI exits with BUDGET_STOP_EXIT_CODE.
+describe('embed --stale time-budget stop is loud (large-brain ceiling)', () => {
+  const rows = Array.from({ length: 10 }, (_, i) => ({
+    slug: `budget-${i}`, chunk_index: 0, chunk_text: `t${i}`, chunk_source: 'compiled_truth' as const,
+    model: null, token_count: 1, source_id: 'default', page_id: i + 1,
+  }));
+  const budgetEngine = () => mockEngine({
+    countStaleChunks: async () => rows.length,
+    listStaleChunks: async (opts: { afterPageId?: number } = {}) => rows.filter(r => r.page_id > (opts.afterPageId ?? 0)).slice(0, 1),
+    getChunks: async (slug: string) => rows.filter(r => r.slug === slug)
+      .map(r => ({ chunk_index: 0, chunk_text: r.chunk_text, chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 })),
+    upsertChunks: async () => {},
+  });
+
+  test('the result names the stop, the remaining stale chunks and the resume command', async () => {
+    process.env.GBRAIN_EMBED_TIME_BUDGET_MS = '100';
+    process.env.GBRAIN_EMBED_CONCURRENCY = '1';
+    embedBatchBehavior = async (texts) => {
+      await new Promise(r => setTimeout(r, 80));
+      return texts.map(() => new Float32Array(1536));
+    };
+    const result = await runEmbedCore(budgetEngine(), { stale: true, sourceId: 'default', batchSize: 1 });
+    expect(result.embedded).toBeGreaterThan(0);
+    expect(result.pages_processed).toBeLessThan(10);
+    expect(result.reason).toBe('time_budget');
+    expect(result.remaining_stale).toBe(10);
+    expect(result.resume_command).toBe('gbrain embed --stale --catch-up --source default');
+  });
+
+  test('the CLI prints the verdict on stdout and exits with the budget-stop status', async () => {
+    const { BUDGET_STOP_EXIT_CODE } = await import('../src/core/exit-codes.ts');
+    const { currentExitCode, _resetCliExitVerdictForTests } = await import('../src/core/cli-force-exit.ts');
+    const { run } = await import('../src/cli/commands/embed.ts');
+    process.env.GBRAIN_EMBED_TIME_BUDGET_MS = '100';
+    process.env.GBRAIN_EMBED_CONCURRENCY = '1';
+    embedBatchBehavior = async (texts) => {
+      await new Promise(r => setTimeout(r, 80));
+      return texts.map(() => new Float32Array(1536));
+    };
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (...args: unknown[]) => { lines.push(args.join(' ')); };
+    _resetCliExitVerdictForTests();
+    try {
+      // `--yes`: an explicit backfill is paid work and this run is the user's approved one.
+      await run(budgetEngine(), ['--stale', '--batch-size', '1', '--yes'], { SELECTED_CONFIG_BY_ENGINE: new Map() } as never);
+      expect(currentExitCode()).toBe(BUDGET_STOP_EXIT_CODE);
+      expect(BUDGET_STOP_EXIT_CODE).toBe(11);
+    } finally {
+      console.log = log;
+      _resetCliExitVerdictForTests();
+      process.exitCode = 0;
+    }
+    const verdict = lines.find(l => l.includes('reason: time_budget'));
+    expect(verdict).toContain('with 10 stale chunk(s) left');
+    expect(verdict).toContain('Finish without a time cap: gbrain embed --stale --catch-up');
+  });
+
+  test('a run that drains everything before the budget reports no stop', async () => {
+    process.env.GBRAIN_EMBED_TIME_BUDGET_MS = '60000';
+    const result = await runEmbedCore(mockEngine({ countStaleChunks: async () => 0 }), { stale: true });
+    expect(result.reason).toBeUndefined();
+    expect(result.remaining_stale).toBeUndefined();
+  });
+});
+
 describe('embedAllStale --source threading (D7)', () => {
   test('countStaleChunks receives the sourceId opt', async () => {
     const { runEmbedCore } = await import('../src/commands/embed.ts');
@@ -1140,7 +1220,7 @@ describe('runEmbed preserves code-chunk metadata across re-embed (regression for
     };
   }
 
-  test('--stale (autopilot path) carries code metadata into upsertChunks', async () => {
+  test('--stale (autopilot path) updates embeddings without rewriting code metadata', async () => {
     const stale = [{
       slug: 'code-page',
       chunk_index: 0,
@@ -1149,49 +1229,58 @@ describe('runEmbed preserves code-chunk metadata across re-embed (regression for
       model: null,
       token_count: 12,
     }];
-    let upsertChunkArgs: any[] | null = null;
+
     const engine = mockEngine({
       countStaleChunks: async () => 1,
       listStaleChunks: async () => stale,
       getChunks: async () => [fullCodeChunk],
-      upsertChunks: async (_slug: string, chunks: any[]) => { upsertChunkArgs = chunks; },
+      upsertChunks: async () => { throw new Error("Embedding must not replace canonical chunks"); },
     });
 
     await runEmbed(engine, ['--stale']);
 
-    expect(upsertChunkArgs).not.toBeNull();
-    expect(upsertChunkArgs!).toHaveLength(1);
-    expect(metadataOf(upsertChunkArgs![0])).toEqual(metadataOf(fullCodeChunk));
+    const updates = embeddingUpdates(engine);
+    expect(updates).toHaveLength(1);
+    expect(updates[0].args[1][5]).toBe(fullCodeChunk.chunk_text);
+    expect(JSON.parse(updates[0].args[1][1])).toHaveLength(1536);
+    expect(metadataOf((await engine.getChunks('code-page'))[0])).toEqual(metadataOf(fullCodeChunk));
+    expect((engine as any)._calls.some((call: any) => call.method === 'upsertChunks')).toBe(false);
   });
 
-  test('--all (full re-embed) carries code metadata into upsertChunks', async () => {
-    let upsertChunkArgs: any[] | null = null;
+  test('--all (full re-embed) updates embeddings without rewriting code metadata', async () => {
+
     const engine = mockEngine({
       listPages: async () => [{ slug: 'code-page' }],
       getChunks: async () => [fullCodeChunk],
-      upsertChunks: async (_slug: string, chunks: any[]) => { upsertChunkArgs = chunks; },
+      upsertChunks: async () => { throw new Error("Embedding must not replace canonical chunks"); },
     });
 
     await runEmbed(engine, ['--all']);
 
-    expect(upsertChunkArgs).not.toBeNull();
-    expect(upsertChunkArgs!).toHaveLength(1);
-    expect(metadataOf(upsertChunkArgs![0])).toEqual(metadataOf(fullCodeChunk));
+    const updates = embeddingUpdates(engine);
+    expect(updates).toHaveLength(1);
+    expect(updates[0].args[1][5]).toBe(fullCodeChunk.chunk_text);
+    expect(JSON.parse(updates[0].args[1][1])).toHaveLength(1536);
+    expect(metadataOf((await engine.getChunks('code-page'))[0])).toEqual(metadataOf(fullCodeChunk));
+    expect((engine as any)._calls.some((call: any) => call.method === 'upsertChunks')).toBe(false);
   });
 
-  test('--slugs (per-page embed) carries code metadata into upsertChunks', async () => {
-    let upsertChunkArgs: any[] | null = null;
+  test('--slugs (per-page embed) updates embeddings without rewriting code metadata', async () => {
+
     const engine = mockEngine({
       getPage: async () => ({ slug: 'code-page', compiled_truth: 'x', timeline: '' }),
       getChunks: async () => [fullCodeChunk],
-      upsertChunks: async (_slug: string, chunks: any[]) => { upsertChunkArgs = chunks; },
+      upsertChunks: async () => { throw new Error("Embedding must not replace canonical chunks"); },
     });
 
     await runEmbed(engine, ['--slugs', 'code-page']);
 
-    expect(upsertChunkArgs).not.toBeNull();
-    expect(upsertChunkArgs!).toHaveLength(1);
-    expect(metadataOf(upsertChunkArgs![0])).toEqual(metadataOf(fullCodeChunk));
+    const updates = embeddingUpdates(engine);
+    expect(updates).toHaveLength(1);
+    expect(updates[0].args[1][5]).toBe(fullCodeChunk.chunk_text);
+    expect(JSON.parse(updates[0].args[1][1])).toHaveLength(1536);
+    expect(metadataOf((await engine.getChunks('code-page'))[0])).toEqual(metadataOf(fullCodeChunk));
+    expect((engine as any)._calls.some((call: any) => call.method === 'upsertChunks')).toBe(false);
   });
 });
 
@@ -1480,6 +1569,7 @@ describe('#4647: heartbeat tick timeout — never-settling refresh', () => {
     const fakeLock: DbLockHandle = {
       id: 'wedged-pool-refresh',
       acquiredAt: '0',
+      acquisitionToken: '00000000-0000-4000-8000-000000000001',
       release: async () => {},
       // The #4647 shape: never settles, never observes the abort signal.
       refresh: () => {

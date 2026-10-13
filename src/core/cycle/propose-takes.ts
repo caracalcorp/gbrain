@@ -37,16 +37,24 @@
  * phase can run hermetically in unit tests without touching the gateway.
  */
 
+import { observationDateLine, observationDateRule, resolveObservationDate, type ObservationDate } from '../ai/date-grounding.ts';
+import { isConsumerDateGroundingOn } from '../facts/extract.ts';
 import { randomUUID, createHash } from 'node:crypto';
 import { BaseCyclePhase, CYCLE_DEADLINE_RESERVE_MS, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { defaultTimeoutMsFor } from '../minions/handler-timeouts.ts';
+import {
+  PROPOSE_TAKES_CALL_TIMEOUT_KEY, PROPOSE_TAKES_CALL_TIMEOUT_MAX_MS, PROPOSE_TAKES_CALL_TIMEOUT_MIN_MS, readPhaseConfigNumber,
+} from './phase-config-values.ts';
 import { chat as gatewayChat, getChatModel, probeChatModel } from '../ai/gateway.ts';
 import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
+import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { upsertExtractRollup, classifyRunStop } from '../extract/rollup-writer.ts';
 import { GBrainError } from '../types.ts';
 import { isConfigTruthy } from '../config.ts';
+import { matchingCloseBracket } from '../llm-json.ts';
+import { TAKE_KIND_VALUES } from '../takes-fence.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseStatus, CyclePhase } from '../cycle.ts';
@@ -56,7 +64,7 @@ import type { PhaseStatus, CyclePhase } from '../cycle.ts';
  * verdicts in `take_proposals` (composite key includes prompt_version) stay
  * valid as audit history; new runs re-spend LLM tokens on every page.
  */
-export const PROPOSE_TAKES_PROMPT_VERSION = 'v0.36.1.0-tuned-cat15';
+export const PROPOSE_TAKES_PROMPT_VERSION = 'v0.36.1.0-tuned-cat15-kinds4736';
 
 /**
  * Sentinel claim_text for the tombstone row written when a page extracts
@@ -90,8 +98,15 @@ export const EMPTY_EXTRACTION_TOMBSTONE_TEXT = '(no gradeable claims)';
  *     (pure facts, direct quotes, restatements).
  *   - conviction inference rules anchored to specific hedging language
  *     ("I bet"/"strong conviction"=0.7-0.85, "I think"/"moderate"=0.5-0.7).
- *   - kind enum kept narrow ('prediction'|'judgment'|'bet') — the v1
- *     stub's 4-tag enum bled into noise classification.
+ *   - kind enum kept narrow — three tags; the v1 stub's 4-tag enum bled
+ *     into noise classification. #4736: the tags now use the fence
+ *     vocabulary parseExtractorOutput accepts ('take'|'bet'|'hunch'); the
+ *     tuned prompt asked for prediction|judgment|bet, which the parser
+ *     allowlist (fact|take|bet|hunch) coerced wholesale to 'take',
+ *     destroying kind provenance on every extraction. Label-only change:
+ *     what counts as gradeable is untouched, so the cat15 F1 numbers above
+ *     still describe the extraction behavior. prediction/judgment stay
+ *     mapped in the parser for cached/old-model outputs.
  *
  * Replaces the v0.36.1.0-stub. If you re-tune, run cat15 against the
  * fixtures before bumping PROPOSE_TAKES_PROMPT_VERSION; the train-holdout
@@ -101,10 +116,11 @@ export const EXTRACT_TAKES_PROMPT = `Extract gradeable claims from the prose bel
 
 A "gradeable claim" is a prediction, recommendation, or interpretive judgment
 that could turn out wrong over time. Examples:
-- "X company will hit ARR milestone by Q3" (prediction)
-- "Y founder is going to struggle with execution" (judgment)
-- "Z market will compress in 18 months" (prediction)
+- "X company will hit ARR milestone by Q3" (take: a prediction)
+- "Y founder is going to struggle with execution" (take: a judgment)
+- "Z market will compress in 18 months" (take: a prediction)
 - "I bet alice wins the round" (bet)
+- "Maybe DTC is quietly coming back" (hunch)
 
 NOT gradeable (do NOT extract these):
 - Pure facts ("X was founded in 2020")
@@ -113,7 +129,7 @@ NOT gradeable (do NOT extract these):
 
 For each gradeable claim, output a JSON object with:
 - claim_text   (string, <=200 chars, paraphrase or near-verbatim from prose)
-- kind         ('prediction' | 'judgment' | 'bet')
+- kind         ('take' = prediction or interpretive judgment | 'bet' = explicit wager language | 'hunch' = low-conviction guess)
 - holder       ('world' | 'people/<slug>' | 'companies/<slug>' | 'brain' — default 'brain' when author asserts the claim)
 - weight       (number 0..1 inferred from hedging language: 'I bet'/'strong conviction'=0.7-0.85,
                 'I think'/'moderate conviction'=0.5-0.7, 'maybe'/'I'd guess'=0.3-0.5)
@@ -136,7 +152,34 @@ export interface ProposedTake {
   holder: string;
   weight: number;
   domain?: string;
+  /**
+   * #4737: 'provider:modelId' of the model that ACTUALLY answered the
+   * extraction call (ChatResult.model — alias/provider-recipe resolution
+   * can differ from the configured string). Stamped by defaultExtractor;
+   * optional so injected test extractors need not care. When present it
+   * wins over the requested model for take_proposals.model_id provenance.
+   */
+  served_model?: string;
 }
+
+/**
+ * #5425 (opt-in, `dream.propose_takes.attribution_rules=true`): speaker and
+ * withdrawal rules for conversation pages, proposed by @clatyceo. Off by
+ * default: a matched cat15-corpus run (Sonnet 4.6, 9 labeled pages x 3)
+ * measured F1 0.896 → 0.876 (recall 0.924 → 0.882) with no attribution error
+ * in either arm to fix. A separate prompt version keeps the two caches apart.
+ */
+export const EXTRACT_TAKES_ATTRIBUTION_RULES = `NOT gradeable either:
+- Claims later withdrawn, corrected, or narrowed in the same page; omit them,
+  or express only the final narrowed scope if it remains gradeable
+
+Attribution: an assistant-authored gradeable judgment may use holder 'brain';
+do not attribute it to the user or another person/company unless that speaker
+explicitly endorses it. Assistant-added plans or deadlines are not user
+commitments by default.
+
+`;
+export const PROPOSE_TAKES_ATTRIBUTION_PROMPT_SUFFIX = '+attribution5425';
 
 /** Extractor function signature — injected for tests; production calls gateway. */
 export type ProposeTakesExtractor = (input: {
@@ -155,6 +198,21 @@ export type ProposeTakesExtractor = (input: {
   /** #4494: escalated cap for the one truncation retry (default
    *  PROPOSE_TAKES_RETRY_MAX_TOKENS; clamped to >= maxTokens). */
   retryMaxTokens?: number;
+  /** #5958: operator-set bound (ms) for each extractor call, base and retry
+   *  alike. The phase reads dream.propose_takes.call_timeout_ms and caps it
+   *  by the phase time left. Absent: extractorCallTimeoutMs(maxTokens). */
+  callBoundMs?: number;
+  /** #5425: include EXTRACT_TAKES_ATTRIBUTION_RULES (opt-in). */
+  attributionRules?: boolean;
+  /**
+   * extraction.date_grounding: resolve relative deadlines ("by Q3", "in 18
+   * months") against the page's observation date. Prompt-only; the
+   * idempotency key (prompt_version) is unchanged so enabling it never
+   * reprocesses pages.
+   */
+  dateGrounding?: boolean;
+  /** The page's observation date (date-grounding.ts), null when undated. */
+  observationDate?: ObservationDate | null;
 }) => Promise<ProposedTake[]>;
 
 export interface ProposeTakesOpts extends BasePhaseOpts {
@@ -312,8 +370,11 @@ export function extractExistingTakesForDedup(pageBody: string): Array<{
   return rows;
 }
 
-/** Per-call wall-clock timeout for the extractor LLM call. */
+/** Per-call wall-clock timeout for the extractor LLM call at the base cap. */
 const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
+/** Ceiling for the scaled timeout: the gateway's own chat default
+ *  (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) bounds the call regardless. */
+const EXTRACTOR_CALL_TIMEOUT_MAX_MS = 300_000;
 
 /**
  * #3763 — output caps for the extractor call. A stopReason 'length' response
@@ -333,6 +394,30 @@ const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
  */
 export const PROPOSE_TAKES_MAX_TOKENS = 2048;
 export const PROPOSE_TAKES_RETRY_MAX_TOKENS = 4096;
+
+/**
+ * Wall-clock timeout for one extractor call, scaled with its output cap
+ * (#5771). A flat 90s sized for the 2048-token base call starved the
+ * truncation retry: at a configured retry_max_tokens of 12000 a dense page's
+ * retry needs well over 90s to generate, so it timed out every cycle and the
+ * page was re-billed (base call + aborted retry) forever with no tombstone.
+ * 90s per PROPOSE_TAKES_MAX_TOKENS of output, floored at 90s, capped at
+ * EXTRACTOR_CALL_TIMEOUT_MAX_MS.
+ */
+function extractorCallTimeoutMs(maxTokens: number): number {
+  const scaled = Math.ceil((EXTRACTOR_CALL_TIMEOUT_MS * maxTokens) / PROPOSE_TAKES_MAX_TOKENS);
+  return Math.min(EXTRACTOR_CALL_TIMEOUT_MAX_MS, Math.max(EXTRACTOR_CALL_TIMEOUT_MS, scaled));
+}
+
+/**
+ * #5958: the configured per-call bound, held to the phase time left so it
+ * never outlasts the phase deadline (never below the default 90s floor, which
+ * the unconfigured path already allows). Unset: no override.
+ */
+function phaseBoundedCallTimeout(configuredMs: number | undefined, phaseRemainingMs: number): { callBoundMs?: number } {
+  if (configuredMs === undefined) return {};
+  return { callBoundMs: Math.min(configuredMs, Math.max(EXTRACTOR_CALL_TIMEOUT_MS, phaseRemainingMs)) };
+}
 
 /**
  * #3763 — halt streak for a dead extractor lane. When EVERY extractor call in
@@ -355,11 +440,22 @@ export const EXTRACTOR_FAILURE_HALT_STREAK = 5;
  * then, the production extractor returns whatever the stub LLM produces —
  * empirically often a sparse list or [].
  */
+/** Prompt flags read once per phase run: #5425 attribution rules and extraction.date_grounding. */
+async function takesPromptFlags(engine: BrainEngine): Promise<{ attributionRules: boolean; dateGrounding: boolean }> {
+  const attributionRules = String(await Promise.resolve(engine.getConfig?.('dream.propose_takes.attribution_rules')).catch(() => null) ?? '').trim() === 'true';
+  return { attributionRules, dateGrounding: await isConsumerDateGroundingOn(engine, 'takes') };
+}
+
 export async function defaultExtractor(
   input: Parameters<ProposeTakesExtractor>[0],
 ): Promise<ProposedTake[]> {
-  const prompt = EXTRACT_TAKES_PROMPT
+  const prompt = (input.attributionRules
+    ? EXTRACT_TAKES_PROMPT.replace('For each gradeable claim,', `${EXTRACT_TAKES_ATTRIBUTION_RULES}For each gradeable claim,`)
+    : EXTRACT_TAKES_PROMPT)
     .replace('{EXISTING_TAKES_JSON}', JSON.stringify(input.existingTakes, null, 2))
+    .replace('PAGE PROSE:\n', input.dateGrounding
+      ? `${observationDateRule()}\n${observationDateLine(input.observationDate ?? resolveObservationDate({ slug: input.pagePath }))}\n\nPAGE PROSE:\n`
+      : 'PAGE PROSE:\n')
     .replace('{PAGE_BODY}', input.pageBody);
 
   // #4494: per-run configurable caps (dream.propose_takes.max_tokens /
@@ -375,12 +471,33 @@ export async function defaultExtractor(
   // Bound each call so one stalled provider socket can't pin the phase for the
   // full gateway default (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) x pageLimit. The
   // caller already catches per-page errors, logs a warning, and continues.
-  const call = (maxTokens: number) => gatewayChat({
-    messages: [{ role: 'user', content: prompt }],
-    ...(input.modelHint ? { model: input.modelHint } : {}),
-    maxTokens,
-    abortSignal: AbortSignal.timeout(EXTRACTOR_CALL_TIMEOUT_MS),
-  });
+  // The bound scales with maxTokens so an escalated or configured larger cap
+  // gets time to generate what it allows. An operator bound (callBoundMs)
+  // takes its place for every call: claude-cli never reports a truncation,
+  // so on that route the retry and its longer scaled bound never happen.
+  const call = (maxTokens: number) => {
+    const boundMs = input.callBoundMs ?? extractorCallTimeoutMs(maxTokens);
+    const ownBound = AbortSignal.timeout(boundMs);
+    return gatewayChat({
+      messages: [{ role: 'user', content: prompt }],
+      ...(input.modelHint ? { model: input.modelHint } : {}),
+      maxTokens,
+      abortSignal: ownBound,
+    }).catch((err: unknown) => {
+      // Reword only what our own bound stopped; any other failure, including
+      // the gateway's shorter chat timeout, keeps its error untouched. The
+      // provider's abort text alone names neither the bound nor the key.
+      if (!ownBound.aborted) throw err;
+      const providerText = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `propose_takes extractor: ${input.pagePath} timed out after ${boundMs} ms, the per-call bound ` +
+        `(${providerText}). To move it, set ${PROPOSE_TAKES_CALL_TIMEOUT_KEY} to whole ms from ` +
+        `${PROPOSE_TAKES_CALL_TIMEOUT_MIN_MS} to ${PROPOSE_TAKES_CALL_TIMEOUT_MAX_MS}. ` +
+        `No tombstone was written; the page is retried next cycle.`,
+        { cause: err },
+      );
+    });
+  };
   let result = await call(baseMaxTokens);
 
   // #3763: a truncated response (stopReason 'length' — e.g. reasoning tokens
@@ -420,7 +537,11 @@ export async function defaultExtractor(
   if (takes.length === 0 && !isWellFormedEmptyExtraction(result.text)) {
     throw new Error('propose_takes extractor: no parseable takes JSON (transient — retry)');
   }
-  return takes;
+  // #4737: model_id provenance comes from the RESPONSE, not the request —
+  // ChatResult.model is the 'provider:modelId' that actually answered.
+  const servedModel =
+    typeof result.model === 'string' && result.model.trim() !== '' ? result.model : undefined;
+  return servedModel ? takes.map((t) => ({ ...t, served_model: servedModel })) : takes;
 }
 
 /**
@@ -450,11 +571,25 @@ export function isWellFormedEmptyExtraction(raw: string): boolean {
   }
 }
 
+
+/**
+ * #4736: kinds the pre-fix EXTRACT_TAKES_PROMPT asked for. Cached and
+ * old-model outputs still emit them; map them onto the fence vocabulary
+ * deterministically so their provenance classifies instead of relying on
+ * the blind coerce-to-'take' default.
+ */
+const LEGACY_EXTRACTOR_KIND_MAP: Record<string, ProposedTake['kind']> = {
+  prediction: 'take',
+  judgment: 'take',
+};
+
 /**
  * Parse extractor output into ProposedTake[]. Handles common LLM output
  * sins (markdown fence wrapping, leading/trailing prose, single-object
  * instead of array). Returns [] on any unrecoverable parse error rather
- * than throwing.
+ * than throwing. Kind tokens are case/whitespace-normalized, matched
+ * against the fence vocabulary (with the #4736 legacy mapping), and
+ * anything else coerces to 'take'.
  */
 export function parseExtractorOutput(raw: string): ProposedTake[] {
   if (!raw || raw.trim().length === 0) return [];
@@ -473,19 +608,13 @@ export function parseExtractorOutput(raw: string): ProposedTake[] {
   try {
     parsed = JSON.parse(text.slice(start));
   } catch {
-    // Fallback: truncate at last ] or } to handle trailing noise (e.g. leftover
-    // markdown fences after <think> stripping). Try array-closing first.
-    const sliced = text.slice(start);
-    const lastArr = sliced.lastIndexOf(']');
-    const lastObj = sliced.lastIndexOf('}');
-    const end = Math.max(lastArr, lastObj);
-    if (end > 0) {
-      try {
-        parsed = JSON.parse(sliced.slice(0, end + 1));
-      } catch {
-        return [];
-      }
-    } else {
+    // Trailing noise (a leftover fence, a `[Source: X]` citation): parse only
+    // up to the value's own closing bracket, never the last bracket in the text.
+    const end = matchingCloseBracket(text, start);
+    if (end === -1) return [];
+    try {
+      parsed = JSON.parse(text.slice(start, end + 1));
+    } catch {
       return [];
     }
   }
@@ -496,9 +625,10 @@ export function parseExtractorOutput(raw: string): ProposedTake[] {
     const r = raw as Record<string, unknown>;
     const claim_text = typeof r.claim_text === 'string' ? r.claim_text.trim() : '';
     if (!claim_text || claim_text.length > 500) continue;
-    const kind = ['fact', 'take', 'bet', 'hunch'].includes(r.kind as string)
-      ? (r.kind as ProposedTake['kind'])
-      : 'take';
+    const kindRaw = typeof r.kind === 'string' ? r.kind.trim().toLowerCase() : '';
+    const kind = TAKE_KIND_VALUES.has(kindRaw)
+      ? (kindRaw as ProposedTake['kind'])
+      : (LEGACY_EXTRACTOR_KIND_MAP[kindRaw] ?? 'take');
     const holder = typeof r.holder === 'string' && r.holder.length > 0 ? r.holder : 'brain';
     const weightRaw = typeof r.weight === 'number' ? r.weight : 0.5;
     const weight = Math.max(0, Math.min(1, weightRaw));
@@ -622,7 +752,8 @@ class ProposeTakesPhase extends BaseCyclePhase {
     }
 
     const extractor = opts.extractor ?? defaultExtractor;
-    const promptVersion = opts.promptVersion ?? PROPOSE_TAKES_PROMPT_VERSION;
+    const { attributionRules, dateGrounding } = await takesPromptFlags(engine);
+    const promptVersion = opts.promptVersion ?? `${PROPOSE_TAKES_PROMPT_VERSION}${attributionRules ? PROPOSE_TAKES_ATTRIBUTION_PROMPT_SUFFIX : ''}`;
     const pageLimit = opts.pageLimit ?? 100;
     const skipPagesWithFence = opts.skipPagesWithFence ?? false;
     // gbrain#4168: explicit test override wins; otherwise the REAL remaining
@@ -660,6 +791,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
       if (retryCap != null) extractorRetryMaxTokens = Math.floor(retryCap);
     } catch { /* keep defaults */ }
     extractorRetryMaxTokens = Math.max(extractorMaxTokens, extractorRetryMaxTokens);
+    const callTimeout = await readPhaseConfigNumber(engine, PROPOSE_TAKES_CALL_TIMEOUT_KEY); // #5874
 
     // With the default (gateway) extractor, skip cheaply when the resolved
     // model's provider can't run — same probe semantics as patterns.ts /
@@ -729,7 +861,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
       budget_exhausted: false,
       llm_calls_succeeded: 0,
       llm_calls_failed: 0,
-      warnings: [],
+      warnings: callTimeout.warning ? [callTimeout.warning] : [],
       deadline_hit: false,
     };
 
@@ -827,6 +959,8 @@ class ProposeTakesPhase extends BaseCyclePhase {
           // #4494: configurable output caps (see resolution above).
           maxTokens: extractorMaxTokens,
           retryMaxTokens: extractorRetryMaxTokens,
+          ...phaseBoundedCallTimeout(callTimeout.value, deadlineMs - (Date.now() - phaseStartMs)),
+          attributionRules, dateGrounding,
         });
       } catch (err) {
         result.llm_calls_failed += 1;
@@ -887,7 +1021,9 @@ class ProposeTakesPhase extends BaseCyclePhase {
             p.weight,
             p.domain ?? null,
             JSON.stringify(existingTakes),
-            modelId,
+            // #4737: prefer the response-derived model (what actually
+            // answered) over the requested one for provenance.
+            p.served_model ?? modelId,
           ],
         );
         result.proposals_inserted += inserted.length;
@@ -935,7 +1071,9 @@ class ProposeTakesPhase extends BaseCyclePhase {
     // v0.42 Wave B3: receipt + rollup for propose_takes. Source-scoped
     // via the read scope. Receipt only when proposals actually written.
     const sourceIdForReceipt = scope.sourceId ?? 'default';
-    if (result.proposals_inserted > 0) {
+    // Managed brains skip the receipt page (a legacy putPage the coordinator
+    // refuses), like extract_atoms and synthesize_concepts; the rollup stays.
+    if (result.proposals_inserted > 0 && !await managedPersistenceEnabled(engine)) {
       try {
         await writeReceipt(engine, {
           kind: 'takes.proposed',

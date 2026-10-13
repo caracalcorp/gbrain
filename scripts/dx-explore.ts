@@ -187,7 +187,7 @@ function ensureGbrainBinary(explicit: string | undefined, rebuild: boolean): str
   }
   fs.mkdirSync(binDir, { recursive: true });
   log('compiling gbrain (bun build --compile)…');
-  const res = spawnSync('bun', ['build', '--compile', '--outfile', binPath, 'src/cli.ts'], {
+  const res = spawnSync('bun', ['build', '--compile', '--no-compile-autoload-bunfig', '--outfile', binPath, 'src/cli.ts'], {
     cwd: REPO_ROOT,
     encoding: 'utf8',
     timeout: 300_000,
@@ -216,7 +216,7 @@ interface ScenarioCtx {
    *  transcripts, the live screen mirror, events.jsonl. Structural, not
    *  checklist: writes go through redactSecrets at the write site. */
   redact: Record<string, string>;
-  events: Array<{ tMs: number; kind: 'input' | 'note' | 'screen'; data: string }>;
+  events: Array<{ tMs: number; kind: 'input' | 'note' | 'screen' | 'friction'; data: string }>;
   t0: number;
 }
 
@@ -256,7 +256,7 @@ function tmp(ctx: ScenarioCtx, prefix: string): string {
   return dir;
 }
 
-function event(ctx: ScenarioCtx, kind: 'input' | 'note' | 'screen', data: string): void {
+function event(ctx: ScenarioCtx, kind: 'input' | 'note' | 'screen' | 'friction', data: string): void {
   ctx.events.push({ tMs: Date.now() - ctx.t0, kind, data });
 }
 

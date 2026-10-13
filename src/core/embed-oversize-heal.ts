@@ -1,3 +1,5 @@
+import { PageRevisionConflictError } from './page-state/types.ts';
+import { readProjectionSnapshot, installPageProjection } from './page-state/projections.ts';
 /**
  * SUP-3874 — heal already-stored chunks that exceed the active embedding
  * model's per-input token limit.
@@ -17,6 +19,7 @@
  */
 
 import { chunkText } from './chunkers/recursive.ts';
+import { fenceTrustMarker, markFenceChunk, unmarkFenceChunk } from './eligibility/fence-overlay.ts';
 import { estimateEmbedTokens } from './chunkers/token-estimate.ts';
 import { resolveMaxChunkTokens } from './embedding-input-limit.ts';
 import type { BrainEngine } from './engine.ts';
@@ -94,16 +97,20 @@ export function healOversizedChunks(
     }
 
     splitCount++;
-    const parts = chunkText(c.chunk_text, { maxTokens });
+    // #5575 ENG-1: a low-tier facts-fence chunk keeps its trust marker on every piece.
+    const { tier, unconfirmed, body } = unmarkFenceChunk(c.chunk_text);
+    const room = tier ? Math.max(1, maxTokens - estimateEmbedTokens(fenceTrustMarker(tier, unconfirmed)) - 1) : maxTokens;
+    const parts = chunkText(body, { maxTokens: room });
     // Pathological: estimator / splitter disagreement — hard-split by chars
     // so we never re-emit the original oversized row unchanged.
     const pieces =
-      parts.length > 1 || (parts[0] && estimateEmbedTokens(parts[0].text) <= maxTokens)
+      parts.length > 1 || (parts[0] && estimateEmbedTokens(parts[0].text) <= room)
         ? parts.map((p) => p.text)
-        : hardSplitByChars(c.chunk_text, maxTokens);
+        : hardSplitByChars(body, room);
 
-    for (const text of pieces) {
-      if (!text) continue;
+    for (const piece of pieces) {
+      if (!piece) continue;
+      const text = tier ? markFenceChunk(tier, piece, unconfirmed) : piece;
       out.push(carryHealedMetadata(c, {
         chunk_index: out.length,
         chunk_text: text,
@@ -167,7 +174,7 @@ export function healedChunksToStaleRows(
  * and re-load. No-op when every chunk already fits.
  */
 export async function healOversizedPageChunks(
-  engine: Pick<BrainEngine, 'getChunks' | 'upsertChunks'>,
+  engine: BrainEngine,
   slug: string,
   opts: {
     sourceId?: string;
@@ -175,28 +182,23 @@ export async function healOversizedPageChunks(
     onSplit?: (splitCount: number) => void;
   } = {},
 ): Promise<{ changed: boolean; splitCount: number; chunks: Chunk[] }> {
-  const getOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
-  const existing = await engine.getChunks(slug, getOpts);
-  const healed = healOversizedChunks(existing, opts.maxTokens ?? resolveMaxChunkTokens());
+  const sourceId = opts.sourceId ?? 'default';
+  const getOpts = { sourceId };
+  const prepared = await readProjectionSnapshot(engine, slug, sourceId, { maxChunkTokens: opts.maxTokens, requireLiveSource: true });
+  if (!prepared) return { changed: false, splitCount: 0, chunks: [] };
+  const existing = prepared.chunks;
+  const healed = healOversizedChunks(existing, prepared.maxChunkTokens);
   if (!healed.changed) {
     return { changed: false, splitCount: 0, chunks: existing };
   }
-  // Freshness guard: the embed single-flight lock does not exclude sync
-  // (different lock keys), so a concurrent import may rewrite this page
-  // between our read and this write — clobbering it with pre-sync splits
-  // would silently desync chunk_text from the page content until the next
-  // edit. Re-read and skip on drift; the next drain pass heals the fresh
-  // rows. (Window shrinks to one query; the upsert itself is keyed on
-  // (chunk_index, chunk_text) so an exact-tie write is content-identical.)
-  const recheck = await engine.getChunks(slug, getOpts);
-  const drifted =
-    recheck.length !== existing.length ||
-    recheck.some((c, i) => c.chunk_index !== existing[i].chunk_index || c.chunk_text !== existing[i].chunk_text);
-  if (drifted) {
-    return { changed: false, splitCount: 0, chunks: recheck };
+  // The final compare and replacement share the same page guard.
+  try {
+    await installPageProjection(engine, prepared, healed.chunks, { seal: true, preserveEmbeddings: true });
+  } catch (error) {
+    if (!(error instanceof PageRevisionConflictError)) throw error;
+    return { changed: false, splitCount: 0, chunks: await engine.getChunks(slug, getOpts) };
   }
   opts.onSplit?.(healed.splitCount);
-  await engine.upsertChunks(slug, healed.chunks, getOpts);
   const refreshed = await engine.getChunks(slug, getOpts);
   return { changed: true, splitCount: healed.splitCount, chunks: refreshed };
 }

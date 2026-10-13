@@ -216,4 +216,129 @@ describe('junk_entity_hubs doctor check (#4222)', () => {
     const check = await checkJunkEntityHubs(engine);
     expect(check.status).toBe('ok');
   });
+
+  test('junk_hub_exempt: true opts an intentional thin hub page out', async () => {
+    await engine.putPage('topic/misc', {
+      type: 'concept',
+      title: 'misc — topic hub (auto-created for graph wiring). Groups its member pages.',
+      compiled_truth: 'stub',
+      timeline: '',
+      frontmatter: { junk_hub_exempt: true, junk_hub_exempt_reason: 'intentional topic-organization scaffolding' },
+    });
+    const batch: LinkBatchInput[] = [];
+    for (let i = 0; i < 4; i++) {
+      const slug = `notes/e-${i}`;
+      await engine.putPage(slug, { type: 'note', title: `Note ${i}`, compiled_truth: 'body', timeline: '' });
+      batch.push({ from_slug: slug, to_slug: 'topic/misc', link_source: 'mentions' });
+    }
+    await engine.addLinksBatch(batch);
+
+    const check = await checkJunkEntityHubs(engine, { edgeThreshold: 3, maxChunks: 2 });
+
+    // Same shape as the junk-hub case above (few chunks, edges over threshold) —
+    // opted out, so it must not appear at all, and with nothing else in the
+    // corpus the check reports ok.
+    expect(check.status).toBe('ok');
+    if (check.details) {
+      const hubs = (check.details as { hubs: Array<{ slug: string }> }).hubs;
+      expect(hubs.some(h => h.slug === 'topic/misc')).toBe(false);
+    }
+  });
+
+  test('a page with the same shape but no exempt marker is still caught (regression control)', async () => {
+    await engine.putPage('topic/unmarked', {
+      type: 'concept', title: 'unmarked hub', compiled_truth: 'stub', timeline: '',
+    });
+    const batch: LinkBatchInput[] = [];
+    for (let i = 0; i < 4; i++) {
+      const slug = `notes/u-${i}`;
+      await engine.putPage(slug, { type: 'note', title: `Note ${i}`, compiled_truth: 'body', timeline: '' });
+      batch.push({ from_slug: slug, to_slug: 'topic/unmarked', link_source: 'mentions' });
+    }
+    await engine.addLinksBatch(batch);
+
+    const check = await checkJunkEntityHubs(engine, { edgeThreshold: 3, maxChunks: 2 });
+
+    expect(check.status).toBe('warn');
+    const hubs = (check.details as { hubs: Array<{ slug: string }> }).hubs;
+    expect(hubs.some(h => h.slug === 'topic/unmarked')).toBe(true);
+  });
+
+  test.each([
+    ['boolean false', false],
+    ['string "false"', 'false'],
+    ['unrelated string', 'nope'],
+  ])('junk_hub_exempt: %s does NOT opt the page out', async (_label, value) => {
+    const slug = `topic/not-exempt-${String(value).replace(/[^a-z0-9]/gi, '')}`;
+    await engine.putPage(slug, {
+      type: 'concept', title: 'not actually exempt', compiled_truth: 'stub', timeline: '',
+      frontmatter: { junk_hub_exempt: value },
+    });
+    const batch: LinkBatchInput[] = [];
+    for (let i = 0; i < 4; i++) {
+      const noteSlug = `notes/${slug.replace('topic/', '')}-${i}`;
+      await engine.putPage(noteSlug, { type: 'note', title: `Note ${i}`, compiled_truth: 'body', timeline: '' });
+      batch.push({ from_slug: noteSlug, to_slug: slug, link_source: 'mentions' });
+    }
+    await engine.addLinksBatch(batch);
+
+    const check = await checkJunkEntityHubs(engine, { edgeThreshold: 3, maxChunks: 2 });
+
+    expect(check.status).toBe('warn');
+    const hubs = (check.details as { hubs: Array<{ slug: string }> }).hubs;
+    expect(hubs.some(h => h.slug === slug)).toBe(true);
+  });
+
+  test('junk_hub_exempt: "true" (string, not boolean) DOES opt the page out', async () => {
+    await engine.putPage('topic/string-true-marked', {
+      type: 'concept', title: 'string-true marked hub', compiled_truth: 'stub', timeline: '',
+      frontmatter: { junk_hub_exempt: 'true' },
+    });
+    const batch: LinkBatchInput[] = [];
+    for (let i = 0; i < 4; i++) {
+      const noteSlug = `notes/st-${i}`;
+      await engine.putPage(noteSlug, { type: 'note', title: `Note ${i}`, compiled_truth: 'body', timeline: '' });
+      batch.push({ from_slug: noteSlug, to_slug: 'topic/string-true-marked', link_source: 'mentions' });
+    }
+    await engine.addLinksBatch(batch);
+
+    const check = await checkJunkEntityHubs(engine, { edgeThreshold: 3, maxChunks: 2 });
+
+    expect(check.status).toBe('ok');
+    if (check.details) {
+      const hubs = (check.details as { hubs: Array<{ slug: string }> }).hubs;
+      expect(hubs.some(h => h.slug === 'topic/string-true-marked')).toBe(false);
+    }
+  });
+});
+
+// #6158: a connector's own contact page collects its source's mention links by design
+// (own-source twin first). Doctor must not call it an extractor-minted junk entity or offer
+// junk_hub_exempt (the connector re-renders the page), and must name the main-brain twin.
+describe('junk_entity_hubs connector contact pages (#6158)', () => {
+  beforeEach(truncateAll);
+
+  test('a connector contact page is reported as a connector twin, not a generic-token entity', async () => {
+    await engine.executeRaw(`INSERT INTO sources (id, name, config) VALUES ('google-example', 'google-example', '{"kind":"google"}'::jsonb) ON CONFLICT (id) DO NOTHING`);
+    await engine.putPage('people/alice-example', { type: 'person', title: 'Alice Example', compiled_truth: 'stub', timeline: '' });
+    await engine.putPage('people/alice-example', { type: 'person', title: 'Alice Example', compiled_truth: 'stub', timeline: '',
+      frontmatter: { google_contact_id: 'c123' } }, { sourceId: 'google-example' });
+    const batch: LinkBatchInput[] = [];
+    for (let i = 0; i < 4; i++) {
+      const slug = `mail/thread-${i}`;
+      await engine.putPage(slug, { type: 'note', title: `Thread ${i}`, compiled_truth: 'body', timeline: '' }, { sourceId: 'google-example' });
+      batch.push({ from_slug: slug, to_slug: 'people/alice-example', link_source: 'mentions', from_source_id: 'google-example', to_source_id: 'google-example' } as LinkBatchInput);
+    }
+    await engine.addLinksBatch(batch);
+
+    const check = await checkJunkEntityHubs(engine, { edgeThreshold: 3, maxChunks: 2 });
+    expect(check.status).toBe('warn');
+    expect(check.message).not.toContain('generic-token');
+    expect(check.message).not.toContain('junk_hub_exempt');
+    expect(check.message).toContain('people/alice-example [google-example]');
+    expect((check as { fix_unavailable_reason?: string }).fix_unavailable_reason).toBe('operator_judgement');
+    const details = check.details as { hubs: unknown[]; connector_twins: Array<Record<string, unknown>> };
+    expect(details.hubs).toEqual([]);
+    expect(details.connector_twins).toEqual([expect.objectContaining({ slug: 'people/alice-example', source_id: 'google-example', canonical_twin: 'people/alice-example' })]);
+  });
 });

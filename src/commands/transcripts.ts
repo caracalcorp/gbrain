@@ -4,8 +4,8 @@
  *
  *   gbrain transcripts recent   — dream-corpus .txt reader (v0.29 surface).
  *   gbrain transcripts ingest   — import dead session logs (Claude Code,
- *                                 Codex, OpenClaw, Hermes) and consumer chat
- *                                 exports (ChatGPT, Claude.ai) into
+ *                                 Codex, OpenClaw, Hermes, Grok) and consumer
+ *                                 chat exports (ChatGPT, Claude.ai) into
  *                                 conversation pages. Local-only, explicit
  *                                 paths are trusted CLI input; embedding is
  *                                 OFF by default (bulk imports defer to the
@@ -15,11 +15,20 @@
  * `gbrain serve` holds the single-writer lock — the lock error names the PID.
  */
 
+import { homedir } from 'node:os';
 import type { BrainEngine } from '../core/engine.ts';
+import type { CliDispatchContext } from '../cli/command-table.ts';
+import type { RecentTranscript } from '../core/transcripts.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import type { TranscriptFormat } from '../core/transcripts/types.ts';
 import { runTranscriptsIngest, type TranscriptsIngestResult } from '../core/transcripts/ingest.ts';
 import { isOpenclawCheckpointFile } from '../core/transcripts/openclaw.ts';
+import { isGrokSessionSidecarStrict } from '../core/transcripts/grok.ts';
+import {
+  isClaudeCodeSubagentFile,
+  isClaudeCodeWorkflowArtifactFile,
+  isClaudeCodeRemoteControlStateFile,
+} from '../core/transcripts/claude-code.ts';
 
 interface RecentOpts {
   days?: number;
@@ -54,6 +63,7 @@ const FORMATS: readonly TranscriptFormat[] = [
   'codex',
   'openclaw',
   'hermes',
+  'grok',
   'chatgpt',
   'claude-export',
 ];
@@ -184,6 +194,8 @@ const HELP = `Usage:
   gbrain transcripts ingest              # discovery: show found session logs
   gbrain transcripts ingest --all        # import everything discovered
   gbrain transcripts status              # found vs imported gap table
+  gbrain transcripts recover codex       # restore user turns lost to #5163 (preview; --apply)
+  gbrain transcripts audit-secrets       # list imported pages that still carry a credential (read-only)
   gbrain transcripts recent [options]
 
 ingest — import dead session logs and chat exports as conversation pages
@@ -192,12 +204,12 @@ long sessions split into searchable parts). Re-runs are free (content-hash
 skip). Embedding is OFF by default; run the embed backfill later or opt in.
 
   --all             Import every session log discovered under the harness
-                    roots (claude/codex/openclaw projects + the hermes store)
+                    roots (claude/codex/openclaw/grok projects + the hermes store)
   --include-self    Also discover gbrain's OWN claude-cli subprocess sessions
                     (recorded by Claude Code for the provider's scratch cwds;
                     excluded by default to avoid a self-ingestion loop)
-  --format F        claude-code | codex | openclaw | hermes | chatgpt |
-                    claude-export (auto-detected when omitted)
+  --format F        claude-code | codex | openclaw | hermes | grok |
+                    chatgpt | claude-export (auto-detected when omitted)
   --dry-run         Parse + redact + report; writes nothing
   --limit N         Max sessions this run
   --since T         Only sessions newer than ISO time T; the word "last"
@@ -212,7 +224,7 @@ skip). Embedding is OFF by default; run the embed backfill later or opt in.
                     fresh --since last scope (caps are part of the
                     checkpoint fingerprint). Adapters differ over budget:
                     codex degrades to a bounded head+tail read, while
-                    claude-code, openclaw and hermes reject the file
+                    claude-code, openclaw, hermes and grok reject the file
                     outright — so LOWERING this can drop those formats
   --json            Machine-readable result
   --quiet           Suppress the human summary
@@ -236,12 +248,33 @@ const IMPORTABLE_EXTENSIONS = ['.jsonl', '.db', '.json'];
  * without the filter, every stray file in a real directory (macOS Finder
  * metadata, editor backups, READMEs) becomes a permanent per-file error that
  * breaks cleanScan on every run, silently killing the since-last resume for
- * directory scopes. Checkpoint snapshots are never imported.
+ * directory scopes. Checkpoint snapshots and Grok session sidecars
+ * (updates.jsonl, summary.json, prompt_history.jsonl, …) are never imported —
+ * via the STRICT (evidence-checked) grok predicate: these are user-supplied
+ * paths with no format scope, and the broad bare-UUID heuristic silently
+ * dropped explicit sessions that merely lived under a UUID-named directory.
+ * Claude Code Remote Control state files (`<uuid>.ccr-tip.json`,
+ * `bridge-pointer.json`) are excluded the same way (#5597): they match the
+ * `.json` importable extension, are not transcripts, and would otherwise
+ * fail every run with `unknown format`. Exported for tests.
  */
-async function expandPaths(specs: string[]): Promise<string[]> {
+/**
+ * Shell-style tilde expansion for a user path spec: a bare `~` or a leading
+ * `~/` (or `~\\`) resolves against the home dir. `~user` forms and a `~`
+ * anywhere else in the string are left untouched (they are literal path
+ * characters). Exported for tests.
+ */
+export function expandTilde(raw: string): string {
+  if (raw === '~') return homedir();
+  if (raw.startsWith('~/') || raw.startsWith('~\\')) return homedir() + raw.slice(1);
+  return raw;
+}
+
+export async function expandPaths(specs: string[]): Promise<string[]> {
   const { statSync } = await import('node:fs');
   const out: string[] = [];
-  for (const spec of specs) {
+  for (const raw of specs) {
+    const spec = expandTilde(raw);
     let matched = false;
     try {
       if (statSync(spec).isFile()) {
@@ -268,21 +301,30 @@ async function expandPaths(specs: string[]): Promise<string[]> {
       out.push(spec);
     }
   }
-  return [...new Set(out)].filter((p) => !isOpenclawCheckpointFile(p));
+  return [...new Set(out)].filter(
+    (p) =>
+      !isOpenclawCheckpointFile(p) &&
+      !isGrokSessionSidecarStrict(p) &&
+      !isClaudeCodeSubagentFile(p) &&
+      !isClaudeCodeWorkflowArtifactFile(p) &&
+      !isClaudeCodeRemoteControlStateFile(p),
+  );
 }
 
 export function fmtSummary(r: TranscriptsIngestResult): string {
   const byHarness = new Map<string, number>();
   for (const f of r.files) {
     for (const s of f.sessions) {
-      if (!s.error) byHarness.set(s.harness, (byHarness.get(s.harness) ?? 0) + 1);
+      if (!s.error && !s.skipped) byHarness.set(s.harness, (byHarness.get(s.harness) ?? 0) + 1);
     }
   }
   const lines: string[] = [];
   const counts = [...byHarness.entries()].map(([h, n]) => `${h}: ${n}`).join(', ');
   lines.push(
     `sessions: ${r.sessionsImported} imported (${counts || 'none'}), ` +
-      `${r.sessionsFiltered} filtered, ${r.sessionsErrored} errored, ${r.sessionsSeen} seen`,
+      `${r.sessionsFiltered} filtered, ${r.sessionsErrored} errored, ` +
+      (r.sessionsSkippedNoTimestamp ? `${r.sessionsSkippedNoTimestamp} skipped (no timestamps), ` : '') +
+      `${r.sessionsSeen} seen`,
   );
   lines.push(
     `pages: ${r.pages.imported} imported, ${r.pages.skipped} unchanged` +
@@ -293,8 +335,14 @@ export function fmtSummary(r: TranscriptsIngestResult): string {
   if (r.redactions > 0) lines.push(`redactions: ${r.redactions} secrets/patterns redacted before write`);
   if (r.imperatives > 0) lines.push(`flagged: ${r.imperatives} agent-directed imperative(s) noted in frontmatter`);
   if (r.driftFiles > 0) {
+    const userless = r.files.filter((f) => f.userTurnsMissing).length;
+    const zero = r.driftFiles - userless;
+    const shapes = [
+      zero > 0 ? `${zero} parsed to zero sessions` : '',
+      userless > 0 ? `${userless} parsed to assistant turns with no user turns` : '',
+    ].filter(Boolean).join(', ');
     lines.push(
-      `DRIFT WARNING: ${r.driftFiles} file(s) parsed to zero sessions — the host ` +
+      `DRIFT WARNING: ${r.driftFiles} file(s) drifted (${shapes}) — the host ` +
         `format may have changed; see the adapter SPEC_TARGET runbook`,
     );
   }
@@ -313,7 +361,7 @@ export function fmtSummary(r: TranscriptsIngestResult): string {
   return lines.join('\n');
 }
 
-async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
+async function runIngest(engine: BrainEngine, args: string[], dispatch: Pick<CliDispatchContext, 'makeContext'>): Promise<void> {
   const parsed = parseIngestArgs(args);
   if ('help' in parsed) {
     console.log(HELP);
@@ -344,7 +392,7 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
       : [...parsed.paths].map((p) => resolve(p)).sort();
 
   // No paths: discovery. Without the all flag, show what WOULD be imported
-  // and stop (a safe default for a command that can touch four harness
+  // and stop (a safe default for a command that can touch five harness
   // histories); with it, import the discovered set.
   if (parsed.paths.length === 0) {
     const { discoverTranscriptFiles } = await import('../core/transcripts/discover.ts');
@@ -445,6 +493,7 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
   reporter.start('transcripts.ingest', paths.length);
 
   let result: TranscriptsIngestResult;
+  const context = await dispatch.makeContext?.(engine, { source: sourceId, dry_run: parsed.dryRun === true });
   try {
     result = await runTranscriptsIngest(engine, {
       paths,
@@ -456,6 +505,7 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
       maxBytes: parsed.maxBytes,
       embed: parsed.embed,
       activePack,
+      context,
       onFileDone: () => reporter.tick(),
       // Multi-session stores (one hermes state.db = thousands of sessions)
       // need liveness BETWEEN file ticks.
@@ -483,7 +533,7 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
 
   // --facts: ONE extractor invocation over every touched slug (including
   // hash-skipped pages — the extractor's version-token gate dedupes work).
-  let factsSummary: { pages: number; spentUsd?: number } | undefined;
+  let factsSummary: { pages: number; pagesFailed: number; spentUsd?: number } | undefined;
   if (parsed.facts && !parsed.dryRun && result.slugsTouched.length > 0) {
     const { runIngestFacts } = await import('../core/transcripts/ingest-facts.ts');
     factsSummary = await runIngestFacts(engine, {
@@ -500,8 +550,9 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
     console.log(fmtSummary(result));
     if (factsSummary) {
       console.log(
-        `facts: extracted over ${factsSummary.pages} page(s)` +
-          (factsSummary.spentUsd !== undefined ? `, ~$${factsSummary.spentUsd.toFixed(2)} spent` : ''),
+        `facts: attempted ${factsSummary.pages} page(s), ${factsSummary.pagesFailed} failed` +
+          (factsSummary.spentUsd !== undefined ? `, ~$${factsSummary.spentUsd.toFixed(2)} spent` : '') +
+          (factsSummary.pagesFailed > 0 ? ' (failed pages stay unfinished; stderr names each retry command)' : ''),
       );
     }
     const firstImported = result.files.flatMap((f) => f.sessions).find((s) => !s.error && s.baseSlug);
@@ -513,7 +564,7 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
   const allFailed =
     result.files.length > 0 &&
     result.files.every((f) => f.error !== undefined || (f.drift && f.sessions.length === 0));
-  if (allFailed) setCliExitVerdict(1);
+  if (allFailed || (factsSummary?.pagesFailed ?? 0) > 0) setCliExitVerdict(1);
 }
 
 async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
@@ -547,17 +598,32 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
   }
 }
 
-export async function runTranscripts(engine: BrainEngine, args: string[]): Promise<void> {
+export async function runTranscripts(engine: BrainEngine, args: string[], dispatch: Pick<CliDispatchContext, 'makeContext'> = {}): Promise<void> {
   const sub = args[0];
   if (sub === 'ingest') {
-    await runIngest(engine, args.slice(1));
+    await runIngest(engine, args.slice(1), dispatch);
     return;
   }
   if (sub === 'status') {
     await runStatus(engine, args.slice(1));
     return;
   }
+  if (sub === 'audit-secrets') {
+    const { runTranscriptsAuditSecrets } = await import('./transcripts-audit.ts');
+    await runTranscriptsAuditSecrets(engine, args.slice(1));
+    return;
+  }
+  if (sub === 'recover') {
+    const { runTranscriptsRecover } = await import('./transcripts-recover.ts');
+    await runTranscriptsRecover(engine, args.slice(1), dispatch);
+    return;
+  }
   if (sub !== 'recent') {
+    if (sub !== '--help' && sub !== '-h' && args.includes('--json')) {
+      const { exitCliError, usageError } = await import('../cli/cli-error.ts');
+      exitCliError(usageError(sub && !sub.startsWith('-') ? `Unknown transcripts subcommand: ${sub}` : 'gbrain transcripts needs a subcommand: ingest, status, recover, audit-secrets or recent.',
+        'Run `gbrain transcripts recent --json` to list recent transcripts, or `gbrain transcripts --help`.'), 'transcripts', { json: true });
+    }
     console.log(HELP);
     if (sub && sub !== '--help' && sub !== '-h') setCliExitVerdict(2);
     return;
@@ -574,17 +640,33 @@ export async function runTranscripts(engine: BrainEngine, args: string[]): Promi
     summary: !parsed.full,
     limit: parsed.limit,
   });
-  if (parsed.json) {
-    console.log(JSON.stringify(rows, null, 2));
-    return;
-  }
-  if (rows.length === 0) {
-    console.log('(no recent transcripts in the corpus dir)');
-    return;
-  }
-  rows.forEach(r => {
-    const date = r.date ?? r.mtime.slice(0, 10);
-    console.log(`\n--- ${date} | ${r.path} | ${r.length} bytes ---`);
-    console.log(r.summary);
-  });
+  console.log(renderRecentTranscripts(rows, parsed.json === true));
+}
+
+function renderRecentTranscripts(rows: RecentTranscript[], json: boolean): string {
+  if (json) return JSON.stringify(rows, null, 2);
+  if (rows.length === 0) return '(no recent transcripts in the corpus dir)';
+  return rows.map(r => `\n--- ${r.date ?? r.mtime.slice(0, 10)} | ${r.path} | ${r.length} bytes ---\n${r.summary}`).join('\n');
+}
+
+/**
+ * `gbrain transcripts recent` while a live `gbrain serve` owns the PGLite
+ * brain: read through the owner's local socket as the trusted CLI (the
+ * stdio agent's own connection still cannot call get_recent_transcripts).
+ * False when no live owner serves the brain (the caller connects normally).
+ */
+export async function runDelegatedTranscriptsRecent(args: string[]): Promise<boolean> {
+  const parsed = parseRecentArgs(args);
+  if ('help' in parsed) return false;
+  const { loadConfig } = await import('../core/config.ts');
+  const { getCliOptions } = await import('../core/cli-options.ts');
+  const { runDelegatedCliOperation } = await import('./persistence-delegate.ts');
+  const params: Record<string, unknown> = {
+    ...(parsed.days !== undefined ? { days: parsed.days } : {}),
+    ...(parsed.limit !== undefined ? { limit: parsed.limit } : {}),
+    summary: !parsed.full,
+    ...(parsed.json ? { json: true } : {}),
+  };
+  return runDelegatedCliOperation('get_recent_transcripts', params, loadConfig(), { brain: getCliOptions().brain },
+    (_op, result) => `${renderRecentTranscripts(Array.isArray(result) ? result as RecentTranscript[] : [], parsed.json === true)}\n`);
 }

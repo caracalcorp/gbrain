@@ -2,7 +2,7 @@
  * types.ts — the transcript-adapter seam (cathedral-4).
  *
  * One contract for every dead-log format gbrain can import: coding-harness
- * session logs (Claude Code, Codex, OpenClaw, Hermes) and consumer chat
+ * session logs (Claude Code, Codex, OpenClaw, Hermes, Grok) and consumer chat
  * exports (ChatGPT, Claude.ai). Each adapter is a leaf module in this
  * directory; the registry in detect.ts is the only place formats are
  * enumerated. Every adapter carries a DATED SPEC_TARGET (the
@@ -29,6 +29,7 @@ export type TranscriptFormat =
   | 'codex'
   | 'openclaw'
   | 'hermes'
+  | 'grok'
   | 'chatgpt'
   | 'claude-export';
 
@@ -66,7 +67,7 @@ export interface ParsedSession {
 /**
  * Per-file diagnostics: the AsyncGenerator RETURN value. `sessions` counts
  * yields; `zeroSessionsReason` makes an empty file explain itself (the
- * parser-drift signal is `bytesRead > 0 && sessions === 0`).
+ * parser-drift signal is `bytesRead > 0 && sessions === 0 && !expectedEmpty`).
  */
 export interface FileDiagnostics {
   bytesRead: number;
@@ -74,6 +75,18 @@ export interface FileDiagnostics {
   truncated: boolean;
   sessions: number;
   zeroSessionsReason?: string;
+  /**
+   * File was understood and simply has no importable text turns (a grok
+   * session that is only system + tool/reasoning traffic). Not host-format
+   * drift — ingest must not freeze the watermark.
+   */
+  expectedEmpty?: boolean;
+  /**
+   * E-N4: the file yielded assistant turns but not one user turn. The usual
+   * cause is a host format change the parser no longer recognizes (#5163), so
+   * ingest reports it as drift and holds the watermark.
+   */
+  userTurnsMissing?: boolean;
 }
 
 export interface ParseSessionsOpts {
@@ -111,6 +124,7 @@ const SLUG_DIRS: Record<TranscriptFormat, string> = {
   codex: 'conversations/sessions',
   openclaw: 'conversations/sessions',
   hermes: 'conversations/sessions',
+  grok: 'conversations/sessions',
   chatgpt: 'conversations/chatgpt',
   'claude-export': 'conversations/claude',
 };
@@ -120,6 +134,7 @@ const HARNESS_FORMATS: ReadonlySet<TranscriptFormat> = new Set([
   'codex',
   'openclaw',
   'hermes',
+  'grok',
 ]);
 
 /**
@@ -140,6 +155,21 @@ export function transcriptFullId(sourceId: string): string {
 
 /** Max slugified-title length inside an export slug (keeps slugs readable). */
 const TITLE_SLUG_MAX = 48;
+
+/**
+ * Normalize an adapter's source timestamp to UTC (gbrain-evals N12-2). A
+ * string carrying an explicit offset ('2026-08-10T22:30:00-07:00') becomes
+ * its UTC ISO instant, so the date and the hour downstream come from the
+ * same instant. Everything else passes through unchanged: UTC strings stay
+ * byte-identical (no churn for existing imports), and unparseable or
+ * zone-less strings keep their current behavior. Non-strings become ''.
+ */
+export function utcTimestamp(v: unknown): string {
+  if (typeof v !== 'string') return '';
+  if (!/[+-]\d{2}:?\d{2}$/.test(v.trim())) return v;
+  const ms = Date.parse(v);
+  return Number.isNaN(ms) ? v : new Date(ms).toISOString();
+}
 
 /**
  * The one slug builder for every imported conversation page.

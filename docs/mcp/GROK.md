@@ -1,5 +1,7 @@
 # Connect GBrain to Grok Build
 
+This guide is for the **Grok Build CLI**. For the personal **Grok Bot** with its own computer, use the dedicated [Grok Bot guide](../guides/grok-bot.md).
+
 > This page is the MCP-registration reference for **Grok Build** — xAI's
 > official `grok` CLI (early beta, subscriber-gated; not the community
 > `superagent-ai/grok-cli`, which ships a colliding `grok` binary — see
@@ -16,13 +18,15 @@ tunnel, no token needed. Works with both PGLite and Supabase engines.
 ## Register (recommended)
 
 ```bash
-grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- gbrain serve --surface verbs
+grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- "$(command -v gbrain)" serve --surface full
 ```
 
-`--surface verbs` exposes the seven-verb memory protocol (`recall`,
-`remember`, `entity`, `synthesize`, `forget`, `context_pack`, `delta` —
-[MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) instead of the full
-100+-op catalog — the recommended starting surface for coding agents.
+`--surface full` serves the whole operation catalog, the seven-verb memory
+protocol (`recall`, `remember`, `entity`, `synthesize`, `forget`,
+`context_pack`, `delta` — [MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md))
+included; it is the surface every registration gbrain writes pins. A harness
+that caps its tool count can register `--surface starter` or `--surface verbs`
+(only the seven verbs) instead.
 Three facts about `grok mcp add`, all observed:
 
 - **The env flag is repeatable, one `KEY=value` per flag** (`-e A=1 -e B=2`).
@@ -76,8 +80,8 @@ grok mcp doctor gbrain      # THE real probe: spawns the server
 ```
 
 `grok mcp doctor gbrain` performs the actual handshake — expect the checks
-`command found`, `server started`, `handshake OK`, and `7 tools discovered`
-(the seven verbs), exit 0. A broken registration exits 1 with a failing
+`command found`, `server started`, `handshake OK`, and `N tools discovered`
+(the full surface; 7 on `--surface verbs`), exit 0. A broken registration exits 1 with a failing
 check and a hint. Then one real round-trip:
 
 ```bash
@@ -85,6 +89,26 @@ grok -p "use the gbrain recall tool to answer: what did I import most recently?"
 ```
 
 `grok -p` (single-turn headless) prints the final answer on stdout.
+
+## Import session logs
+
+Grok Build writes one `chat_history.jsonl` per session under
+`~/.grok/sessions/<url-encoded-cwd>/<uuid>/` (`GROK_HOME` relocates the
+user dir). Those dead logs import through the same `gbrain transcripts ingest`
+lane as Claude Code / Codex / OpenClaw / Hermes:
+
+```bash
+gbrain transcripts ingest                    # discover, including ~/.grok/sessions
+gbrain transcripts ingest --all              # import every discovered harness log
+gbrain transcripts ingest ~/.grok/sessions --format grok --dry-run
+```
+
+**Say to your agent:** *"Archive my grok session transcripts"* — *"Import my Grok Build chat history into the brain."*
+
+Sidecars (`updates.jsonl`, `events.jsonl`, `summary.json`, `prompt_history.jsonl`)
+are skipped; only `chat_history.jsonl` is a session. User/assistant text
+turns land as conversation pages; system prompts, reasoning, and tool
+traffic do not.
 
 ## Headless auth + model pin
 

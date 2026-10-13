@@ -16,7 +16,10 @@
  *     text blocks are extracted verbatim, non-text blocks become placeholders
  *     ([tool: name] / [tool result] / [thinking] / [image]) so the corpus
  *     records THAT a tool ran, never its payload.
- *   - isSidechain:true entries (subagent traffic) are skipped.
+ *   - root isSidechain/isMeta/isCompactSummary exactly true entries are skipped.
+ *   - user text with a non-empty structured origin.kind other than 'human'
+ *     is excluded; absent/unstructured origins stay compatible. Non-text
+ *     placeholders and assistant text are retained, not classified by origin.
  *   - type 'summary' entries and system/compact-boundary entries are skipped.
  *   - malformed lines are counted (skippedLines), never fatal.
  *
@@ -25,9 +28,11 @@
  * ~/.claude/projects, `.jsonl` extension, lstat-rejected symlinks, byte cap.
  */
 
-import { closeSync, lstatSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { isPathContained } from '../path-confine.ts';
 import { detectWslMountRoot, translateWindowsPath } from '../wsl-paths.ts';
+import { stripPastedContent } from './pasted-content.ts';
 import { claudeProjectsDir, type HostSpecTarget } from '../bootstrap/host-specs.ts';
 import type { WindowTurn } from '../context/entity-salience.ts';
 
@@ -48,7 +53,9 @@ export const SPEC_TARGET: HostSpecTarget = {
     'block array ({type: "text"|"tool_use"|"tool_result"|"thinking"|"image", …}). ' +
     'Non-turn lines: {type: "summary"} and {type: "system", subtype: ' +
     '"compact_boundary"} among others — anything that is not a non-sidechain ' +
-    'user/assistant message is skipped. Unknown fields tolerated everywhere.',
+    'user/assistant message is skipped, as are root isMeta/isCompactSummary: true. ' +
+    'User text with a non-empty string origin.kind other than "human" is excluded; ' +
+    'missing/unstructured origins stay compatible. Unknown fields tolerated elsewhere.',
 };
 
 // ── Byte caps ───────────────────────────────────────────────────────────────
@@ -62,7 +69,7 @@ export const TRANSCRIPT_HARD_CAP_BYTES = 50 * 1024 * 1024;
 // ── Confinement [S3#8] ──────────────────────────────────────────────────────
 
 export type ConfineTranscriptResult =
-  | { ok: true; path: string; size: number }
+  | { ok: true; path: string; size: number; absent?: boolean }
   | { ok: false; reason: 'missing_path' | 'not_jsonl' | 'unreadable' | 'symlink' | 'not_file' | 'too_large' | 'outside_projects_dir' };
 
 /**
@@ -71,7 +78,12 @@ export type ConfineTranscriptResult =
  * lstat'ed so a symlink is SEEN, never followed), regular file, byte cap,
  * and realpath containment in ~/.claude/projects (`isPathContained` resolves
  * intermediate symlinked directories, so a planted dir-symlink that escapes
- * the tree also fails). Fail-closed on every error.
+ * the tree also fails). Fail-closed on every error — with ONE deliberate
+ * exception (#5465): an ENOENT leaf whose parent resolves inside the tree
+ * validates ok with `absent: true`, because Claude Code writes transcripts
+ * asynchronously and a not-yet-created file has nothing to read (the same
+ * trust as no transcript_path at all). An absent parent, or any other lstat
+ * failure, still fails closed.
  *
  * Cross-OS install (#4522, Claude Code on the Windows host + gbrain in WSL):
  * the hook stdin's transcript_path arrives as a Windows drive literal
@@ -96,36 +108,57 @@ export type ConfineTranscriptResult =
  */
 export function confineTranscriptPath(
   p: unknown,
-  opts: { root?: string; maxBytes?: number; wslMountRoot?: string | null } = {},
+  opts: { root?: string; maxBytes?: number; wslMountRoot?: string | null; allowOversize?: boolean } = {},
 ): ConfineTranscriptResult {
   if (typeof p !== 'string' || p.length === 0) return { ok: false, reason: 'missing_path' };
   if (!p.endsWith('.jsonl')) return { ok: false, reason: 'not_jsonl' };
   const mountRoot = opts.wslMountRoot !== undefined ? opts.wslMountRoot : detectWslMountRoot();
   const translated = mountRoot !== null ? translateWindowsPath(p, mountRoot) : null;
   const candidate = translated ?? p;
-  let st: ReturnType<typeof lstatSync>;
-  try {
-    st = lstatSync(candidate);
-  } catch {
-    return { ok: false, reason: 'unreadable' };
-  }
-  if (st.isSymbolicLink()) return { ok: false, reason: 'symlink' };
-  if (!st.isFile()) return { ok: false, reason: 'not_file' };
-  const cap = opts.maxBytes ?? TRANSCRIPT_HARD_CAP_BYTES;
-  if (st.size > cap) return { ok: false, reason: 'too_large' };
   const rootRaw = opts.root ?? claudeProjectsDir();
   const root = (mountRoot !== null ? translateWindowsPath(rootRaw, mountRoot) : null) ?? rootRaw;
-  if (!isPathContained(candidate, root)) {
+  // Containment against the resolved tree, shared by the existing-file and
+  // absent-leaf paths. realpathSync resolves intermediate symlinked segments
+  // (the planted dir-symlink escape), so the caller's pinned root — not the
+  // path's own shape — decides membership.
+  const containedIn = (leaf: string): boolean => {
+    if (isPathContained(leaf, root)) return true;
     // Cross-OS fallback (#4522): only for a path we translated ourselves and
     // only when the caller didn't pin an explicit root.
     const derived =
       mountRoot !== null && translated !== null && opts.root === undefined
         ? deriveTranslatedProjectsRoot(translated, mountRoot)
         : null;
-    if (derived === null || !isPathContained(candidate, derived)) {
-      return { ok: false, reason: 'outside_projects_dir' };
-    }
+    return derived !== null && isPathContained(leaf, derived);
+  };
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(candidate);
+  } catch (e) {
+    // #5465: Claude Code writes the transcript asynchronously, so on turn 1
+    // of a fresh session (or the only turn of `claude -p`) the path can be
+    // absent. A CONFINED absent path has nothing to read — the same trust as
+    // no transcript_path at all — so it validates with absent:true and the
+    // caller's prompt-only path runs instead of aborting the event. An
+    // absent path whose parent escapes the tree stays a rejection, and every
+    // non-ENOENT lstat failure (EACCES, ENOTDIR, …) stays fail-closed.
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return { ok: false, reason: 'unreadable' };
+    const parent = dirname(candidate);
+    // No directory component (a bare filename — e.g. an untranslated Windows
+    // drive literal on a non-WSL host) or an absent parent: containment is
+    // unprovable, so fail closed exactly as before.
+    if (parent === '.' || !existsSync(parent)) return { ok: false, reason: 'unreadable' };
+    if (!containedIn(parent)) return { ok: false, reason: 'outside_projects_dir' };
+    return { ok: true, path: candidate, size: 0, absent: true };
   }
+  if (st.isSymbolicLink()) return { ok: false, reason: 'symlink' };
+  if (!st.isFile()) return { ok: false, reason: 'not_file' };
+  // #5701: the size gate belongs to the READER, not the confinement. Every
+  // hook lane tail-reads a bounded window through parseTranscript, so callers
+  // that opt in skip the gate; path, symlink and root confinement still apply.
+  const cap = opts.maxBytes ?? TRANSCRIPT_HARD_CAP_BYTES;
+  if (!opts.allowOversize && st.size > cap) return { ok: false, reason: 'too_large' };
+  if (!containedIn(candidate)) return { ok: false, reason: 'outside_projects_dir' };
   return { ok: true, path: candidate, size: st.size };
 }
 
@@ -163,6 +196,14 @@ function deriveTranslatedProjectsRoot(translated: string, mountRoot: string): st
 export interface ParsedTranscript {
   /** Conversation turns, oldest → newest (WindowTurn — the IPC window shape). */
   turns: WindowTurn[];
+  /**
+   * Turn indexes whose accepted user-role content contains genuine text. Claude records
+   * tool results as user-role messages too, so role alone cannot identify a
+   * human prompt. Kept parallel to `turns` instead of removing placeholders:
+   * archival/corpus consumers still see that tools ran, while prompt-only
+   * consumers can select structurally without matching rendered text.
+   */
+  genuineUserTurnIndexes: number[];
   /**
    * Context blocks a gbrain hook previously INJECTED this session, oldest →
    * newest. Claude Code records a UserPromptSubmit hook's additionalContext
@@ -259,6 +300,7 @@ export function parseTranscript(
 
   const lines = raw.split('\n');
   const turns: WindowTurn[] = [];
+  const genuineUserTurnIndexes: number[] = [];
   const injectedContextBlocks: string[] = [];
   const boundaryTurnIndexes: number[] = [];
   const toolCalls: ToolCallWithId[] = [];
@@ -298,8 +340,11 @@ export function parseTranscript(
       for (const c of entryToToolCalls(entry)) { toolCalls.push(c); toolCallTurnIndexes.push(turns.length); }
       for (const r of entryToToolResults(entry)) toolResults.set(r.tool_use_id, r.ok);
     }
-    const turn = entryToTurn(entry);
-    if (turn) turns.push(turn);
+    const parsedTurn = entryToTurn(entry);
+    if (parsedTurn) {
+      if (parsedTurn.genuineUser) genuineUserTurnIndexes.push(turns.length);
+      turns.push(parsedTurn.turn);
+    }
   }
   // Join results to calls by tool_use_id, then strip the internal id field so
   // the public ToolCallRecord shape (and the receipt JSON derived from it)
@@ -308,7 +353,7 @@ export function parseTranscript(
     const ok = c.id !== undefined ? toolResults.get(c.id) : undefined;
     return { name: c.name, input: capToolCallInput(c.input), ...(ok !== undefined ? { result: { ok } } : {}) };
   });
-  return { turns, injectedContextBlocks, bytesRead, parsedLines, skippedLines, compactBoundaries, boundaryTurnIndexes, toolCalls: joinedToolCalls, toolCallTurnIndexes };
+  return { turns, genuineUserTurnIndexes, injectedContextBlocks, bytesRead, parsedLines, skippedLines, compactBoundaries, boundaryTurnIndexes, toolCalls: joinedToolCalls, toolCallTurnIndexes };
 }
 
 /** {type:'system', subtype:'compact_boundary'} — Claude Code's on-disk compaction marker (v0.45.7). */
@@ -354,11 +399,33 @@ function entryToInjectedBlock(entry: unknown): string | null {
   return GBRAIN_BLOCK_MARKERS.some((m) => text.includes(m)) ? text : null;
 }
 
-/** One transcript line → a WindowTurn, or null for non-turn/skipped shapes. */
-function entryToTurn(entry: unknown): WindowTurn | null {
+/**
+ * Claude Code writes slash-command bookkeeping (`/clear`, its stdout) as
+ * `user` records whose content is ONLY harness tags. They stay in the window
+ * (archival) but are not something the human said, so they never count as a
+ * genuine user prompt for the writeback lane. A turn that is only pasted
+ * content (#5812) is classified the same way; its text is never rewritten.
+ */
+const HARNESS_TAG_RE = /<(local-command-stdout|local-command-stderr|command-name|command-message|command-args)>[\s\S]*?<\/\1>/g;
+function isGenuineUserText(text: string): boolean {
+  return stripPastedContent(text.replace(HARNESS_TAG_RE, '')).text.trim().length > 0;
+}
+
+function isSkippedTurnEntry(e: Record<string, unknown>): boolean {
+  return e.isSidechain === true || e.isMeta === true || e.isCompactSummary === true;
+}
+
+function hasNonHumanOrigin(e: Record<string, unknown>): boolean {
+  if (typeof e.origin !== 'object' || e.origin === null) return false;
+  const kind = (e.origin as Record<string, unknown>).kind;
+  return typeof kind === 'string' && kind.length > 0 && kind !== 'human';
+}
+
+/** One transcript line → a turn plus its structural human-prompt origin. */
+function entryToTurn(entry: unknown): { turn: WindowTurn; genuineUser: boolean } | null {
   if (typeof entry !== 'object' || entry === null) return null;
   const e = entry as Record<string, unknown>;
-  if (e.isSidechain === true) return null; // subagent traffic — skipped
+  if (isSkippedTurnEntry(e)) return null;
   const type = e.type;
   if (type !== 'user' && type !== 'assistant') return null; // summary / system / compact boundary
   const msg = e.message;
@@ -366,11 +433,15 @@ function entryToTurn(entry: unknown): WindowTurn | null {
   const m = msg as Record<string, unknown>;
   const role: WindowTurn['role'] =
     m.role === 'assistant' || m.role === 'user' ? m.role : (type as WindowTurn['role']);
+  const acceptText = role !== 'user' || !hasNonHumanOrigin(e);
 
   const content = m.content;
   let text = '';
+  let hasGenuineText = false;
   if (typeof content === 'string') {
+    if (!acceptText) return null;
     text = content;
+    hasGenuineText = isGenuineUserText(content);
   } else if (Array.isArray(content)) {
     const parts: string[] = [];
     for (const block of content) {
@@ -378,7 +449,10 @@ function entryToTurn(entry: unknown): WindowTurn | null {
       const b = block as Record<string, unknown>;
       switch (b.type) {
         case 'text':
-          if (typeof b.text === 'string' && b.text.trim()) parts.push(b.text);
+          if (acceptText && typeof b.text === 'string' && b.text.trim()) {
+            parts.push(b.text);
+            if (isGenuineUserText(b.text)) hasGenuineText = true;
+          }
           break;
         case 'tool_use':
           parts.push(`[tool: ${typeof b.name === 'string' && b.name ? b.name : 'unknown'}]`);
@@ -400,7 +474,7 @@ function entryToTurn(entry: unknown): WindowTurn | null {
   }
   text = text.trim();
   if (!text) return null;
-  return { role, text };
+  return { turn: { role, text }, genuineUser: role === 'user' && hasGenuineText };
 }
 
 /**
@@ -435,7 +509,7 @@ interface ToolCallWithId extends ToolCallRecord {
 function entryContentBlocks(entry: unknown): unknown[] | null {
   if (typeof entry !== 'object' || entry === null) return null;
   const e = entry as Record<string, unknown>;
-  if (e.isSidechain === true) return null; // subagent traffic — skipped, same as entryToTurn
+  if (isSkippedTurnEntry(e)) return null;
   const msg = e.message;
   if (typeof msg !== 'object' || msg === null) return null;
   const content = (msg as Record<string, unknown>).content;
@@ -530,6 +604,20 @@ export interface ParsedClaudeSession {
   turns: TimedTurn[];
   bytesRead: number;
   skippedLines: number;
+  /**
+   * Records that CLAIM to be importable turns: `type` user/assistant and not
+   * skipped by entry markers or explicit non-human origins. Zero of them means
+   * the file had nothing accepted to import (metadata or non-human text only) —
+   * understood, not host-format drift. Above zero with `turns` still empty is
+   * the real drift signal: turn records exist but no longer yield text.
+   */
+  turnShapedLines: number;
+  /**
+   * User records deliberately excluded (root isMeta/isSidechain/isCompactSummary
+   * or a non-human origin): a session with these and no user turn was started
+   * by automation, not a parser that lost the human side.
+   */
+  excludedUserLines: number;
 }
 
 /**
@@ -552,6 +640,8 @@ export function parseClaudeSessionFile(
   let sessionId = '';
   let cwd: string | undefined;
   let skippedLines = 0;
+  let turnShapedLines = 0;
+  let excludedUserLines = 0;
   for (const line of raw.split('\n')) {
     const t = line.trim();
     if (!t) continue;
@@ -566,9 +656,16 @@ export function parseClaudeSessionFile(
     if (!sessionId && typeof e.sessionId === 'string' && e.sessionId) sessionId = e.sessionId;
     if (!cwd && typeof e.cwd === 'string' && e.cwd) cwd = e.cwd;
     const turn = entryToTurn(entry);
+    if (
+      !isSkippedTurnEntry(e) && (e.type === 'user' || e.type === 'assistant') &&
+      (turn || e.type === 'assistant' || !hasNonHumanOrigin(e))
+    ) {
+      turnShapedLines++;
+    }
+    if (e.type === 'user' && (isSkippedTurnEntry(e) || hasNonHumanOrigin(e))) excludedUserLines++;
     if (!turn) continue;
     const timestamp = typeof e.timestamp === 'string' ? e.timestamp : '';
-    turns.push({ role: turn.role, text: turn.text, timestamp });
+    turns.push({ role: turn.turn.role, text: turn.turn.text, timestamp });
   }
   return {
     sessionId,
@@ -577,6 +674,8 @@ export function parseClaudeSessionFile(
     turns,
     bytesRead: size,
     skippedLines,
+    turnShapedLines,
+    excludedUserLines,
   };
 }
 
@@ -591,4 +690,3 @@ export function toCorpusText(turns: WindowTurn[]): string {
   if (!turns.length) return '';
   return turns.map((t) => `[${t.role}]\n${t.text}`).join('\n\n') + '\n';
 }
-

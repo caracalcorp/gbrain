@@ -9,7 +9,8 @@
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { buildRelationalArm, ensureRelationalEvidenceSlot } from '../src/core/search/relational-recall.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
+import { buildRelationalArm, ensureRelationalEvidenceSlot, readRecentRelationalFailures } from '../src/core/search/relational-recall.ts';
 import { hybridSearch } from '../src/core/search/hybrid.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import { probeEmbeddingDim } from './fixtures/retrieval-quality/relational/corpus.ts';
@@ -21,12 +22,12 @@ beforeAll(async () => {
   eng = new PGLiteEngine();
   await eng.connect({});
   await eng.initSchema();
-  const dim = await probeEmbeddingDim(eng); // match schema column width (1280 ZE / 1536 OpenAI)
+  const dim = await probeEmbeddingDim(eng); // match schema column width (1024 Voyage / 1536 OpenAI)
 
   await eng.putPage('companies/widget-co', { type: 'company', title: 'Widget Co', compiled_truth: 'A payments company.', timeline: '' });
   // The investor's body deliberately NEVER mentions Widget Co — only the edge connects them.
   await eng.putPage('people/alice-example', { type: 'person', title: 'Alice Example', compiled_truth: 'Alice is a seed-stage investor based in Lisbon.', timeline: '' });
-  await eng.upsertChunks('people/alice-example', [{
+  await installFixtureChunks(eng, 'people/alice-example', [{
     chunk_index: 0, chunk_text: 'Alice is a seed-stage investor based in Lisbon.',
     chunk_source: 'compiled_truth', embedding: new Float32Array(dim), token_count: 8,
   }] satisfies ChunkInput[]);
@@ -41,7 +42,17 @@ beforeAll(async () => {
     frontmatter: { visibility: 'private' },
     compiled_truth: 'Mallory runs a stealth family office in Zurich.', timeline: '',
   });
+  await installFixtureChunks(eng, 'people/mallory-secret', [{ chunk_index: 0, chunk_source: 'compiled_truth',
+    chunk_text: 'Mallory runs a stealth family office in Zurich.' }]);
   await eng.addLink('people/mallory-secret', 'companies/widget-co', '', 'invested_in', 'manual');
+
+  // N9-5 (gbrain-evals world-v1): "Acme" collides with "Acme Labs" under
+  // bare-name prefix expansion; the page titled exactly "Acme" is the seed.
+  await eng.putPage('companies/acme-0', { type: 'company', title: 'Acme', compiled_truth: 'A robotics company.', timeline: '' });
+  await eng.putPage('companies/acme-labs-50', { type: 'company', title: 'Acme Labs', compiled_truth: 'A research lab.', timeline: '' });
+  await eng.putPage('people/bea-example', { type: 'person', title: 'Bea Example', compiled_truth: 'Bea is an engineer.', timeline: '' });
+  await installFixtureChunks(eng, 'people/bea-example', [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Bea is an engineer.' }]);
+  await eng.addLink('people/bea-example', 'companies/acme-0', '', 'works_at', 'manual');
 }, 60_000);
 
 afterAll(async () => { await eng.disconnect(); });
@@ -56,6 +67,13 @@ describe('buildRelationalArm', () => {
     expect(alice!.relational_seed).toBe('companies/widget-co');
     // chunk-backed page → reinforces a REAL chunk id (not synthetic 0).
     expect(alice!.chunk_id).toBeGreaterThan(0);
+  });
+
+  test('N9-5: a bare company name that collides under prefix expansion seeds from its exact-title page', async () => {
+    const list = await buildRelationalArm(eng, 'Who works at Acme?');
+    const bea = list.find(r => r.slug === 'people/bea-example');
+    expect(bea).toBeDefined();
+    expect(bea!.relational_seed).toBe('companies/acme-0');
   });
 
   test('non-relational query is a pure no-op', async () => {
@@ -110,7 +128,7 @@ describe('buildRelationalArm', () => {
   });
 
   test('fail-open: fanout error returns [] + errored meta, never throws', async () => {
-    const original = eng.relationalFanout.bind(eng);
+    const original = eng.relationalFanout;
     let captured: { errored?: boolean } = {};
     eng.relationalFanout = async () => { throw new Error('boom'); };
     try {
@@ -213,7 +231,7 @@ describe('hybridSearch guarantees page-1 relational evidence (#3995)', () => {
       compiled_truth: 'Alice is a seed-stage backer based in Lisbon.', timeline: '',
       frontmatter: { provenance: 'auto-extracted', status: 'unverified' },
     });
-    await eng2.upsertChunks('people/alice-example', [{
+    await installFixtureChunks(eng2, 'people/alice-example', [{
       chunk_index: 0, chunk_text: 'Alice is a seed-stage backer based in Lisbon.',
       chunk_source: 'compiled_truth', token_count: 8,
     }] as ChunkInput[]);
@@ -223,8 +241,8 @@ describe('hybridSearch guarantees page-1 relational evidence (#3995)', () => {
     for (let i = 0; i < 12; i++) {
       const slug = `notes/noise-${i}`;
       const text = `Fund memo ${i}: somebody invested in widget-co adjacent themes.`;
-      await eng2.putPage(slug, { type: 'note', title: `Noise ${i}`, compiled_truth: text, timeline: '' });
-      await eng2.upsertChunks(slug, [{
+      await eng2.putPage(slug, { type: 'note', title: `Who invested in widget-co memo ${i}`, compiled_truth: text, timeline: '' });
+      await installFixtureChunks(eng2, slug, [{
         chunk_index: 0, chunk_text: text, chunk_source: 'compiled_truth', token_count: 12,
       }] as ChunkInput[]);
     }
@@ -271,4 +289,76 @@ describe('hybridSearch guarantees page-1 relational evidence (#3995)', () => {
     expect(results.some(r => r.slug === 'people/alice-example')).toBe(true);
     expect(meta?.relational_evidence_slot).toBeUndefined();
   }, 60_000);
+});
+
+describe('buildRelationalArm: multi-hop planner and one-hop orientation', () => {
+  beforeAll(async () => {
+    await eng.putPage('people/frank-example', { type: 'person', title: 'Frank Example', compiled_truth: 'Frank builds payment rails.', timeline: '' });
+    await installFixtureChunks(eng, 'people/frank-example', [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Frank builds payment rails.' }]);
+    await installFixtureChunks(eng, 'companies/widget-co', [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'A payments company.' }]);
+    // Written on the company page: stored company → person.
+    await eng.addLink('companies/widget-co', 'people/frank-example', 'founded by Frank', 'founded', 'markdown');
+  });
+  const CHAIN_Q = 'Who founded the companies that Alice Example invested in?';
+
+  test('a two-relation question walks the chain: answer plus the support page, with evidence', async () => {
+    let meta: any;
+    const list = await buildRelationalArm(eng, CHAIN_Q, { planner: true, onMeta: m => { meta = m; } });
+    const frank = list.find(r => r.slug === 'people/frank-example')!;
+    expect(frank.relational).toMatchObject({ role: 'answer', seed: 'people/alice-example', hop: 2 });
+    expect(frank.relational!.edges.map(e => e.link_type)).toEqual(['invested_in', 'founded']);
+    expect(list.find(r => r.slug === 'companies/widget-co')?.relational?.role).toBe('support');
+    expect(meta).toMatchObject({ kind: 'chain', fired: true, plan: { status: 'fired', anchor: 'Alice Example', answers: 1 } });
+  });
+
+  test('planner off: the arm output for the same question is exactly the pre-planner output', async () => {
+    const off = await buildRelationalArm(eng, CHAIN_Q, {});
+    const explicitOff = await buildRelationalArm(eng, CHAIN_Q, { planner: false });
+    expect(JSON.stringify(explicitOff)).toBe(JSON.stringify(off));
+    expect(off.some(r => r.relational !== undefined)).toBe(false);
+  });
+
+  test('an unsupported chain (coordination) runs no relational arm instead of a one-hop guess', async () => {
+    let meta: any;
+    const list = await buildRelationalArm(eng, 'Which companies did Alice Example found and invest in?', { planner: true, onMeta: m => { meta = m; } });
+    expect(list).toEqual([]);
+    expect(meta.plan).toMatchObject({ status: 'unsupported' });
+  });
+
+  test('an unresolved anchor reports anchor_not_found and returns the one-hop path\'s output', async () => {
+    let meta: any;
+    const q = 'Who founded the companies that Nobody Example invested in?';
+    const planned = await buildRelationalArm(eng, q, { planner: true, onMeta: m => { meta = m; } });
+    expect(meta.plan).toMatchObject({ status: 'anchor_not_found' });
+    expect(JSON.stringify(planned)).toBe(JSON.stringify(await buildRelationalArm(eng, q, {})));
+  });
+
+  test('a chain error is audited and the one-hop path answers instead', async () => {
+    const original = eng.relationalChainHop;
+    let meta: any;
+    eng.relationalChainHop = async () => { throw new Error('chain boom'); };
+    try {
+      const planned = await buildRelationalArm(eng, CHAIN_Q, { planner: true, onMeta: m => { meta = m; } });
+      expect(meta.errored).toBe(true);
+      eng.relationalChainHop = original;
+      expect(JSON.stringify(planned)).toBe(JSON.stringify(await buildRelationalArm(eng, CHAIN_Q, {})));
+      expect(readRecentRelationalFailures().some(f => f.query_kind === 'chain' && f.error_summary.includes('chain boom'))).toBe(true);
+    } finally {
+      eng.relationalChainHop = original;
+    }
+  });
+
+  test('the literal all-sources scope stays fail-closed for chains', async () => {
+    let meta: any;
+    const list = await buildRelationalArm(eng, CHAIN_Q, { planner: true, sourceId: '__all__', onMeta: m => { meta = m; } });
+    expect(list.some(r => r.relational !== undefined)).toBe(false);
+    expect(meta.plan).toMatchObject({ status: 'anchor_not_found' });
+  });
+
+  test('one-hop orientation finds a founder written on the company page', async () => {
+    const plain = await buildRelationalArm(eng, 'who founded widget-co', {});
+    const oriented = await buildRelationalArm(eng, 'who founded widget-co', { orientOneHop: true });
+    expect(plain.map(r => r.slug)).not.toContain('people/frank-example');
+    expect(oriented.map(r => r.slug)).toContain('people/frank-example');
+  });
 });

@@ -1,3 +1,4 @@
+import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts';
 /**
  * gbrain remote-source git helpers (v0.28).
  *
@@ -18,6 +19,7 @@ import { execFileSync } from 'child_process';
 import { lstatSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { isInternalUrl } from './url-safety.ts';
+import { execFileBounded } from './bounded-child-exec.ts';
 
 /**
  * Git CLI accepts two flag positions:
@@ -215,6 +217,7 @@ export const GIT_ENV_AUTH = {
  * - Throws GitOperationError on failure; caller is responsible for cleanup.
  */
 export function cloneRepo(url: string, destDir: string, opts: CloneOpts = {}): void {
+  assertManagedFilesystemWrite(destDir);
   if (existsSync(destDir)) {
     let entries: string[];
     try {
@@ -264,22 +267,41 @@ export function cloneRepo(url: string, destDir: string, opts: CloneOpts = {}): v
  * GBRAIN_GIT_ALLOW_FILE_TRANSPORT=1 escape hatch reaches sync's pull —
  * self-hosted local-filesystem remotes could clone but never pull. Default
  * stays `never`; the origin was already validated at clone time.
+ *
+ * Runs asynchronously so the caller's event loop stays live while git waits
+ * on the remote: --timeout timers, signal handlers and job-lease renewals keep
+ * firing. The child is stopped when `opts.signal` aborts or after
+ * `opts.timeoutMs` (default 5 min); `isStoppedGitPull` recognizes the error
+ * that produces, so callers can tell "we stopped it" from "git failed".
  */
-export function pullRepo(repoPath: string, opts: { timeoutMs?: number } = {}): void {
-  const args: string[] = ['-C', repoPath, ...durableSsrfFlags(), 'pull', ...GIT_SSRF_SUBCOMMAND_FLAGS, '--ff-only'];
-  try {
-    execFileSync('git', args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: opts.timeoutMs ?? 300_000,
-      env: { ...process.env, ...GIT_ENV },
-    });
-  } catch (e) {
-    throw new GitOperationError(
-      'pull',
-      `git pull failed in ${repoPath}: ${gitErrorDetail(e)}`,
-      e,
-    );
-  }
+export async function pullRepo(repoPath: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<void> {
+  assertManagedFilesystemWrite(repoPath);
+  const argv = ['-C', repoPath, ...durableSsrfFlags(), 'pull', ...GIT_SSRF_SUBCOMMAND_FLAGS, '--ff-only'];
+  const run = await execFileBounded('git', argv, {
+    timeout: opts.timeoutMs ?? 300_000,
+    env: { ...process.env, ...GIT_ENV },
+    signal: opts.signal,
+  });
+  if (!run.error) return;
+  // execFile hands stderr back beside the error rather than on it, so lead
+  // with it here to keep the #1315 stderr-first message.
+  const reason = run.stderr.trim() || run.error.message;
+  throw new GitOperationError('pull', `git pull failed in ${repoPath}: ${reason}`, run.error);
+}
+
+/**
+ * Whether a `pullRepo` rejection means the pull was stopped (its deadline
+ * passed, its signal aborted, or something outside sent git SIGTERM) rather
+ * than git reporting a failure. GitOperationError keeps the subprocess error
+ * as `cause`, so the stop markers are read there: `code` ETIMEDOUT/ABORT_ERR
+ * or `signal` SIGTERM.
+ */
+export function isStoppedGitPull(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause === null || typeof cause !== 'object') return false;
+  const { code, signal } = cause as { code?: unknown; signal?: unknown };
+  return code === 'ETIMEDOUT' || code === 'ABORT_ERR' || signal === 'SIGTERM';
 }
 
 /**
@@ -346,6 +368,24 @@ export function validateRepoState(
     });
     remoteUrl = out.toString().trim();
   } catch {
+    // #4559 (reported by @matteborje): a local-only source has no `origin`
+    // by design — `git remote get-url origin` exiting non-zero is only
+    // corruption when a remote was actually expected (a managed clone
+    // missing its origin). With no expectedRemoteUrl, classify on real
+    // repository integrity instead so a healthy no-remote repo doesn't
+    // read clone_state=corrupted forever.
+    if (expectedRemoteUrl === undefined) {
+      try {
+        execFileSync('git', ['-C', repoPath, 'rev-parse', '--git-dir'], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 10_000,
+          env: { ...process.env, ...GIT_ENV },
+        });
+        return 'healthy';
+      } catch {
+        return 'corrupted';
+      }
+    }
     return 'corrupted';
   }
 
@@ -543,6 +583,7 @@ export function divergenceSafePull(
   branch: string,
   opts: { timeoutMs?: number } = {},
 ): PullOutcome {
+  assertManagedFilesystemWrite(repoPath);
   const timeoutMs = opts.timeoutMs ?? 300_000;
 
   if (isWorkingTreeDirty(repoPath)) return { status: 'skipped_dirty' };

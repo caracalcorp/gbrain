@@ -1,7 +1,7 @@
 # Checkpoint compaction + compiled views
 
 Compaction is the worst moment in a long-lived agent's life: the harness
-summarizes the window and the un-extracted detail dies with it. Cathedral 5
+summarizes the window and the un-extracted detail dies with it. gbrain
 makes the brain the durable side of that boundary, in two halves:
 
 1. **Checkpoint compaction** — at the compaction boundary the raw
@@ -57,6 +57,15 @@ happy path exactly-once and every failure path at-least-once (never loss):
 | Session-end corpus + sweep pass 3 | SessionEnd hook + serve sweep | the post-last-boundary REMAINDER when segment coverage holds; the FULL transcript otherwise |
 | `gbrain transcripts ingest --facts` | manual | whatever the operator points it at (operator's explicit choice) |
 
+The checkpoint harvest and the session-end lane run while
+`memory.auto_writeback` is unset (installing the harness hooks opted into
+them) and stop on an explicit `off`: banked segments and transcripts are
+retired, never extracted, and a capture made under `off` stays retired after
+writeback is turned back on. Read errors, plane drift and invalid values hold
+them untouched. The full truth table is in
+[ambient writeback](ambient-writeback.md#capture-lanes-and-the-off-switch).
+`gbrain transcripts ingest --facts` is an explicit choice and is never gated.
+
 Coverage is decided by **exact-set hashes**, not counts: session-end
 recomputes every boundary window's redacted hash from its own full parse and
 requires each in the per-session ledger (`<session>.ledger.json`). A missed
@@ -82,9 +91,9 @@ makes this the exception path.
   delegating (spool-first; serve IPC on PGLite, direct connection on
   Postgres) and `assemble()` injects the checkpoint block from the banked
   manifest. No hooks, no recipe.
-- **Codex / opencode** — not wired in this release. The pull protocol
+- **Codex / opencode** — not wired. The pull protocol
   (`gbrain context-pack` after compaction, per `docs/guides/ambient-recall.md`)
-  is the supported path; codex now has a native SessionEnd capture lane (trust-gated hooks.json entry, `gbrain bootstrap hooks --harness codex`) — per-turn/compaction context on codex stays the pull protocol.
+  is the supported path; codex has a native SessionEnd capture lane (trust-gated hooks.json entry, `gbrain bootstrap hooks --harness codex`) — per-turn/compaction context on codex stays the pull protocol.
 
 ## Operational runbook — reason vocabulary
 
@@ -109,7 +118,12 @@ only — never content.
   `dream_output` (dream-cycle output is never re-harvested) / `aborted`
   (retryable — nothing was written) / `manifest_failed` (receipt kept; the
   retry re-publishes without re-extracting). Hard failures carry the error
-  name as the reason.
+  name as the reason, plus its code when it has one
+  (`operationerror:writer_lock_unavailable`); serve's stderr names the first
+  failure of each reason. A segment refused because the canonical writer
+  stayed busy is not re-queued (its first window already wrote `.progress`):
+  the error stands and the sweep resumes the segment. Only the writeback
+  lane re-queues a busy-writer refusal.
 
 **Single-corpus-dir invariant:** the hook resolves the corpus dir from file
 config while serve resolves it from DB config. Keep

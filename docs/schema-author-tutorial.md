@@ -8,7 +8,7 @@ The whole walkthrough takes about 5 minutes. You'll see something working by ste
 
 ## What you'll need
 
-- gbrain v0.40.7.0 or later (`gbrain --version` to check)
+- gbrain installed (`gbrain --version` to check)
 - A brain that's been initialized (`gbrain init` already run; either PGLite or Postgres is fine)
 - A terminal you can paste commands into
 
@@ -171,7 +171,7 @@ gbrain whoknows "machine learning"
 
 If your researcher pages contain ML-related content, they'll surface in the ranked results — even though they're typed `researcher`, not `person` or `company`.
 
-**This is the load-bearing demonstration of T1.5 wiring.** Pre-v0.40.7.0, `whoknows` hardcoded `['person', 'company']` as the eligible types and would have ignored your `researcher` pages entirely. The v0.40.7.0 wiring consults the active pack's `expert_routing: true` types via `expertTypesFromPack(pack.manifest)`, so your custom type now routes through expert search.
+**This is the load-bearing demonstration of the pack-aware wiring.** `whoknows` consults the active pack's `expert_routing: true` types via `expertTypesFromPack(pack.manifest)` rather than a hardcoded `['person', 'company']` list, so your custom type routes through expert search instead of being ignored.
 
 ## What you built
 
@@ -184,6 +184,14 @@ You now have:
 You also exercised the full mutation skeleton: bundled-pack guard, per-pack lock, validation gate, atomic write, audit log, cache invalidation. Every step was idempotent — re-running any of them is a no-op.
 
 ## Next steps
+
+**Add a type set by frontmatter only.** Some types don't live in one directory: an `archive` page can sit anywhere and is typed by its frontmatter `type: archive`. Declare it with `--no-prefix` instead of `--prefix`:
+
+```bash
+gbrain schema add-type archive --primitive concept --no-prefix
+```
+
+The pack records `path_prefixes: []`, so pages get this type only from frontmatter. Leaving out both `--prefix` and `--no-prefix` is refused (exit 2, `invalid_params`), and `--no-prefix` can't be combined with `--extractable` or `--expert` (lint rules `extractable_empty_corpus`, `expert_routing_without_prefix`).
 
 **Add a link verb.** A `researcher` can `author` a `paper`. To model that:
 
@@ -217,6 +225,6 @@ gbrain schema lint --with-db
 
 ## Related docs
 
-- **Reference:** `gbrain schema --help` for the full CLI surface (30+ subcommands); the "Schema Cathedral v3" section of `docs/architecture/KEY_FILES.md` for the module-by-module architecture.
+- **Reference:** `gbrain schema --help` for the full CLI surface (30+ subcommands); the "Schema packs: mutation surface" section of `docs/architecture/KEY_FILES.md` for the module-by-module architecture.
 - **How-to:** [`skills/schema-author/SKILL.md`](../skills/schema-author/SKILL.md) — the agent dispatcher with the 7-phase workflow (brain → assess → propose → apply → sync → verify → commit).
 - **Explanation:** [`skills/conventions/schema-evolution.md`](../skills/conventions/schema-evolution.md) — when to add a type vs alias vs prefix.

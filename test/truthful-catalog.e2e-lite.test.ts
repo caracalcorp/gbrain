@@ -42,7 +42,7 @@
  * (FOV-6c: exactly ONE warn-mode case below, probing a READ op only).
  *
  * Wall-clock budget: the whole file should finish in < 3 minutes (ENG-21).
- * The budget is ENFORCED only under GBRAIN_ENFORCE_E5_BUDGET=1 (a loaded CI
+ * The budget is ENFORCED only under GBRAIN_TEST_ENFORCE_E5_BUDGET=1 (a loaded CI
  * shard or laptop makes wall-clock assertions flaky); otherwise an overrun
  * warns loudly so drift is still visible.
  */
@@ -59,7 +59,7 @@ import {
   type Operation,
   type AuthInfo,
 } from '../src/core/operations.ts';
-import { hasScope } from '../src/core/scope.ts';
+import { hasScope, operationScopesAllowed } from '../src/core/scope.ts';
 import {
   filterOpsForSurface,
   STARTER_OPS,
@@ -87,6 +87,9 @@ const WALL_CLOCK_BUDGET_MS = 3 * 60 * 1000;
 const SKILL_FIXTURE = join(import.meta.dir, 'fixtures', 'skill-catalog', 'skills');
 const BOUND_PREFIX = 'e2e-bound/';
 const LEGACY_TOKEN = 'e5-truthful-catalog-legacy-token';
+// Legacy tokens with no explicit scope column retain read/write/admin. The
+// paid agent lane is a separate grant; admin does not imply agent.
+const LEGACY_DEFAULT_SCOPES = ['read', 'write', 'admin'];
 
 /**
  * Hermetic env pins, applied via withEnv (the repo's R1-compliant pattern):
@@ -173,7 +176,7 @@ async function setGates(on: boolean): Promise<void> {
 
 interface Cell {
   label: string;
-  /** OAuth token scopes; null = legacy bearer semantics (no scope checks). */
+  /** Explicit token scopes; null = the legacy read/write/admin defaults. */
   scopes: string[] | null;
   surface: McpSurface;
   gatesOn: boolean;
@@ -181,10 +184,12 @@ interface Cell {
 }
 
 function cellAuth(cell: Cell): AuthInfo {
+  const clientId = `e5-${cell.label}`;
   return {
     token: 'e5-token',
-    clientId: `e5-${cell.label}`,
-    scopes: cell.scopes ?? [],
+    clientId,
+    principal: { kind: 'oauth_client', id: clientId },
+    scopes: cell.scopes ?? LEGACY_DEFAULT_SCOPES,
     ...(cell.bound ? { boundSlugPrefixes: [BOUND_PREFIX] } : {}),
   };
 }
@@ -198,15 +203,16 @@ function cellAuth(cell: Cell): AuthInfo {
  */
 function expectedVisibleSet(cell: Cell): Set<string> {
   const out = new Set<string>();
+  const scopes = cell.scopes ?? LEGACY_DEFAULT_SCOPES;
   for (const op of operations) {
     if (op.localOnly) continue;                                  // D7: network transport
+    if (op.cliOnly) continue;                                    // F5: owner-only CLI ops are never listed on MCP
     if (cell.surface === 'verbs' && op.verb !== true) continue;  // frozen verb surface
     if (cell.surface === 'starter' && !STARTER_OPS.has(op.name)) continue;
-    if (cell.scopes !== null) {
-      const scopeOk = hasScope(cell.scopes, op.scope ?? 'read')
-        || (op.agentCallable === true && hasScope(cell.scopes, 'agent')); // FOV-4
-      if (!scopeOk) continue;
-    }
+    const scopeOk = hasScope(scopes, op.scope ?? 'read')
+      || (op.agentCallable === true && hasScope(scopes, 'agent')); // FOV-4
+    if (!scopeOk) continue;
+    if (!(op.requiredScopes ?? []).every(scope => hasScope(scopes, scope))) continue;
     if (cell.bound && !opAllowedForBoundClient({ boundSlugPrefixes: [BOUND_PREFIX] }, op)) continue;
     if (op.publishGateKey && !cell.gatesOn) continue;            // WP1 honest catalog
     out.add(op.name);
@@ -217,16 +223,17 @@ function expectedVisibleSet(cell: Cell): Set<string> {
 /**
  * The serve-http ListTools computation, composed from the exact seams the
  * real handler uses (serve-http.ts POST /mcp → ListToolsRequestSchema):
- * surface filter after the localOnly filter, then scope (+ agentCallable
- * carve-out), bound-client predicate, publish gates.
+ * surface filter after the localOnly filter, then isCallable's cliOnly
+ * exclusion (F5), scope (+ agentCallable carve-out), bound-client predicate,
+ * publish gates.
  */
 async function oauthToolsList(cell: Cell): Promise<Set<string>> {
   const mcpOperations = filterOpsForSurface(operations.filter(op => !op.localOnly), cell.surface);
   const gateDisabled = await disabledOpsForPublishGates(engine, null);
   const auth = cellAuth(cell);
   const visible = mcpOperations.filter(op =>
-    (hasScope(auth.scopes, op.scope ?? 'read')
-      || (op.agentCallable === true && hasScope(auth.scopes, 'agent')))
+    !op.cliOnly
+    && operationScopesAllowed(auth.scopes, op)
     && opAllowedForBoundClient(auth, op)
     && !gateDisabled.has(op.name));
   return new Set(visible.map(o => o.name));
@@ -274,8 +281,7 @@ async function oauthToolCall(
   const op = mcpOperations.find(o => o.name === name);
   if (!op) return { kind: 'unknown', envelope: { error: 'unknown_operation' } };
   const auth = cellAuth(cell);
-  const scopeSatisfied = hasScope(auth.scopes, op.scope ?? 'read')
-    || (op.agentCallable === true && hasScope(auth.scopes, 'agent'));
+  const scopeSatisfied = operationScopesAllowed(auth.scopes, op);
   if (!scopeSatisfied) {
     return { kind: 'list_level_denial', envelope: { error: 'insufficient_scope' } };
   }
@@ -376,6 +382,17 @@ describe('E5 truthful catalog — legacy bearer transport (real HTTP, PGLite)', 
     }
     for (const localOnly of ['file_list', 'file_upload', 'file_url', 'sync_brain']) {
       expect(listed.has(localOnly)).toBe(false);
+    }
+    for (const [name, args] of [
+      ['submit_agent', { prompt: 'Synthetic scope probe' }],
+      ['get_agent_job', { id: 1 }],
+    ] as const) {
+      expect(listed.has(name)).toBe(false);
+      const denied = await legacyToolCall(name, args);
+      expect(denied.envelope?.error).toBe('permission_denied');
+      expect(denied.envelope?.message).toBe('Tool requires agent scope');
+      expect(denied.envelope).toMatchObject({ code: 'insufficient_scope', reason: 'insufficient_scope', fix: { actor: 'host_admin', next: 'tell_user_to_run' } });
+      expect((denied.envelope as { fix?: { argv?: string[] } }).fix?.argv?.slice(0, 2)).toEqual(['gbrain', 'auth']);
     }
   });
 
@@ -783,7 +800,7 @@ describe('E5 budget', () => {
         `trim probe work or split cells before raising this budget.`;
       // Machine load makes wall-clock assertions flaky — hard-fail only when
       // the budget gate is explicitly armed (dedicated perf lane / local run).
-      if (process.env.GBRAIN_ENFORCE_E5_BUDGET === '1') throw new Error(msg);
+      if (process.env.GBRAIN_TEST_ENFORCE_E5_BUDGET === '1') throw new Error(msg);
       console.warn(msg);
     }
   });

@@ -19,6 +19,7 @@ import { withEnv, emptyHome } from './helpers/with-env.ts';
 import {
   runPhaseProposeTakes,
   parseExtractorOutput,
+  EXTRACT_TAKES_PROMPT,
   contentHash,
   hasCompleteFence,
   extractExistingTakesForDedup,
@@ -186,6 +187,50 @@ describe('parseExtractorOutput', () => {
     expect(out[0]!.domain).toBe('macro');
   });
 
+  // #4736 — the prompt's kind vocabulary and the parser's allowlist must
+  // never diverge again: every kind token the prompt instructs the model to
+  // emit must survive parsing with its provenance intact (NOT be silently
+  // coerced to the default 'take').
+  test('every kind token in EXTRACT_TAKES_PROMPT is accepted, not coerced (#4736)', () => {
+    const kindLine = EXTRACT_TAKES_PROMPT.split('\n').find((l) => l.trim().startsWith('- kind'));
+    expect(kindLine).toBeDefined();
+    const tokens = [...kindLine!.matchAll(/'([a-z]+)'/g)].map((m) => m[1]!);
+    expect(tokens.length).toBeGreaterThanOrEqual(2);
+    for (const token of tokens) {
+      const out = parseExtractorOutput(
+        JSON.stringify([{ claim_text: `claim of kind ${token}`, kind: token, holder: 'brain', weight: 0.6 }]),
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0]!.kind).toBe(token as ProposedTake['kind']);
+    }
+  });
+
+  test('legacy prompt kinds (prediction/judgment) map onto the fence vocabulary (#4736)', () => {
+    // Cached / old-model outputs still emit the pre-#4736 prompt vocabulary;
+    // they classify deterministically instead of relying on blind coercion.
+    const legacy: Array<[string, ProposedTake['kind']]> = [
+      ['prediction', 'take'],
+      ['judgment', 'take'],
+    ];
+    for (const [legacyKind, mapped] of legacy) {
+      const out = parseExtractorOutput(
+        JSON.stringify([{ claim_text: 'x', kind: legacyKind, holder: 'brain', weight: 0.5 }]),
+      );
+      expect(out[0]!.kind).toBe(mapped);
+    }
+  });
+
+  test('kind matching is case/whitespace-insensitive (#4736)', () => {
+    const out = parseExtractorOutput(
+      JSON.stringify([
+        { claim_text: 'a', kind: 'Bet', holder: 'brain', weight: 0.5 },
+        { claim_text: 'b', kind: ' hunch ', holder: 'brain', weight: 0.5 },
+      ]),
+    );
+    expect(out[0]!.kind).toBe('bet');
+    expect(out[1]!.kind).toBe('hunch');
+  });
+
   test('strips <think> reasoning tags before parsing (MiniMax-M3, DeepSeek-R1)', () => {
     const raw = '<think>Analyzing the prose... I see several claims.</think>\n\n```json\n[{"claim_text":"X","kind":"take","holder":"brain","weight":0.5}]\n```';
     const out = parseExtractorOutput(raw);
@@ -204,6 +249,30 @@ describe('parseExtractorOutput', () => {
     const out = parseExtractorOutput(raw);
     expect(out).toHaveLength(1);
     expect(out[0]!.claim_text).toBe('Z');
+  });
+
+  // #5209: recovery must stop at the value's own closing bracket; the last
+  // `]`/`}` in the reply can belong to prose after it.
+  const take = (claim: string, kind = 'take') => JSON.stringify({ claim_text: claim, kind, holder: 'brain', weight: 0.7 });
+
+  test('an array followed by a numbered citation keeps its takes', () => {
+    const out = parseExtractorOutput(`[${take('Pricing beats features')},${take('Hiring lags plan', 'bet')}]\n[1] board memo`);
+    expect(out.map(t => [t.claim_text, t.kind])).toEqual([['Pricing beats features', 'take'], ['Hiring lags plan', 'bet']]);
+  });
+
+  test('a lone object followed by a stray `]` is recovered', () => {
+    const out = parseExtractorOutput(`${take('Churn is seasonal', 'hunch')}\n]`);
+    expect(out.map(t => t.claim_text)).toEqual(['Churn is seasonal']);
+  });
+
+  test('brackets, braces and an escaped quote inside claim_text', () => {
+    const claim = 'Ratio {a]/[b} is "stable"';
+    const out = parseExtractorOutput(`[${take(claim)}] per [[companies/acme-example]]`);
+    expect(out.map(t => t.claim_text)).toEqual([claim]);
+  });
+
+  test('control: a cut-off array followed by a citation still yields nothing', () => {
+    expect(parseExtractorOutput(`[${take('A')},{"claim_text":"B"\nSee [Source: memo]`)).toEqual([]);
   });
 });
 
@@ -581,7 +650,9 @@ New prose appended here.`;
 
       const result = await runPhaseProposeTakes(buildCtx(engine), {
         extractor,
-        meter: new BudgetMeter({ budgetUsd: 0.000001, phase: 'propose_takes' }),
+        // The OpenRouter alias is not in the canonical pricing table; the
+        // opt-in bypass keeps this test about model-id preservation (C-16).
+        meter: new BudgetMeter({ budgetUsd: 0.000001, phase: 'propose_takes', allowUnpriced: true }),
       });
 
       expect(result.status).toBe('ok');
@@ -981,6 +1052,37 @@ describe('runPhaseProposeTakes — global-error halt (#3044)', () => {
   });
 });
 
+// ─── #4312: pricing.overrides reach the base-phase budget gate ─────
+
+describe('pricing.overrides reach the base-phase meter (#4312)', () => {
+  test('a $0 operator override lets a capped phase run instead of exhausting at list price', async () => {
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'test-key' } });
+    try {
+      const run = async (overrides: string | null) => {
+        const pages = [buildPage({ slug: 'wiki/override', body: 'an operator rate should price the gate' })];
+        const { engine, captured } = buildMockEngine({ pages });
+        (engine as unknown as { getConfig: (k: string) => Promise<string | null> }).getConfig =
+          async (k: string) => (k === 'pricing.overrides' ? overrides : null);
+        const extractor: ProposeTakesExtractor = async () => [
+          { claim_text: 'an operator rate should price the gate', kind: 'take', holder: 'brain', weight: 0.5 },
+        ];
+        const result = await runPhaseProposeTakes(buildCtx(engine), { extractor, budgetUsd: 0.000001 });
+        return { result, inserted: captured.some(c => c.sql.includes('INSERT INTO take_proposals')) };
+      };
+      // Control: at list price the cap is binding.
+      const listed = await run(null);
+      expect(listed.result.details.budget_exhausted).toBe(true);
+      expect(listed.inserted).toBe(false);
+      // With the operator's $0 rate the same cap admits the call.
+      const priced = await run('{"anthropic:claude-sonnet-4-6": 0}');
+      expect(priced.result.details.budget_exhausted).toBe(false);
+      expect(priced.inserted).toBe(true);
+    } finally {
+      resetGateway();
+    }
+  });
+});
+
 // ─── #4102: cycle.propose_takes.enabled off switch ─────────────────
 
 describe('cycle.propose_takes.enabled gate (#4102)', () => {
@@ -1050,5 +1152,40 @@ describe('cycle.propose_takes.enabled gate (#4102)', () => {
     const result = await runPhaseProposeTakes(buildCtx(engine), { extractor, once: true });
     expect(result.status).not.toBe('skipped');
     expect(calls()).toBe(1);
+  });
+});
+
+// ─── #4823: `gbrain dream --dry-run` promises "no writes" ────────────
+// BaseCyclePhase.run() must skip every subclass (propose_takes / grade_takes /
+// calibration_profile) under dry-run — they bill LLM calls and INSERT rows and
+// have no dry-run path of their own — the same shape extract uses.
+
+describe('runPhaseProposeTakes — dry-run (#4823)', () => {
+  function armedEngine(): { engine: BrainEngine; calls: () => number } {
+    let calls = 0;
+    const engine = {
+      kind: 'pglite',
+      async executeRaw() { calls++; throw new Error('executeRaw must not run under dry-run'); },
+      async listPages() { calls++; throw new Error('listPages must not run under dry-run'); },
+    } as unknown as BrainEngine;
+    return { engine, calls: () => calls };
+  }
+  const meter = () => new BudgetMeter({ budgetUsd: 1, phase: 'propose_takes' });
+
+  test('opts.dryRun: skipped with no_dry_run_support; engine never touched', async () => {
+    const { engine, calls } = armedEngine();
+    const r = await runPhaseProposeTakes(buildCtx(engine), { dryRun: true, meter: meter() });
+    expect(r.status).toBe('skipped');
+    expect(r.details.reason).toBe('no_dry_run_support');
+    expect(r.details.dryRun).toBe(true);
+    expect(calls()).toBe(0);
+  });
+
+  test('ctx.dryRun alone (caller forgot to thread opts): still skipped; engine never touched', async () => {
+    const { engine, calls } = armedEngine();
+    const r = await runPhaseProposeTakes({ ...buildCtx(engine), dryRun: true }, { meter: meter() });
+    expect(r.status).toBe('skipped');
+    expect(r.details.reason).toBe('no_dry_run_support');
+    expect(calls()).toBe(0);
   });
 });

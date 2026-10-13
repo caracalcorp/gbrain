@@ -11,9 +11,8 @@
  *   - Disabled-builtin honored
  *   - Timezone warning (D19) emitted when frontmatter timezone missing
  *
- * Pure-function tests; no PGLite, no LLM. The LLM polish/fallback
- * tests live in `llm-base.test.ts`, `llm-polish.test.ts`,
- * `llm-fallback.test.ts` (T4).
+ * Pure-function tests; no PGLite, no LLM. The LLM fallback tests
+ * live in `llm-base.test.ts` and `llm-fallback.test.ts` (T4).
  */
 
 import { describe, expect, test } from 'bun:test';
@@ -769,6 +768,30 @@ describe('bold-name-no-time pattern (Circleback/Granola/Zoom, no timestamp)', ()
     expect(r.messages[0].timestamp).toBe('1970-01-01T00:00:00Z');
   });
 
+  // gbrain-evals N12-1: a status note with three one-off bold labels is
+  // not a conversation. Full-body density (3/26 ≈ 0.115) clears the floor,
+  // so the gate is structural: three or more turns with no speaker ever
+  // speaking twice is a list of labels, not an exchange.
+  test('REGRESSION (N12-1): a status note with one-off bold labels is no_match', () => {
+    const filler = Array.from({ length: 22 }, (_, i) => `Paragraph ${i + 1}: the team agreed in principle and will review the plan this week.`);
+    const body = ['# Project status', '', '**Status:** green', '**Owner:** Alice Example', '**Next step:** ship the draft', '', ...filler, ''].join('\n');
+    const r = parseConversation(body, { noFallback: true, noPolish: true, page: { frontmatter: { date: '2026-04-01' } } } as any);
+    expect(r.phase).toBe('no_match');
+    expect(r.messages).toEqual([]);
+  });
+
+  test('N12-1 control: a three-person exchange where someone speaks twice still parses', () => {
+    const body = [
+      '**Alice Example:** shall we start?',
+      '**Bob Example:** ready.',
+      '**Carol Example:** me too.',
+      '**Alice Example:** great, first item.',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-04-01' });
+    expect(r.matched_pattern_id).toBe('bold-name-no-time');
+    expect(r.messages).toHaveLength(4);
+  });
+
   // REGRESSION: must NOT shadow bold-paren-time. A `**Name** (00:00): text`
   // line has its colon OUTSIDE the bold markers, so it must still parse via
   // bold-paren-time (the safety is the regex, not declaration order).
@@ -1336,5 +1359,64 @@ describe('unrecognized_headings — folded speaker headings surface (#4136)', ()
       source: 'explicit',
     });
     expect(messages.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Date-fallback anchoring (#4681 narrow cut): an anchor whose date cannot be
+// reconstructed still opens its own message instead of being dropped and
+// folding its body into the previous speaker.
+// ---------------------------------------------------------------------------
+
+describe('date-fallback anchoring applies to every pattern (#4681)', () => {
+  test('a telegram anchor with an unknown month opens a fallback-dated message instead of folding', () => {
+    // buildIso() returning null used to drop the anchor; on a multi_line
+    // pattern the body then folded into the PREVIOUS speaker while the parse
+    // still returned regex_match (silent misattribution). Reachable on
+    // telegram-text-export with any non-English 3-letter month.
+    const body = [
+      'Alice Doe, [Mar 15, 2024 at 6:37:00 PM]',
+      'hello',
+      'Bob Roe, [Xyz 15, 2024 at 6:38:00 PM]',
+      'bad month',
+      'Alice Doe, [Mar 15, 2024 at 6:39:00 PM]',
+      'bye',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2024-03-15' });
+    expect(r.matched_pattern_id).toBe('telegram-text-export');
+    expect(r.messages).toHaveLength(3);
+    expect(r.messages[0].text).toBe('hello');
+    expect(r.messages[1].speaker).toContain('Bob');
+    expect(r.messages[1].text).toBe('bad month');
+    // Inherits the previous anchor's timestamp (NOT midnight): a midnight
+    // stamp mid-page would open a new too-short segment downstream in
+    // extract-conversation-facts and lose the following message.
+    expect(r.messages[1].timestamp).toBe('2024-03-15T18:37:00Z');
+    expect(r.messages[2].text).toBe('bye');
+    expect(r.date_fallback_count).toBe(1);
+  });
+
+  test('a first-anchor date failure anchors at midnight of the page fallback date', () => {
+    const body = [
+      'Bob Roe, [Xyz 15, 2024 at 6:38:00 PM]',
+      'bad month',
+      'Alice Doe, [Mar 15, 2024 at 6:39:00 PM]',
+      'bye',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2024-03-15' });
+    expect(r.matched_pattern_id).toBe('telegram-text-export');
+    expect(r.messages).toHaveLength(2);
+    expect(r.messages[0].speaker).toContain('Bob');
+    expect(r.messages[0].text).toBe('bad month');
+    expect(r.messages[0].timestamp).toBe('2024-03-15T00:00:00Z');
+    expect(r.date_fallback_count).toBe(1);
+  });
+
+  test('healthy pages carry no date_fallback_count (JSON stays byte-identical)', () => {
+    const body = ['Alice Doe, [Mar 15, 2024 at 6:37:00 PM]', 'hello', 'Bob Roe, [Mar 15, 2024 at 6:38:00 PM]', 'hi'].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2024-03-15' });
+    expect(r.messages).toHaveLength(2);
+    expect(r.date_fallback_count).toBeUndefined();
+    expect('date_fallback_count' in JSON.parse(JSON.stringify(r))).toBe(false);
   });
 });

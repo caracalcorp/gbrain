@@ -1,21 +1,27 @@
 /**
- * Request metrics for `gbrain serve --http` (#3893, reimplemented from
- * @y2688's community PR).
+ * Request metrics and health probes for `gbrain serve --http` (#3893,
+ * reimplemented from @y2688's community PR).
  *
  * In-process counters plus a Prometheus text exposition (format 0.0.4).
- * Kept out of serve-http.ts so the module-size ratchet keeps its teeth; the
- * runServeHttp closure wires exactly three seams:
+ * Kept out of serve-http.ts so the module-size ratchet keeps its teeth;
+ * buildServeHttpApp wires exactly three metrics seams:
  *
  *   - `createMetricsCounters()` once per server,
  *   - `app.use(metricsTrackingMiddleware(counters))` BEFORE every route —
  *     Express only applies `app.use` middleware to routes registered after
  *     it (the original PR mounted the tracker after most routes, so they
  *     were never counted),
- *   - `GET /metrics` behind requireAdmin, rendering
+ *   - `GET /metrics` behind requireAdmin (`mountMetrics`), rendering
  *     `renderPrometheusMetrics(counters)` — request/error/latency series
  *     profile a personal brain's usage, so the exposition is not public.
+ *
+ * `mountHealth` serves the public liveness probe; `probeHealth` backs the
+ * admin-only full-stats endpoint.
  */
-import type { NextFunction, Request, RequestHandler, Response } from 'express';
+import type { Express, NextFunction, Request, RequestHandler, Response } from 'express';
+import type { BrainEngine } from '../core/engine.ts';
+import { VERSION } from '../version.ts';
+import type { ServeHttpContext } from './serve-http.ts';
 
 export interface MetricsCounters {
   requests: number;
@@ -97,4 +103,169 @@ export function renderPrometheusMetrics(
     `gbrain_uptime_seconds ${uptimeSeconds}`,
     '',
   ].join('\n');
+}
+
+/**
+ * /health endpoint timeout. 3s rather than 5s: Fly.io's default
+ * health-check timeout is 5s, so returning 503 right at the orchestrator
+ * deadline races with the orchestrator recording the request as a timeout.
+ * 3s leaves 2s of headroom for TCP, response framing, and clock skew.
+ */
+export const HEALTH_TIMEOUT_MS = 3000;
+
+export type ProbeHealthResult =
+  | { ok: true; status: 200; body: { status: 'ok'; version: string; engine: string; [k: string]: unknown } }
+  | { ok: false; status: 503; body: { error: 'service_unavailable'; error_description: string } };
+
+/**
+ * Pure async health probe. Races `engine.getStats()` against a timeout,
+ * returns a tagged result. No Express coupling — easy to unit-test with a
+ * mock engine. The /health route handler is a thin wrapper around this.
+ */
+export async function probeHealth(
+  engine: BrainEngine,
+  engineName: string,
+  version: string,
+  timeoutMs: number = HEALTH_TIMEOUT_MS,
+): Promise<ProbeHealthResult> {
+  // Capture the handle so we can clearTimeout when getStats() wins. Without
+  // this, every fast /health request leaves a 3s pending timer in the event
+  // loop until it fires — under high probe rates this builds up a rolling
+  // backlog of timers and avoidable wakeups. Both adversarial reviewers
+  // (Claude + Codex) flagged this independently.
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    const stats = await Promise.race([
+      engine.getStats(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('health_timeout')), timeoutMs);
+      }),
+    ]);
+    return {
+      ok: true,
+      status: 200,
+      body: { status: 'ok', version, engine: engineName, ...stats },
+    };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'unknown';
+    return {
+      ok: false,
+      status: 503,
+      body: {
+        error: 'service_unavailable',
+        error_description: msg === 'health_timeout'
+          ? 'Health check timed out (database pool may be saturated)'
+          : 'Database connection failed',
+      },
+    };
+  } finally {
+    // Clear the timer regardless of which branch won the race. No-op when
+    // the timer already fired (we're in the timeout-rejection catch block).
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+/**
+ * Races an abortable `SELECT 1` against `probeHealth`'s timeout; Postgres
+ * cancels the losing query while PGLite only discards its eventual result.
+ */
+export async function probeLiveness(
+  engine: BrainEngine,
+  engineName: string,
+  version: string,
+  timeoutMs: number = HEALTH_TIMEOUT_MS,
+): Promise<ProbeHealthResult> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const controller = new AbortController();
+  try {
+    await Promise.race([
+      engine.executeRaw('SELECT 1', undefined, { signal: controller.signal }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error('health_timeout'));
+        }, timeoutMs);
+      }),
+    ]);
+    return {
+      ok: true,
+      status: 200,
+      body: { status: 'ok', version, engine: engineName },
+    };
+  } catch (e: unknown) {
+    const msg = controller.signal.aborted ? 'health_timeout' : (e instanceof Error ? e.message : 'unknown');
+    return {
+      ok: false,
+      status: 503,
+      body: {
+        error: 'service_unavailable',
+        error_description: msg === 'health_timeout'
+          ? 'Health check timed out (database pool may be saturated)'
+          : 'Database connection failed',
+      },
+    };
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+/**
+ * Process liveness: is this event loop still answering?
+ *
+ * Deliberately takes no engine and performs no I/O, and the SIGNATURE is the
+ * guarantee — there is no database handle in scope to reach for, so no later
+ * edit can quietly make "is the process alive?" depend on "is Postgres up?".
+ * Answering at all is the entire signal.
+ *
+ * Why this is not `probeLiveness` with the query removed: they answer
+ * different questions for different callers. `/health` tells a human or a
+ * dashboard whether the brain is USABLE, and a database outage must show
+ * there. An orchestrator's liveness probe asks whether to KILL the container,
+ * and a database outage must NOT show there — restarting the process does not
+ * fix Postgres, and doing it on every blip turns a recoverable dependency
+ * outage into a crash loop. Conflating them forces one endpoint to be wrong
+ * for one of its two consumers.
+ *
+ * Returns a plain object rather than {@link ProbeHealthResult}: that union's
+ * failure arm is unreachable here, and a 503 branch that cannot fire reads as
+ * a promise this probe does not make.
+ */
+export function probeProcessLiveness(version: string): { status: 'ok'; version: string } {
+  return { status: 'ok', version };
+}
+
+/** GET /health: liveness only (full stats are the admin-only /admin/api/full-stats). */
+export function mountHealth(app: Express, ctx: ServeHttpContext): void {
+  const { engine, config } = ctx;
+  // ---------------------------------------------------------------------------
+  // Health check — liveness only. Full engine stats live at
+  // /admin/api/full-stats (requireAdmin). See probeLiveness above for the why.
+  // ---------------------------------------------------------------------------
+  app.get('/health', async (_req, res) => {
+    const result = await probeLiveness(engine, config.engine || 'pglite', VERSION);
+    res.status(result.status).json(result.body);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Process liveness — no database, no I/O. For orchestrator liveness probes
+  // (Kubernetes livenessProbe, Azure Container Apps Liveness), which must not
+  // restart the container because a dependency is down. See
+  // probeProcessLiveness above for why this is a second route and not a flag
+  // on /health.
+  // ---------------------------------------------------------------------------
+  app.get('/livez', (_req, res) => {
+    res.status(200).json(probeProcessLiveness(VERSION));
+  });
+}
+
+/** GET /metrics behind requireAdmin. */
+export function mountMetrics(app: Express, ctx: ServeHttpContext): void {
+  const { requireAdmin, metricsCounters } = ctx;
+  // #3893 (reimplemented from @y2688): Prometheus exposition. Admin-gated —
+  // request/error/latency series profile a personal brain's usage, so this
+  // is not a public surface (the original PR served it unauthenticated).
+  app.get('/metrics', requireAdmin, (_req: Request, res: Response) => {
+    res.set('Content-Type', 'text/plain; version=0.0.4');
+    res.send(renderPrometheusMetrics(metricsCounters));
+  });
 }

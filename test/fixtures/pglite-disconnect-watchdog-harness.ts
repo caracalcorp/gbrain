@@ -1,5 +1,5 @@
 /**
- * Fixture for test/pglite-disconnect-watchdog.serial.test.ts. Spawned via `bun`.
+ * Fixture for test/pglite-disconnect-watchdog.test.ts. Spawned via `bun`.
  *
  * Usage: bun pglite-disconnect-watchdog-harness.ts <mode>
  *   wedge-watchdog — monkeypatch close() into the measured #4284 wedge (a
@@ -39,6 +39,9 @@ process.on('SIGTERM', () => { /* no-op — a starved loop never runs this */ });
 
 const engine = new PGLiteEngine();
 await engine.connect({ engine: 'pglite' }); // in-memory; no initSchema — close is monkeypatched
+// The healthy path also exercises a full cold migration replay. An empty
+// client table must not load the operation registry or register its sinks.
+if (mode === 'clean-watchdog') await engine.initSchema();
 
 if (mode === 'wedge-watchdog' || mode === 'wedge-control') {
   const eng = engine as unknown as { _db: { close: () => Promise<void> } | null };

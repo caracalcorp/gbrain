@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   buildClaudeHookCommand,
+  buildPortableClaudeHookCommand,
   claudeCommittedSettingsPath,
   claudeSettingsPath,
   registerClaudeMcp,
@@ -255,7 +256,7 @@ describe('removeClaudeHooks [G5]', () => {
 });
 
 describe('MCP registration argv builders [G1, CX-P1.4]', () => {
-  test('registerClaudeMcp: stdio shape with scope + source env; serve pinned to --surface full', () => {
+  test('registerClaudeMcp: stdio shape with scope + source env; serve pinned to --surface full (REGISTRATION_SURFACE)', () => {
     const cmds = registerClaudeMcp({ gbrainBin: BIN, scope: 'project', sourceId: 'workspace' });
     expect(cmds).toEqual([
       ['claude', 'mcp', 'add', 'gbrain', '--scope', 'project', '-e', 'GBRAIN_SOURCE=workspace', '--', BIN, 'serve', '--surface', 'full'],
@@ -272,7 +273,7 @@ describe('MCP registration argv builders [G1, CX-P1.4]', () => {
     ]);
   });
 
-  test('registerCodexMcp: --env shape, no scope flag; serve pinned to --surface full', () => {
+  test('registerCodexMcp: --env shape, no scope flag; serve pinned to --surface full (REGISTRATION_SURFACE)', () => {
     const cmds = registerCodexMcp({ gbrainBin: BIN, sourceId: 'workspace', gbrainHome: '/ws' });
     expect(cmds).toEqual([
       ['codex', 'mcp', 'add', 'gbrain', '--env', 'GBRAIN_SOURCE=workspace', '--env', 'GBRAIN_HOME=/ws', '--', BIN, 'serve', '--surface', 'full'],
@@ -294,6 +295,16 @@ describe('buildClaudeHookCommand', () => {
     expect(cmd).toBe(
       `env GBRAIN_SOURCE=plain-slug 'GBRAIN_HOME=/has space/dir' ${BIN} hook user-prompt`,
     );
+  });
+
+  test('local carrier: an omitted GBRAIN_SOURCE renders NO source pin (harness lane under a live PGLite serve)', () => {
+    const cmd = buildClaudeHookCommand(BIN, 'SessionStart', { GBRAIN_HOOK_LANE: 'harness' });
+    expect(cmd).toBe(`env GBRAIN_HOOK_LANE=harness ${BIN} hook session-start`);
+    expect(cmd).not.toContain('GBRAIN_SOURCE');
+  });
+
+  test('committed carrier: an omitted GBRAIN_SOURCE is refused — the portable command must stay source-scoped', () => {
+    expect(() => buildPortableClaudeHookCommand('SessionStart', {})).toThrow(/source-scoped/);
   });
 });
 

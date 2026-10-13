@@ -24,9 +24,12 @@ export const anthropic: Recipe = {
     chat: {
       models: [
         'claude-fable-5',
+        'claude-fable-5-1',
+        'claude-opus-5-5',
         'claude-opus-5',
         'claude-opus-4-8',
         'claude-opus-4-7',
+        'claude-sonnet-5-5',
         'claude-sonnet-5',
         'claude-sonnet-4-6',
         'claude-haiku-4-5-20251001',
@@ -36,7 +39,10 @@ export const anthropic: Recipe = {
       supports_prompt_cache: true,
       model_context_tokens: {
         'claude-fable-5': 1_000_000,
+        'claude-fable-5-1': 1_000_000,
+        'claude-opus-5-5': 1_000_000,
         'claude-opus-5': 1_000_000,
+        'claude-sonnet-5-5': 1_000_000,
         'claude-sonnet-5': 1_000_000,
         'claude-opus-4-8': 1_000_000,
         'claude-opus-4-7': 1_000_000,

@@ -91,10 +91,24 @@ export interface Page {
   timeline: string;
   frontmatter: Record<string, unknown>;
   content_hash?: string;
+  /** Source-relative canonical file identity; snapshot reads expose it for guarded import comparisons. */
+  source_path?: string | null;
+  /** Opaque canonical state; independent of indexing and telemetry updates. */
+  knowledge_revision?: string;
+  /** Revision whose text/search chunks have been atomically installed. */
+  text_projection_revision?: string | null;
   /** v0.29 — deterministic 0..1 score; populated by the recompute_emotional_weight cycle phase. */
   emotional_weight?: number;
   created_at: Date;
   updated_at: Date;
+  /**
+   * `updated_at` at the column's microsecond precision, as an ISO string
+   * (`2026-08-10T12:00:00.000123Z`). Projected by `listPages` so keyset
+   * callers can resume from the exact row (`updatedAfterKeyset.updatedAt`);
+   * a JS Date holds milliseconds only and would re-select every row in the
+   * last row's millisecond. Absent on paths that do not project it.
+   */
+  updated_at_iso?: string;
   /**
    * v0.26.5: when present, the page is soft-deleted. Hidden from search and
    * from `getPage` / `listPages` by default; surface via `include_deleted: true`.
@@ -182,6 +196,7 @@ export type EffectiveDateSource =
   | 'date'
   | 'published'
   | 'filename'
+  | 'created'
   | 'fallback';
 
 // `image` (v0.27.1): multimodal ingestion path, parallel to markdown + code.
@@ -305,9 +320,12 @@ export interface PageFilters {
    * v0.45.7 — keyset cursor for deterministic pagination through pages sharing
    * one `updated_at`. `WHERE p.updated_at > ts OR (p.updated_at = ts AND
    * p.slug > slug)`. Supersedes `updated_after` when set; pair with
-   * `sort: 'updated_asc'` (total order). Used by the `delta` verb's session
+   * `sort: 'updated_asc'` (a total order: updated_at, slug, source_id, id —
+   * slug alone is unique only per source). Used by the `delta` verb's session
    * cursor so a >limit same-timestamp cluster pages cleanly instead of
-   * livelocking. `slug` empty ⇒ start of the `ts` bucket.
+   * livelocking. `slug` empty ⇒ start of the `ts` bucket. `updatedAt` should
+   * be the row's `updated_at_iso` (column precision); a millisecond-rounded
+   * value re-selects same-millisecond rows.
    */
   updatedAfterKeyset?: { updatedAt: string; slug: string };
   /**
@@ -358,10 +376,35 @@ export interface PageFilters {
    * (search/private-visibility.ts) in BOTH engines.
    */
   excludePrivate?: boolean;
+  /**
+   * #5154: select only the listing columns (identity, type, title, dates).
+   * `compiled_truth` and `timeline` come back as '' and `frontmatter` as {},
+   * so a listing never detoasts or ships page bodies. Only for callers that
+   * read none of those fields (list_pages).
+   */
+  listColumnsOnly?: boolean;
 }
 
 /** v0.26.5 — opts for getPage / softDeletePage / restorePage. */
-export interface GetPageOpts {
+export interface PageReadScope {
+  sourceId?: string;
+  sourceIds?: string[];
+  /** Resolved by the trusted operation layer, never from MCP parameters. */
+  excludePrivate?: boolean;
+  /** Untrusted chunk reads require a verified protected-body index, even with visibility opt-outs. */
+  requireSafeChunks?: boolean;
+  /** #5575 read floor (eligibility/policy.ts): only pages at or above this tier; a chunk's tier is its page's. */
+  minTrust?: import('./trust/tier.ts').TrustTier;
+  /** #5575 CEO-20, proactive reads only: hide unconfirmed agent-written pages with an instruction-family gate flag. */
+  suppressFlagged?: boolean;
+}
+
+export interface PageReadPolicy extends PageReadScope {
+  /** Undefined is unrestricted; an empty list permits no holders. */
+  takesHoldersAllowList?: string[];
+}
+
+export interface GetPageOpts extends PageReadScope {
   /** Filter to a specific source. When omitted, getPage returns the first slug match across sources (pre-existing semantics). */
   sourceId?: string;
   /**
@@ -382,9 +425,16 @@ export const PAGE_SORT_SQL: Record<NonNullable<PageFilters['sort']>, string> = {
   // cluster of pages sharing one updated_at (bulk syncs stamp identical
   // now() across a transaction). Without the tiebreaker, rows at the same
   // timestamp order arbitrarily and a >limit tie cluster is unpageable.
-  updated_asc:  'p.updated_at ASC, p.slug ASC',
+  // The cursor must carry the column's microsecond precision to be exact:
+  // resume from `Page.updated_at_iso`, never from a JS Date. Slug is unique
+  // only per source, so a federated listing needs source_id + id behind it to
+  // stay a total order (same tiebreakers as `slug` below).
+  updated_asc:  'p.updated_at ASC, p.slug ASC, p.source_id ASC, p.id ASC',
   created_desc: 'p.created_at DESC',
-  slug:         'p.slug ASC',
+  // Slug uniqueness is per (source_id, slug), so a federated listing can hold
+  // the same slug from several sources; source_id + id make slug+offset paging
+  // a TOTAL order (same class as the updated_asc tiebreaker above).
+  slug:         'p.slug ASC, p.source_id ASC, p.id ASC',
 };
 
 /**
@@ -446,7 +496,7 @@ export interface DomainBankRow {
   representative_chunk_id: number | null;
 }
 
-export interface SalienceOpts {
+export interface SalienceOpts extends PageReadPolicy {
   /** Scalar source scope. Ignored when `sourceIds` is set (array wins). */
   sourceId?: string;
   /** Federated source scope — the op layer passes `ctx.auth.allowedSources`. */
@@ -550,7 +600,7 @@ export const ENRICH_ORDER_SQL: Record<EnrichCandidatesOpts['order'], string> = {
  * the number of distinct pages touched on `since`. A cohort is anomalous when its
  * current count exceeds `mean + sigma * stddev`. Year cohort deferred to v0.30.
  */
-export interface AnomaliesOpts {
+export interface AnomaliesOpts extends PageReadScope {
   /** Scalar source scope. Ignored when `sourceIds` is set (array wins). */
   sourceId?: string;
   /** Federated source scope — the op layer passes `ctx.auth.allowedSources`. */
@@ -721,6 +771,8 @@ export interface ChunkInput {
    */
   chunk_source: 'compiled_truth' | 'timeline' | 'fenced_code' | 'image_asset';
   embedding?: Float32Array;
+  /** #5553: embedding-input provenance (see embedding-input-hash.ts); written only with `embedding`. */
+  embedding_input_hash?: string;
   model?: string;
   token_count?: number;
   /**
@@ -751,17 +803,25 @@ export interface ChunkInput {
 }
 
 // Search
+export interface RrfAttribution {
+  raw: number;
+  normalized: number;
+  compiled_truth_boost: number;
+  arms: import('./search/rrf-page-fusion.ts').RrfArmVote[];
+}
+
 export interface SearchResult {
   slug: string;
   page_id: number;
   title: string;
   type: PageType;
   chunk_text: string;
-  chunk_source: 'compiled_truth' | 'timeline';
+  chunk_source: 'compiled_truth' | 'timeline' | 'fenced_code';
   chunk_id: number;
   chunk_index: number;
   score: number;
-  stale: boolean;
+  /** #5988: `{ held_since, last_indexed_revision }` when sync holds the page's newer file (stampHeldHits). */
+  stale: boolean | { held_since: string; last_indexed_revision: string | null };
   /**
    * v0.42 (issue #1699) content-quality gate agent-warning channel. Set
    * when the result's page carries a `frontmatter.content_flag` marker
@@ -772,6 +832,27 @@ export interface SearchResult {
    * Absent when the page is clean.
    */
   content_flag?: { reason: string; detail: string };
+  /** #5575 A6: the page's trust tier and short write origin (eligibility/stamp.ts), stamped after ranking. */
+  trust_tier?: import('./trust/tier.ts').TrustTier;
+  origin?: string;
+  /** #5575 CEO-20: unconfirmed agent-written content with an instruction-family gate flag (explicit reads only). */
+  unconfirmed?: true;
+  /**
+   * 2026-09 fix wave (#3617 follow-up): true when this row came from the
+   * keyword/title arm's AND→OR zero-strict-recall fallback rather than a
+   * strict websearch match. Stamped by the ENGINES inside the fallback
+   * branch (both engines, keyword + title arms — parity-pinned). hybridSearch
+   * reads it at fusion time: relaxed rows only vote in RRF when EVERY vector
+   * list is empty (the fallback's designed rescue case — keyword-only /
+   * keyless / degraded paths). When the vector arm is healthy, relaxed rows
+   * are dropped pre-fusion: OR-of-common-terms matches carry noise-shaped
+   * rank evidence, and letting them vote at full RRF weight demonstrably
+   * outvotes correct semantic results (LongMemEval receipt: hybrid
+   * recall_all@5 51.3% with them voting vs vector-only 93.8%; disabling the
+   * fallback restored gold to ranks 0-2 on probed questions). Absent on
+   * strict-match rows.
+   */
+  keyword_relaxed?: boolean;
   /**
    * Extraction quarantine lane (issue #160): true when the result's page is
    * an unverified auto-extracted entity stub (frontmatter
@@ -853,6 +934,23 @@ export interface SearchResult {
   relational_hop?: number;
   /** Shortest connecting slug path seed→…→result (for "how I know this"). */
   relational_path?: string[];
+  /** Stored-direction edges along `relational_path` (for retrieval feedback attribution). */
+  relational_path_edges?: string[];
+  /**
+   * Multi-hop chain evidence: why a chain put this page here. `role` is the
+   * page's place on the chain (a candidate answer, an intermediate page, or the
+   * page an edge was written on), not a correctness claim; `path_count` counts
+   * retained paths and is not corroboration. `edges` is the best path's
+   * evidence, at most three edges.
+   */
+  relational?: RelationalEvidence;
+  /**
+   * Ranker wave — set when `pinRelationalRows` (relational-rerank-pin.ts)
+   * re-pinned this relational-arm row above the reranked text rows. Autocut
+   * preserves stamped rows and excludes them from its cliff computation (they
+   * carry low cross-encoder scores by construction). Absent otherwise.
+   */
+  relational_pinned?: boolean;
   /**
    * v0.40.4 full attribution (D12=A) — per-stage score deltas for the
    * `gbrain search --explain` formatter. Every boost stage stamps its
@@ -864,6 +962,18 @@ export interface SearchResult {
   /** RRF + cosine score BEFORE any boost stage mutated it. */
   base_score?: number;
   /**
+   * Explain attribution from weighted RRF fusion: the summed vote (`raw`),
+   * the score after max-normalization (`normalized`), the compiled-truth
+   * factor, and every arm-instance vote behind it (0-based ranks). Absent on
+   * rows that never went through `rrfFusionWeighted` (keyword-only single-arm
+   * paths). Lean MCP rows strip it; `explain` renders it as score_details.
+   */
+  rrf?: RrfAttribution;
+  /** Cosine blend input: the max-normalized RRF score the 0.7/0.3 blend used. */
+  blend_norm_rrf?: number;
+  /** Per-row ranking breakdown, set by the `search`/`query` ops only when the caller passes `explain: true`. */
+  score_details?: import('./search/explain-formatter.ts').ScoreDetails;
+  /**
    * v0.46.15 — RAW query↔chunk cosine similarity from cosineReScore's
    * hydration (the active embedding column's space). Absent on keyword-only
    * / no-embedding paths. This is the ONLY calibrated semantic signal on the
@@ -874,6 +984,12 @@ export interface SearchResult {
   cosine?: number;
   /** Multiplier applied by applyBacklinkBoost (1.0 = unchanged). */
   backlink_boost?: number;
+  /** Use-attributed feedback multiplier on the ordering score (src/core/search/feedback-boost.ts); absent when neutral. */
+  feedback_boost?: number;
+  /** The page's content_hash when this result was retrieved (stamped while retrieval feedback is enabled). */
+  content_hash?: string | null;
+  /** Caller-visible inbound linking pages behind backlink_boost (stamped with it). */
+  backlink_count?: number;
   /** Multiplier applied by applySalienceBoost. */
   salience_boost?: number;
   /** Multiplier applied by applyRecencyBoost. */
@@ -898,6 +1014,10 @@ export interface SearchResult {
    *  (RRF + boosts). v0.42.3.0 autocut cuts on this — the trustworthy
    *  separatrix — never on RRF/cosine. */
   rerank_score?: number;
+  /** System One: `rubric` rerank scores (autocut/CRAG ignore them); the S3 evidence probability when the gate acted. */
+  rerank_score_kind?: 'rubric'; decide_evidence?: { p: number; clears: boolean };
+  /** System One S5 (on mode only): injection probability, and the flag that demoted it below clean same-class results. */
+  injection_p?: number; injection_suspected?: true;
   /**
    * v0.42 (T19, plan D6) — multiplier applied by applyAliasResolvedBoost
    * (1.0 = unchanged; default 1.05x). Fires when the result's slug is
@@ -972,6 +1092,8 @@ export interface SearchResult {
    * incident's duplicate-stub class.
    */
   create_safety?: import('./search/evidence.ts').CreateSafety;
+  /** Evidence delivery (`return_unit`): present only when a non-chunk unit applied. */
+  delivered?: import('./search/evidence-delivery.ts').DeliveredEvidence;
 }
 
 /**
@@ -1039,7 +1161,17 @@ export interface ResolvedColumn {
   embeddingModel: string;
 }
 
-export interface SearchOpts {
+export interface VectorPoolMeta {
+  underfilled: boolean;
+  escalations: number;
+  innerLimit: number;
+  incomplete?: boolean;
+  reason?: 'candidate_budget' | 'iterative_scan_unavailable' | 'deadline';
+  candidatePool?: number;
+  exactFallback?: boolean;
+}
+
+export interface SearchOpts extends PageReadPolicy {
   limit?: number;
   offset?: number;
   /**
@@ -1048,10 +1180,15 @@ export interface SearchOpts {
    * candidate pool before the per-page DISTINCT collapse, underfilling the
    * result). Engines have no telemetry sink; the HYBRID layer passes a
    * collector here and owns the emit. Called at most once per searchVector
-   * call, only when the escalation loop ended with the page set still
-   * underfilled at the HNSW substrate cap (ef_search hard ceiling).
+   * call, only when bounded work ended before exhaustion could be proved.
    */
-  onVectorPoolMeta?: (m: { underfilled: boolean; escalations: number; innerLimit: number }) => void;
+  onVectorPoolMeta?: (m: VectorPoolMeta) => void;
+  /** #5824 rollback: keep the freshness guard inside the HNSW candidate CTE. Latched by the caller (search/vector-legacy-guard.ts). */
+  vectorLegacyGuard?: boolean;
+  /** #6132: pgvector `hnsw.iterative_scan` mode (default relaxed_order), latched by the caller (search/hnsw-iterative-scan.ts). */
+  hnswIterativeScan?: import('./search/hnsw-iterative-scan.ts').HnswIterativeScanMode;
+  /** #5989: bounded CJK keyword arm (deadline + meta sink); set by hybrid only (engine-sql/cjk-search.ts). */
+  cjkKeyword?: import('./engine-sql/cjk-search.ts').CjkKeywordRun;
   /**
    * v0.42 — intent-aware adaptive return-sizing. `true` enables with config/
    * default caps; an object overrides caps per-call; omitted/`false` = off
@@ -1087,6 +1224,12 @@ export interface SearchOpts {
    * via DEFAULT_SOURCE_BOOSTS so archived content stays findable by default.
    */
   exclude_slug_prefixes?: string[];
+  /**
+   * Resolved source-boost map (prefix → factor) for the ranking arms. Set by
+   * hybridSearch from the brain's `search.source_boosts` config; engines
+   * fall back to `resolveBoostMap()` (defaults + env) when absent.
+   */
+  source_boosts?: Record<string, number>;
   /**
    * Opt-back-in list — subtracts entries from the resolved hard-exclude set.
    * E.g. `include_slug_prefixes: ['test/']` lets a query see test/ pages even
@@ -1177,11 +1320,13 @@ export interface SearchOpts {
    * v0.27.0: filter results to pages updated/created after this date. ISO-8601 string.
    */
   afterDate?: string;
+  afterDateInclusive?: boolean;
   /**
    * @deprecated v0.29.1: use `until` instead. Removed in v0.30.
    * v0.27.0: filter results to pages updated/created before this date. ISO-8601 string.
    */
   beforeDate?: string;
+  beforeDateInclusive?: boolean;
   /**
    * @deprecated v0.29.1: use `recency` ('off' | 'on' | 'strong') instead. Removed in v0.30.
    * v0.27.0: recency boost strength. 0 = off, 1 = moderate, 2 = aggressive.
@@ -1222,9 +1367,9 @@ export interface SearchOpts {
   /**
    * #4352 — page-level `visibility: private` enforcement for untrusted
    * callers. When true, both engines' search paths (keyword, titles,
-   * keyword-chunks, vector) add
-   * `COALESCE(p.frontmatter->>'visibility','world') <> 'private'` to the
-   * visibility clause. Callers resolve trust + the config gate via
+   * keyword-chunks, vector) add `privatePagesFilterFragment` to the
+   * visibility clause (absent visibility is world, except on derived atoms
+   * and synthesized concepts, where it is private). Callers resolve trust + the config gate via
    * `resolveExcludePrivatePages` (search/private-visibility.ts):
    * ctx.remote !== false → true unless the operator opted out. Omitted /
    * false = pre-fix behavior (trusted local reads see everything).
@@ -1270,25 +1415,7 @@ export interface SearchOpts {
    * Sensible operator overrides for dense-embedder corpora: 0.85-0.95.
    */
   floorRatio?: number;
-  /**
-   * v0.36 cross-modal wave: route this search through the multimodal
-   * embedding space (Voyage multimodal-3 by default).
-   *
-   * - 'text' (default for queries that don't match image-intent regex):
-   *   existing text-embedding path. No behavior change vs pre-v0.36.
-   * - 'image': force routing through the multimodal model + embedding_image
-   *   column. Skip LLM expansion (image embeddings handle synonyms in-space)
-   *   and skip keyword search (no FTS index on image content).
-   * - 'both': run text and image vector searches in parallel; merge via
-   *   modality-weighted RRF.
-   * - 'auto' (literal): same effect as undefined — let intent classifier
-   *   decide. Accepted on the wire so MCP callers can be explicit.
-   *
-   * Cross-modal override matrix (D9): when effective modality is 'image',
-   * cross-modal path overrides expansion (false) and reranker (false)
-   * regardless of mode bundle. zerank-2 can't rerank image embeddings;
-   * sending them produces garbage scores.
-   */
+
   crossModal?: 'text' | 'image' | 'both' | 'auto';
   /**
    * v0.40.4 — per-call override for the graph-signals stage. Threads
@@ -1310,6 +1437,22 @@ export interface SearchOpts {
    */
   relationalRetrieval?: boolean;
   relationalRetrievalDepth?: number;
+  /**
+   * Ranker wave — per-call override for `search.relational_rerank_pin`
+   * (relational-arm rows re-pinned above reranked text rows; `0` disables).
+   * Per-call wins over config wins over the mode bundle; out-of-range values
+   * (negative, > 10, fractional, NaN) are treated as unset through the ONE
+   * range contract `normalizeRelationalRerankPin` (relational-rerank-pin.ts),
+   * in BOTH the inner search and the cache resolver (knobs hash reflects it).
+   * Eval A/B gates drive it here.
+   */
+  relationalRerankPin?: number;
+  /** Per-call override for `search.relational_planner` (multi-hop chains; eval A/B). */
+  relationalPlanner?: boolean;
+  /** Per-call override for `search.relational_orient_onehop` (typed one-hop orientation; eval A/B). */
+  relationalOrientOneHop?: boolean;
+  /** Per-call override for `search.relational_chain_slots` (0..10; eval A/B). */
+  relationalChainSlots?: number;
 }
 
 /**
@@ -1332,9 +1475,9 @@ export interface CodeEdgeInput {
 
 /**
  * v0.20.0 Cathedral II: result row from code edge queries (getCallersOf,
- * getCalleesOf, getEdgesByChunk). `resolved=true` means the row came from
- * code_edges_chunk (to_chunk_id is a known chunk); `resolved=false` means
- * code_edges_symbol (to_chunk_id is null).
+ * getCalleesOf, getEdgesByChunk). `resolved=true`: a code_edges_chunk row, or a
+ * code_edges_symbol row stamped with edge_metadata.resolved_chunk_id (N13-2).
+ * `resolved=false`: an unresolved code_edges_symbol row (to_chunk_id null).
  */
 export interface CodeEdgeResult {
   id: number;
@@ -1384,6 +1527,8 @@ export interface Link {
 
 export interface GraphNode {
   slug: string;
+  /** Source holding this page; the same slug in two sources is two nodes. */
+  source_id: string;
   title: string;
   type: PageType;
   depth: number;
@@ -1397,7 +1542,9 @@ export interface GraphNode {
  */
 export interface GraphPath {
   from_slug: string;
+  from_source_id: string;
   to_slug: string;
+  to_source_id: string;
   link_type: string;
   context: string;
   /** Depth of `to_slug` from the root (1 for direct neighbors). */
@@ -1420,11 +1567,16 @@ export interface RelationalFanoutRow {
   edge_count: number;
   via_link_types: string[];
   path: string[];
+  /** Stored-direction edges ('from_slug|link_type|to_slug') along `path`, in order. */
+  path_edges?: string[];
   canonical_chunk_id: number | null;
 }
 
 /** Options for BrainEngine.relationalFanout. */
-export interface RelationalFanoutOpts {
+export interface RelationalFanoutOpts extends PageReadPolicy {
+  temporal?: import('./link-validity.ts').EdgeTemporalOpts; // per-hop temporal edge policy; absent = every edge
+  /** Resolved seed identities; separate from the read grant for edge origins. */
+  seedRefs?: Array<{ source_id: string; slug: string }>;
   /** Edge types to traverse; null/empty = type-agnostic. */
   linkTypes?: string[] | null;
   /** Direction from each seed. Default 'both'. */
@@ -1439,6 +1591,67 @@ export interface RelationalFanoutOpts {
   sourceIds?: string[];
   /** Hard cap on returned candidate nodes. Default 50. */
   limit?: number;
+}
+
+/** Chain evidence carried on a search row (SearchResult.relational). */
+export interface RelationalEvidence {
+  role: 'answer' | 'support' | 'origin';
+  seed: string;
+  hop: number;
+  path_count: number;
+  edges: Array<{
+    link_type: string;
+    stored_from: string;
+    stored_to: string;
+    orientation: 'canonical' | 'stored' | 'flipped' | 'uncertain';
+    context: string | null;
+    origin: string | null;
+  }>;
+}
+
+/**
+ * Options for BrainEngine.relationalChainHop: one bounded, oriented expansion
+ * step of a multi-hop relational chain. `subjectTypes`/`objectTypes` are the
+ * hop relation's page-type signature; `degreeLinkTypes` names the typed edges
+ * counted for a frontier node's degree (hub weighting).
+ */
+export interface ChainHopOpts extends PageReadPolicy {
+  linkTypes: string[];
+  toward: 'object' | 'subject';
+  subjectTypes: string[];
+  objectTypes: string[];
+  degreeLinkTypes: string[];
+  /** Max logical edges returned per frontier node (deterministic: lowest link id first). */
+  neighborCap: number;
+  temporal?: import('./link-validity.ts').EdgeTemporalOpts; // relationship-validity policy per link row; absent = every edge
+}
+
+/**
+ * One LOGICAL edge from a frontier node, oriented by the relation's type
+ * signature and already authorized (both endpoints and any origin page pass
+ * the read policy). Stored rows between the same pair that resolve to the same
+ * subject/object collapse into one edge (`link_ids`).
+ */
+export interface ChainHopEdge {
+  from_page_id: number;
+  to_page_id: number;
+  to_slug: string;
+  to_type: string;
+  source_id: string;
+  link_type: string;
+  orientation: 'canonical' | 'stored' | 'flipped' | 'uncertain';
+  link_ids: number[];
+  stored_from_slug: string;
+  stored_to_slug: string;
+  /** Edge context from the evidence row; null when the caller may not read the evidence page's text. */
+  context: string | null;
+  origin_page_id: number | null;
+  origin_slug: string | null;
+  canonical_chunk_id: number | null;
+  /** Distinct typed neighbors of the frontier node the caller may read; saturates at 300 readable link rows. */
+  from_degree: number;
+  /** True when the frontier node had more logical edges than `neighborCap`. */
+  neighbor_cap_hit: boolean;
 }
 
 // Timeline
@@ -1459,8 +1672,10 @@ export interface TimelineInput {
   detail?: string;
 }
 
-export interface TimelineOpts {
+export interface TimelineOpts extends PageReadScope {
   limit?: number;
+  /** #5575 read eligibility (eligibility/sql.ts) for read ops. */
+  eligibility?: import('./eligibility/policy.ts').ReadEligibility;
   after?: string;
   before?: string;
   /**
@@ -1495,7 +1710,7 @@ export interface ChronicleTimelineRow {
   kind: string | null;        // event.kind from the event page frontmatter
 }
 
-export interface ChronicleTimelineOpts {
+export interface ChronicleTimelineOpts extends PageReadScope {
   /** getTimelineForDate: expand to the ISO week (Mon–Sun) containing `date`. */
   week?: boolean;
   /** getSince: filter event projections by `event.kind`. */
@@ -1556,12 +1771,19 @@ export interface OntologyConflict {
   dimension: string;
   values: { value: string; source: string | null; confidence: number; fact_id: number }[];
 }
-export interface OntologyReadOpts {
+// excludePrivate (from PageReadScope) drops observations whose provenance page
+// is `visibility: private` BEFORE per-dimension resolution, so an untrusted
+// caller resolves the newest value they may see — never a private one, never
+// a hole where one was. Set by the op layer (readPolicyOpts); engines never
+// decide trust.
+export interface OntologyReadOpts extends PageReadScope {
   asof?: string;
   minConfidence?: number;
   includeQuarantined?: boolean;
   sourceId?: string;
   sourceIds?: string[];
+  /** Fact visibility tiers the caller may read; undefined reads every tier. */
+  visibility?: Array<'private' | 'world'>;
 }
 
 // Raw data
@@ -1571,14 +1793,18 @@ export interface RawData {
   fetched_at: Date;
 }
 
-// Versions
-export interface PageVersion {
-  id: number;
-  page_id: number;
-  compiled_truth: string;
-  frontmatter: Record<string, unknown>;
-  snapshot_at: Date;
+export type { PageVersion } from './page-state/version-types.ts';
+
+/** Who wrote a row, joined at read time (`ops/attribution.ts`); `unrecorded` = pre-attribution or an unattributed legacy writer. */
+export interface WriteAttributionView {
+  request_id: string | null; operation: string | null; at: string | null;
+  principal: { kind: string; id: string; name: string | null } | null;
+  origin: 'request' | 'maintenance' | 'unrecorded';
 }
+/** A `get_versions` row as trusted local and admin callers see it. */
+export type AttributedPageVersion = import('./page-state/version-types.ts').PageVersion & {
+  written_by: WriteAttributionView; archived_by: WriteAttributionView;
+};
 
 // Stats + Health
 export interface BrainStats {
@@ -1680,7 +1906,7 @@ export interface BrainHealth {
    */
   schema_version?: '1';
   migrations?:
-    | { pending: string[]; partial: string[]; wedged: string[]; skipped_future: number }
+    | { pending: string[]; pending_fresh_install: string[]; partial: string[]; wedged: string[]; skipped_future: number }
     | { error: 'ledger_unreadable' };
 }
 
@@ -1765,32 +1991,6 @@ export interface EvalCaptureFailure {
   reason: EvalCaptureFailureReason;
 }
 
-/**
- * WP2/T3 — CLOSED degradation vocabulary for `HybridSearchMeta.degraded`
- * (D6). Every stage a search can degrade through has an enumerated name;
- * consumers (MCP `_meta.retrieval`, telemetry, `--explain`) match on these
- * codes. Additive-forever: new stages append, existing names never change.
- *
- *   embed_unavailable  — no embedding ran (no provider, or provider errored)
- *   embed_timeout      — every query embed hit the wall-clock deadline
- *   expansion_failed   — the LLM multi-query expander threw; original only
- *   expansion_partial  — some (not all) variant embeds survived; results
- *                        salvaged from the surviving lists (ENG-15)
- *   rescore_skipped    — original-query embed failed, so the cosine
- *                        re-score stage was skipped (variant-list salvage)
- *   vector_arm_failed  — an engine.searchVector arm threw; surviving arms
- *                        (or keyword) carried the result
- *   budget_dropped_all — the first result alone exceeded the token budget
- *                        and NOTHING was returned (GBRAIN_SEARCH_SALVAGE=off
- *                        strict path — the result set is empty)
- *   budget_truncated   — the minKeep failsafe kept ONE result truncated to
- *                        fit the budget (results non-empty but cut; distinct
- *                        stage so consumers can tell "empty" from "clipped")
- *   keyword_zero       — the keyword arm returned zero rows on a path where
- *                        it was the primary recall arm (vector unavailable)
- *   cache_prestamp     — served from a cache row written before the
- *                        degradation stamp existed; cleanliness unprovable
- */
 export const DEGRADED_STAGES = [
   'embed_unavailable',
   'embed_timeout',
@@ -1798,10 +1998,21 @@ export const DEGRADED_STAGES = [
   'expansion_partial',
   'rescore_skipped',
   'vector_arm_failed',
+  'keyword_arm_failed',
+  'title_arm_failed',
   'budget_dropped_all',
   'budget_truncated',
   'keyword_zero',
   'cache_prestamp',
+  'reranker_skipped',
+  'rerank_passthrough',
+  'rerank_failed',
+  'keyword_relaxed_carried',
+  'safe_index_pending',
+  'vector_candidates_incomplete',
+  'keyword_candidates_incomplete',
+  'projection_pending',
+  'projection_status_unknown',
 ] as const;
 export type DegradedStage = (typeof DEGRADED_STAGES)[number];
 
@@ -1818,12 +2029,45 @@ export const DEGRADED_REASONS = [
   'variant_embed_failed',
   'original_embed_failed',
   'first_result_truncated',
+  'no_key',
+  // #4648 — rerank_passthrough reasons (mirror RerankPassThroughReason).
+  'empty_result_set',
+  'malformed_shape',
+  'budget',
+  'candidate_budget',
+  'iterative_scan_unavailable',
+  'egress_denied', // System One: the Jev reranker skipped a query with a candidate from decide.egress.deny_sources
+  'embedding_disabled', // the brain opted out of embedding: the query text was never sent to the provider
 ] as const;
 export type DegradedReason = (typeof DEGRADED_REASONS)[number];
 
 export interface DegradedStageEntry {
   stage: DegradedStage;
   reason?: DegradedReason;
+}
+
+/**
+ * Stages that change RANKING but never RECALL: the result set is complete,
+ * only its order is not what the mode promised. Consumers that reason about
+ * "was recall impaired?" (empty-result copy, the short degraded cache TTL)
+ * skip these; consumers that report "what did not run" keep them.
+ *
+ * Membership is a deliberate list, not "anything reranker-shaped":
+ *   - `reranker_skipped` IS ranking-only: it is a CONFIG state (no key / dead
+ *     provider) that a short TTL cannot fix, so the cache keeps the full TTL.
+ *   - `rerank_passthrough` (#4648) is NOT listed on purpose: the provider
+ *     answered 200 with an empty/malformed set — a TRANSIENT fault where the
+ *     short degraded TTL lets the next query recover a reranked result set
+ *     (master's v0.48.1.0 behavior, kept at the merge). It never reaches the
+ *     empty-result copy because a pass-through implies a non-empty batch.
+ *   - `rerank_failed` (the call threw: timeout / provider_error / budget) is transient too.
+ *   - `keyword_relaxed_carried` is recall-shaped by definition (see above).
+ * Pinned by test/degraded-stages-recall.test.ts; a new fail-open stage must be
+ * classified here in the same commit that adds it.
+ */
+export const RANKING_ONLY_DEGRADED_STAGES: ReadonlySet<DegradedStage> = new Set<DegradedStage>(['reranker_skipped']);
+export function affectsRecall(d: { stage?: string; reason?: string } | undefined | null): boolean {
+  return !!d?.stage && !RANKING_ONLY_DEGRADED_STAGES.has(d.stage as DegradedStage);
 }
 
 /**
@@ -1836,6 +2080,10 @@ export interface DegradedStageEntry {
 export interface HybridSearchMeta {
   /** True iff vector search actually ran. False when OPENAI_API_KEY missing or embed failed. */
   vector_enabled: boolean;
+  /** System One: slot diagnostics (only when a slot ran visibly) and the reranker model version that answered. */
+  decide?: import('./search/decide-stage.ts').DecideSearchMeta; rerank?: { model_resolved: string };
+  /** System One S4 on the query op (diagnostic only): probability the top-k answer the query, threshold and verdict. */
+  answerability?: import('./search/decide-stage.ts').AnswerabilityMeta;
   /** Post-auto-detect detail level. */
   detail_resolved: 'low' | 'medium' | 'high' | null;
   /** True iff multi-query expansion (Haiku) actually fired and produced variants. */
@@ -1858,7 +2106,9 @@ export interface HybridSearchMeta {
    * the caller asked for more distinct pages than the candidate pool could
    * yield). Omitted on clean runs. Exhaustion is VISIBLE, not silent.
    */
-  vector_pool_underfilled?: { escalations: number; innerLimit: number };
+  vector_pool_underfilled?: Omit<VectorPoolMeta, 'underfilled'>;
+  /** #5989: the bounded CJK keyword arm's outcome and wall time (separate from total hybrid latency). */
+  keyword_candidates?: import('./engine-sql/cjk-search.ts').CjkKeywordMeta;
   /**
    * v0.42.3.0 — autocut decision (signal, cut point, kept/total, gapRatio).
    * Omitted when autocut didn't run (no reranker). Surfaced for
@@ -1873,6 +2123,39 @@ export interface HybridSearchMeta {
    * didn't fire. Surfaced for `gbrain search --explain`.
    */
   relational_evidence_slot?: import('./search/relational-recall.ts').RelationalEvidenceSlotDecision;
+  /**
+   * Ranker wave — relational rerank pin decision (knob, relational pages in
+   * the pool, the pinned rows with from/to/fused ranks, how many moved).
+   * Present only when the reranker reordered the pool AND at least one
+   * relational-arm row was pinned; omitted for non-relational queries, pin 0,
+   * and every reranker fail-open path. Surfaced for `gbrain search --explain`.
+   */
+  relational_rerank_pin?: import('./search/relational-rerank-pin.ts').RelationalRerankPinDecision;
+  /** Multi-hop planner outcome for a 2-3 relation question (status, anchor, per-hop counts, cap). */
+  relational_plan?: import('./search/relational-recall.ts').RelationalPlanMeta;
+  /**
+   * Ranker wave (Phase E2, Cat 13) — keyword-arm confidence decision:
+   * `margin_ratio` (scale-free `top / (top + second)` over the keyword arm's
+   * fused rows; 1 single row; 0 empty), the raw `top_score` (diagnostics),
+   * and `downweighted` (did the keyword + title lists fuse at weight 0.5).
+   * Present on every main RRF-path result — INCLUDING with the floor off
+   * (`downweighted: false`) — so an operator can calibrate
+   * `search.keyword_arm_confidence_floor` from per-probe margins. Omitted on
+   * the keyword-only fallback paths (no vector arm → no decision).
+   */
+  keyword_arm_confidence?: import('./search/arm-confidence.ts').KeywordArmConfidenceDecision;
+  /**
+   * Ranker wave (Phase E3, Cat 13) — metadata boost gate decision: the
+   * resolved `gate` (`always` | `lexical`), `lexical_voted` (did a strict
+   * keyword, title-arm or relational row reach fusion), `boosts_applied` (did
+   * the backlink / salience / recency / graph-signal / alias-resolved stages
+   * run) and the `reason`. Present on every main RRF-path result — INCLUDING
+   * under `always` (`boosts_applied: true`) — so an operator can count
+   * vector-only-voter queries before flipping `search.metadata_boost_gate`.
+   * Omitted on the keyword-only fallback paths (the lexical arms are the
+   * recall there; the gate is never consulted).
+   */
+  metadata_boost_gate?: import('./search/metadata-boost-gate.ts').MetadataBoostGateDecision;
   /**
    * v0.32.x (search-lite): token budget enforcement metadata. Omitted when
    * no budget was applied (backward-compatible with pre-search-lite
@@ -1898,6 +2181,17 @@ export interface HybridSearchMeta {
    * existed (surfaced as `cache_prestamp` at hit time).
    */
   degraded?: DegradedStageEntry[];
+  /**
+   * 2026-09 fix wave (#3617 follow-up): count of OR-relaxed lexical rows
+   * fetched but EXCLUDED from RRF fusion because the text vector arm was
+   * healthy (the designed demotion). NOT a degraded stage — muting relaxed
+   * noise on a healthy run is normal operation and common (any query with
+   * zero strict lexical matches), so it must not shorten the cache TTL —
+   * but without this field `_meta` implies the lexical arms voted when they
+   * contributed nothing, hiding the demotion from an operator debugging a
+   * miss. Omitted when zero.
+   */
+  relaxed_dropped?: number;
   /**
    * WP2/T3 — pre-budget hit count: how many results retrieval produced for
    * this page BEFORE token-budget enforcement. Lets a consumer distinguish

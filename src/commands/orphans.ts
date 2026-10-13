@@ -1,3 +1,5 @@
+import type { PageReadScope } from '../core/types.ts';
+import { pageReadFilter } from '../core/search/read-policy-sql.ts';
 /**
  * gbrain orphans — Surface disconnected pages.
  *
@@ -24,7 +26,10 @@ import {
   shouldExcludeFromOrphanReporting,
   loadOrphanPolicyOverrides,
   type OrphanPolicyOverrides,
+  type OrphanPageMeta,
 } from '../core/orphan-policy.ts';
+import { quarantineFilterFragment } from '../core/quarantine.ts';
+import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
 
 // --- Types ---
 
@@ -32,6 +37,9 @@ export interface OrphanPage {
   slug: string;
   title: string;
   domain: string;
+  /** #5891: the page's source and type, so a federated caller can tell rows apart. */
+  source_id?: string;
+  type?: string | null;
 }
 
 export interface OrphanResult {
@@ -40,6 +48,20 @@ export interface OrphanResult {
   total_linkable: number;
   total_pages: number;
   excluded: number;
+  /** #5877: orphaned connector renders (email/meeting pages of a google/github source), counted apart and left out of both totals. */
+  connector_renders_excluded?: number;
+}
+
+const CONNECTOR_RENDER_TYPES = new Set(['email', 'meeting']);
+
+/**
+ * #5877: ids of connector-kind sources. Their `email`/`meeting` pages are
+ * leaf renders (participants are raw addresses, never wikilinks), so an
+ * islanded render is expected and is reported apart rather than as an orphan.
+ */
+async function loadConnectorSourceIds(engine: BrainEngine): Promise<Set<string>> {
+  const rows = await engine.executeRaw<{ id: string; kind: string | null }>(`SELECT id, config->>'kind' AS kind FROM sources`);
+  return new Set(rows.filter(r => isConnectorSourceKind(r.kind)).map(r => r.id));
 }
 
 // --- Filter logic ---
@@ -48,8 +70,12 @@ export interface OrphanResult {
  * Returns true if a slug should be excluded from orphan reporting by default.
  * These are pages where having no inbound links is expected / not a content problem.
  */
-export function shouldExclude(slug: string, overrides?: OrphanPolicyOverrides): boolean {
-  return shouldExcludeFromOrphanReporting(slug, overrides);
+export function shouldExclude(
+  slug: string,
+  overrides?: OrphanPolicyOverrides,
+  meta?: OrphanPageMeta,
+): boolean {
+  return shouldExcludeFromOrphanReporting(slug, overrides, meta);
 }
 
 /**
@@ -74,7 +100,7 @@ export function deriveDomain(frontmatterDomain: string | null | undefined, slug:
  */
 export async function queryOrphanPages(
   engine: BrainEngine,
-): Promise<{ slug: string; title: string; domain: string | null }[]> {
+): Promise<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string }[]> {
   return engine.findOrphanPages();
 }
 
@@ -98,7 +124,7 @@ export async function queryOrphanPages(
  */
 export async function findOrphans(
   engine: BrainEngine,
-  opts: { includePseudo?: boolean; sourceId?: string; sourceIds?: string[]; mode?: 'inbound' | 'islanded' } = {},
+  opts: PageReadScope & { includePseudo?: boolean; mode?: 'inbound' | 'islanded' } = {},
 ): Promise<OrphanResult> {
   const includePseudo = !!opts.includePseudo;
   // v0.41.29.0: `sourceId` (scalar, from `--source` + single-source MCP
@@ -116,12 +142,16 @@ export async function findOrphans(
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
   progress.start('orphans.scan');
   const stopHb = startHeartbeat(progress, 'scanning pages for missing inbound links…');
-  let allOrphans: { slug: string; title: string; domain: string | null }[];
+  let allOrphans: { slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string }[];
   let total: number;
   let excludedAll: number;
   const overrides = includePseudo ? undefined : await loadOrphanPolicyOverrides(engine);
+  const connectorSources = includePseudo ? new Set<string>() : await loadConnectorSourceIds(engine);
+  const isConnectorRender = (row: { type?: string | null; source_id?: string }) =>
+    !!row.source_id && connectorSources.has(row.source_id) && !!row.type && CONNECTOR_RENDER_TYPES.has(row.type);
   try {
     allOrphans = await engine.findOrphanPages({
+      excludePrivate: opts.excludePrivate,
       ...(sourceIds ? { sourceIds } : sourceId ? { sourceId } : {}),
       ...(opts.mode ? { mode: opts.mode } : {}),
     });
@@ -133,39 +163,39 @@ export async function findOrphans(
     // total_linkable and suppressing orphan warnings. `getAllSlugs` is NOT
     // used here because it does not filter soft-deleted rows; `total` must
     // match `findOrphanPages`'s `deleted_at IS NULL` candidate universe.
-    let scopeClause = '';
     const liveParams: unknown[] = [];
-    if (sourceIds) {
-      liveParams.push(sourceIds);
-      scopeClause = ` AND source_id = ANY($${liveParams.length}::text[])`;
-    } else if (sourceId) {
-      liveParams.push(sourceId);
-      scopeClause = ` AND source_id = $${liveParams.length}`;
-    }
-    const liveRows = await engine.executeRaw<{ slug: string }>(
-      `SELECT slug FROM pages WHERE deleted_at IS NULL${scopeClause}`,
+    const scopeClause = ` AND ${pageReadFilter('pages', opts, liveParams)}`;
+    // #4280: carry type + quarantine metadata so the denominator applies the
+    // same served-memory policy as the orphan list itself.
+    const liveRows = await engine.executeRaw<{ slug: string; type: string | null; quarantined: boolean }>(
+      `SELECT slug, type, (NOT ${quarantineFilterFragment('pages')}) AS quarantined
+         FROM pages WHERE deleted_at IS NULL${scopeClause}`,
       liveParams,
     );
     total = liveRows.length;
     excludedAll = includePseudo
       ? 0
-      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug, overrides) ? 1 : 0), 0);
+      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug, overrides, r) ? 1 : 0), 0);
   } finally {
     stopHb();
     progress.finish();
   }
 
-  const filtered = includePseudo
+  const policyKept = includePseudo
     ? allOrphans
-    : allOrphans.filter(row => !shouldExclude(row.slug, overrides));
+    : allOrphans.filter(row => !shouldExclude(row.slug, overrides, row));
+  const filtered = policyKept.filter(row => !isConnectorRender(row));
+  const connectorRendersExcluded = policyKept.length - filtered.length;
 
   const orphans: OrphanPage[] = filtered.map(row => ({
     slug: row.slug,
     title: row.title,
     domain: deriveDomain(row.domain, row.slug),
+    ...(row.source_id !== undefined ? { source_id: row.source_id } : {}),
+    ...(row.type !== undefined ? { type: row.type } : {}),
   }));
 
-  const excluded = allOrphans.length - filtered.length;
+  const excluded = allOrphans.length - policyKept.length;
 
   return {
     orphans,
@@ -173,9 +203,10 @@ export async function findOrphans(
     // v0.41.29.0 (Codex F6): denominator = live pages minus ALL excluded
     // pages (orphan or not), so excluded pages with inbound links no longer
     // inflate it.
-    total_linkable: total - excludedAll,
+    total_linkable: total - excludedAll - connectorRendersExcluded,
     total_pages: total,
     excluded,
+    connector_renders_excluded: connectorRendersExcluded,
   };
 }
 
@@ -193,9 +224,10 @@ export const getOrphansData = findOrphans;
 export function formatOrphansText(result: OrphanResult): string {
   const lines: string[] = [];
 
-  const { orphans, total_orphans, total_linkable, total_pages, excluded } = result;
+  const { orphans, total_orphans, total_linkable, total_pages, excluded, connector_renders_excluded } = result;
+  const renders = connector_renders_excluded ? `; ${connector_renders_excluded} connector renders reported apart` : '';
   lines.push(
-    `${total_orphans} orphans out of ${total_linkable} linkable pages (${total_pages} total; ${excluded} excluded)\n`,
+    `${total_orphans} orphans out of ${total_linkable} linkable pages (${total_pages} total; ${excluded} excluded${renders})\n`,
   );
 
   if (orphans.length === 0) {
