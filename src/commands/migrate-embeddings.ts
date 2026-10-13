@@ -380,6 +380,18 @@ export async function probeTargetReranker(
 }
 
 /**
+ * The file plane's effective embedding target. A persisted deferred-setup
+ * sentinel (`embedding_disabled: true`) means no model is live, whatever
+ * `embedding_model` says, so verify keeps the config step outstanding.
+ */
+function filePlaneEmbedding(
+  fileCfg: { embedding_model?: string; embedding_dimensions?: number; embedding_disabled?: boolean },
+): { model: string | null; dims: number | null } {
+  if (fileCfg.embedding_disabled) return { model: null, dims: null };
+  return { model: fileCfg.embedding_model ?? null, dims: fileCfg.embedding_dimensions ?? null };
+}
+
+/**
  * Persist the target model+dims to the FILE plane and reconfigure the
  * in-process gateway. The gateway reads file/env config, not the DB plane —
  * without this the re-embed would silently run against the OLD provider.
@@ -429,6 +441,9 @@ export async function persistEmbeddingFileConfig(
   }
   fileCfg.embedding_model = toModel;
   fileCfg.embedding_dimensions = toDims;
+  // A keyless `gbrain init` persists the deferred-setup sentinel; left in
+  // place it makes every embed callsite refuse, so the re-embed would no-op.
+  delete fileCfg.embedding_disabled;
   saveConfig(fileCfg);
   // Reconfigure the in-process gateway from the MERGED view (env still wins
   // at runtime; when env is set it matches the target — the ≠ case was
@@ -553,7 +568,7 @@ export async function planMigrationFlow(
     const { loadConfigFileOnly } = await import('../core/config.ts');
     const fileCfg = loadConfigFileOnly();
     filePlane = fileCfg
-      ? { model: fileCfg.embedding_model ?? null, dims: fileCfg.embedding_dimensions ?? null }
+      ? filePlaneEmbedding(fileCfg)
       : null;
   } catch { /* unreadable file plane = absent */ }
 
@@ -813,7 +828,7 @@ export async function runMigrateEmbeddings(
       const { loadConfigFileOnly, loadConfig } = await import('../core/config.ts');
       const fileCfg = loadConfigFileOnly();
       filePlane = fileCfg
-        ? { model: fileCfg.embedding_model ?? null, dims: fileCfg.embedding_dimensions ?? null }
+        ? filePlaneEmbedding(fileCfg)
         : null;
       const cfg = loadConfig();
       if (cfg?.database_url) identity = { engine: 'postgres', target: redactPgUrl(cfg.database_url) };
