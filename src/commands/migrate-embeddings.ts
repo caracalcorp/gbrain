@@ -54,6 +54,7 @@ import {
   verifySearchRoundTrip,
   MIGRATION_STATE_KEY,
   type EmbeddingMigrationPlan,
+  type FilePlaneSnapshot,
   type MigrationVerify,
   type MigrationState,
   type EnvOverrideWarning,
@@ -386,7 +387,7 @@ export async function probeTargetReranker(
  */
 function filePlaneSnapshot(
   fileCfg: { embedding_model?: string; embedding_dimensions?: number; embedding_disabled?: boolean },
-): { model: string | null; dims: number | null; embedding_disabled?: true } {
+): FilePlaneSnapshot {
   return {
     model: fileCfg.embedding_model ?? null,
     dims: fileCfg.embedding_dimensions ?? null,
@@ -566,7 +567,7 @@ export async function planMigrationFlow(
   const envMatchesTarget = envFullyPinsTarget(plan.to_model, plan.to_dims);
 
   // File plane read WITHOUT env merge — verify must not be poisonable.
-  let filePlane: { model?: string | null; dims?: number | null; embedding_disabled?: true } | null = null;
+  let filePlane: FilePlaneSnapshot | null = null;
   try {
     const { loadConfigFileOnly } = await import('../core/config.ts');
     const fileCfg = loadConfigFileOnly();
@@ -825,7 +826,7 @@ export async function runMigrateEmbeddings(
     for (const k of ['VOYAGE_API_KEY', 'OPENAI_API_KEY', 'ZEROENTROPY_API_KEY', 'OPENROUTER_API_KEY']) {
       keyPresence[k] = Boolean(process.env[k]);
     }
-    let filePlane: { model?: string | null; dims?: number | null; embedding_disabled?: true } | null = null;
+    let filePlane: FilePlaneSnapshot | null = null;
     let identity = { engine: 'unknown', target: 'unknown' };
     try {
       const { loadConfigFileOnly, loadConfig } = await import('../core/config.ts');

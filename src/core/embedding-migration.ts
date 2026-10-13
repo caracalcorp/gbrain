@@ -1017,13 +1017,15 @@ export interface MigrationVerify {
   };
 }
 
+/** File-plane embedding settings (no env merge); `embedding_disabled` = keyless-init sentinel set, no model live. */
+export type FilePlaneSnapshot = { model?: string | null; dims?: number | null; embedding_disabled?: true };
+
 export async function verifyMigrationComplete(
   engine: BrainEngine,
   target: { toModel: string; toDims: number },
   opts: {
-    /** File-plane config read WITHOUT env merge (loadConfigFileOnly). A set
-     *  `embedding_disabled` (keyless-init sentinel) means no model is live. */
-    filePlane?: { model?: string | null; dims?: number | null; embedding_disabled?: boolean } | null;
+    /** File-plane config read WITHOUT env merge (loadConfigFileOnly). */
+    filePlane?: FilePlaneSnapshot | null;
     /** True when GBRAIN_EMBEDDING_* env exactly matches the target. */
     envMatchesTarget?: boolean;
     /** True when GBRAIN_EMBEDDING_* env is set at all. */
