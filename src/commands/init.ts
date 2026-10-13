@@ -1189,7 +1189,7 @@ export async function initPGLite(opts: {
   let resolvedModel: string | undefined;
   if (opts.aiOpts?.noEmbedding) {
     // D9 deferred-setup mode: skip preflight, no model/dim resolved.
-    console.log(`  --no-embedding: deferred setup — enable later with \`gbrain init --force --embedding-model voyage:voyage-4\` (\`config set embedding_model\` is refused by design)`);
+    console.log(`  --no-embedding: deferred setup — ${(await import('../core/embedding-dim-check.ts')).ENABLE_EMBEDDINGS_HINT}`);
   } else if (opts.aiOpts?.embedding_model) {
     const { resolveSchemaEmbeddingDim } = await import('../core/embedding-dim-check.ts');
     const pre = resolveSchemaEmbeddingDim({
@@ -1493,7 +1493,7 @@ export async function initPostgresCore(opts: {
   let resolvedDim: number | undefined;
   let resolvedModel: string | undefined;
   if (opts.aiOpts?.noEmbedding) {
-    console.log(`  --no-embedding: deferred setup — enable later with \`gbrain init --force --embedding-model voyage:voyage-4\` (\`config set embedding_model\` is refused by design)`);
+    console.log(`  --no-embedding: deferred setup — ${(await import('../core/embedding-dim-check.ts')).ENABLE_EMBEDDINGS_HINT}`);
   } else if (opts.aiOpts?.embedding_model) {
     const { resolveSchemaEmbeddingDim } = await import('../core/embedding-dim-check.ts');
     const pre = resolveSchemaEmbeddingDim({

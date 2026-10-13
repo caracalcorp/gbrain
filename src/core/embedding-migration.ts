@@ -1019,7 +1019,8 @@ export interface MigrationVerify {
 
 /** File-plane embedding settings (no env merge); `embedding_disabled` = keyless-init sentinel set, no model live. */
 export type FilePlaneSnapshot = { model?: string | null; dims?: number | null; embedding_disabled?: true };
-export const FILE_PLANE_SENTINEL_BLOCKER = 'runtime config (file plane) has embedding_disabled set (deferred setup) — a successful migrate clears it';
+export const FILE_PLANE_SENTINEL_HINT = 'a successful migrate clears it';
+export const FILE_PLANE_SENTINEL_BLOCKER = `runtime config (file plane) has embedding_disabled set (deferred setup) — ${FILE_PLANE_SENTINEL_HINT}`;
 export const FILE_PLANE_OFF_TARGET_BLOCKER = 'runtime config (file plane) does not point at the target yet';
 
 export async function verifyMigrationComplete(

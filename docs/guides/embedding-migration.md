@@ -32,6 +32,21 @@ onto a dying API would strand the brain). Self-hosting a wire-compatible
 endpoint behind a `provider_base_urls` override? `--force-sunset-target` is
 the explicit escape hatch.
 
+## Leaving keyless mode
+
+A brain created with `gbrain init --no-embedding` (or keyless) carries
+`embedding_disabled: true`, which makes every embed callsite refuse. Once the
+brain has content, `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024`
+is the way out: it embeds the backlog and clears the flag. `gbrain migrate
+embeddings --status` and the dry-run plan flag a brain stuck behind the flag
+(`embedding_disabled set: a successful migrate clears it`). Keep the provider
+key where every `gbrain` process can read it (`~/.gbrain/config.json` via
+`gbrain config set voyage_api_key ...`); the migration warns when it only
+found the key in its own shell environment.
+
+**Say to your agent:** *"turn on embeddings for my brain"* — your agent runs
+`gbrain migrate embeddings --to voyage:voyage-4 --dim 1024`.
+
 ## Recommended targets
 
 - **`voyage:voyage-4 --dim 1024`** (the new-install default). One

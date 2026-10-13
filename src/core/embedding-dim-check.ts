@@ -71,14 +71,21 @@ export class EmbeddingDisabledError extends Error {
   }
 }
 
+/**
+ * How to leave deferred-setup (keyless) mode: re-init an empty brain, or
+ * `migrate embeddings` once it has content (which also clears
+ * `embedding_disabled`). `config set embedding_model` is refused by design.
+ * Shared by every surface that meets the sentinel so the advice can't drift.
+ */
+export const ENABLE_EMBEDDINGS_HINT =
+  'enable with `gbrain init --force --embedding-model voyage:voyage-4` on an empty brain, ' +
+  'or `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024` once it has content (set VOYAGE_API_KEY first)';
+
 export function assertEmbeddingEnabled(cfg: { embedding_disabled?: boolean } | null): void {
   if (cfg?.embedding_disabled) {
     throw new EmbeddingDisabledError(
       'This brain was initialized with `--no-embedding` (deferred setup).\n' +
-      'Configure an embedding provider before running embed / import:\n' +
-      '  gbrain config set embedding_model <provider>:<model>\n' +
-      '  gbrain config set embedding_dimensions <N>\n' +
-      '  gbrain init --force --embedding-model <provider>:<model>   # re-init to size schema\n',
+      `To run embed / import, ${ENABLE_EMBEDDINGS_HINT}.\n`,
     );
   }
 }

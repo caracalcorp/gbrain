@@ -21,6 +21,7 @@ import {
 import {
   FILE_PLANE_OFF_TARGET_BLOCKER,
   FILE_PLANE_SENTINEL_BLOCKER,
+  FILE_PLANE_SENTINEL_HINT,
   verifyMigrationComplete,
 } from '../src/core/embedding-migration.ts';
 import {
@@ -88,8 +89,37 @@ afterAll(() => {
   }
 });
 
+/** Run fn with console.error captured; returns everything it printed. */
+async function captureStderr(fn: () => Promise<void>): Promise<string> {
+  const lines: string[] = [];
+  const orig = console.error;
+  console.error = (...a: unknown[]) => { lines.push(a.map(String).join(' ')); };
+  try {
+    await fn();
+  } finally {
+    console.error = orig;
+  }
+  return lines.join('\n');
+}
+
+test('persistEmbeddingFileConfig warns when the target key lives only in this process env', async () => {
+  writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true }, null, 2));
+  process.env.VOYAGE_API_KEY = 'pa-env-only';
+  try {
+    const err = await captureStderr(() => persistEmbeddingFileConfig('voyage:voyage-4', 1024));
+    expect(err).toContain('embedding_disabled cleared — VOYAGE_API_KEY is not in ~/.gbrain/config.json');
+    expect(readCfg().embedding_disabled).toBeUndefined();
+  } finally {
+    delete process.env.VOYAGE_API_KEY;
+    // Restore the shared seed for the next test, pass or fail.
+    writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
+  }
+});
+
 test('persistEmbeddingFileConfig clears the deferred-setup sentinel', async () => {
-  await persistEmbeddingFileConfig('voyage:voyage-4', 1024);
+  // The key is on the file plane, so leaving keyless mode is durable: no warning.
+  const err = await captureStderr(() => persistEmbeddingFileConfig('voyage:voyage-4', 1024));
+  expect(err).not.toContain('embedding_disabled cleared');
   const cfg = readCfg();
   expect(cfg.embedding_model).toBe('voyage:voyage-4');
   expect(cfg.embedding_dimensions).toBe(1024);
@@ -202,7 +232,7 @@ describe('stuck sentinel (model already at target)', () => {
     test('--status names the sentinel in the human file-plane line', async () => {
       const { code, out } = await runMigrate(engine(), ['--status']);
       expect(code).toBe(0);
-      expect(out).toContain(`File plane: ${TARGET} @ ${TARGET_DIMS}d (embedding_disabled set: a successful migrate clears it)`);
+      expect(out).toContain(`File plane: ${TARGET} @ ${TARGET_DIMS}d (embedding_disabled set: ${FILE_PLANE_SENTINEL_HINT})`);
     }, 30000);
   });
 
@@ -212,6 +242,21 @@ describe('stuck sentinel (model already at target)', () => {
     test('does the config step instead of verified-skipping, then converges', async () => {
       expect(await engine().countStaleChunks()).toBe(0);
       await expectSelfHeal(engine(), 0);
+    }, 120000);
+  });
+
+  describe('fresh keyless-init brain (sentinel, no model)', () => {
+    const engine = useFreshEngine();
+    beforeEach(() => {
+      writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, openai_api_key: 'sk-test-fake' }, null, 2));
+    });
+
+    test('migrate --to X --yes embeds the backlog and clears the sentinel', async () => {
+      await engine().putPage('notes/keyless', { type: 'note', title: 'keyless', compiled_truth: '# keyless\n\nbody' });
+      await engine().upsertChunks('notes/keyless', [
+        { chunk_index: 0, chunk_text: 'chunk text for keyless', chunk_source: 'compiled_truth', token_count: 5 },
+      ]);
+      await expectSelfHeal(engine(), 1);
     }, 120000);
   });
 
@@ -319,6 +364,14 @@ describe('file-plane conjunct edges', () => {
       expect(human).toContain(row.human);
       expect(human).not.toContain('embedding_disabled');
     }
+  }, 30000);
+
+  // What a keyless `gbrain init` actually writes: the sentinel with no model.
+  test('--status on a fresh keyless-init config: no model, sentinel flagged', async () => {
+    writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true }, null, 2));
+    const report = JSON.parse(await status(['--json'])) as { file_plane: Record<string, unknown> | null };
+    expect(report.file_plane).toEqual({ model: null, dims: null, embedding_disabled: true });
+    expect(await status([])).toContain(`File plane: (none) @ ?d (embedding_disabled set: ${FILE_PLANE_SENTINEL_HINT})\n`);
   }, 30000);
 
   /**

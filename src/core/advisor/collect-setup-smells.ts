@@ -8,6 +8,7 @@
  */
 
 import type { AdvisorCollector, AdvisorFinding } from './types.ts';
+import { ENABLE_EMBEDDINGS_HINT } from '../embedding-dim-check.ts';
 
 async function dbBool(ctx: { engine: { getConfig(k: string): Promise<string | null> } }, key: string): Promise<boolean | null> {
   try {
@@ -34,10 +35,7 @@ export const collectSetupSmells: AdvisorCollector = {
         id: 'embeddings_disabled',
         severity: 'warn',
         title: 'Embeddings are disabled — semantic search and dedup are off.',
-        detail:
-          'Enable with `gbrain init --force --embedding-model voyage:voyage-4` on an empty brain, ' +
-          'or `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024` once it has content ' +
-          '(set VOYAGE_API_KEY first).',
+        detail: `To turn them on, ${ENABLE_EMBEDDINGS_HINT}.`,
         fix: { command_argv: null },
         collector: 'setup-smells',
         ask_user: true,

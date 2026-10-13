@@ -54,6 +54,7 @@ import {
   readMigrationStatus,
   verifySearchRoundTrip,
   MIGRATION_STATE_KEY,
+  FILE_PLANE_SENTINEL_HINT,
   type EmbeddingMigrationPlan,
   type FilePlaneSnapshot,
   type MigrationVerify,
@@ -400,6 +401,9 @@ function filePlaneSnapshot(
  * Persist the target model+dims to the FILE plane and reconfigure the
  * in-process gateway. The gateway reads file/env config, not the DB plane —
  * without this the re-embed would silently run against the OLD provider.
+ * Also clears the keyless-init `embedding_disabled` sentinel, warning when
+ * the target's API key lives only in this process's env (no-op in
+ * env-canonical mode, where there is no file plane to write).
  * Shared by the CLI command and the `migrate_embeddings` op handler.
  */
 export async function persistEmbeddingFileConfig(
@@ -448,8 +452,21 @@ export async function persistEmbeddingFileConfig(
   fileCfg.embedding_dimensions = toDims;
   // A keyless `gbrain init` persists the deferred-setup sentinel; left in
   // place it makes every embed callsite refuse, so the re-embed would no-op.
+  const leavingKeylessMode = fileCfg.embedding_disabled === true;
   delete fileCfg.embedding_disabled;
   saveConfig(fileCfg);
+  if (leavingKeylessMode) {
+    // Leaving keyless mode is durable, so the provider key must be too: a key
+    // passed only to this run would make every later embed (cron, hooks) fail
+    // where keyless mode exited quietly.
+    const { getRecipe } = await import('../core/ai/recipes/index.ts');
+    const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
+    const fileKeys = mergedProviderEnv(fileCfg, {});
+    const envOnly = (getRecipe(toModel.split(':')[0])?.auth_env?.required ?? []).filter((k) => !fileKeys[k]);
+    if (envOnly.length > 0) {
+      serr(`  [migrate] embedding_disabled cleared — ${envOnly.join(', ')} is not in ~/.gbrain/config.json; make it available to every gbrain process (cron, hooks) or later embeds will fail.`);
+    }
+  }
   // Reconfigure the in-process gateway from the MERGED view (env still wins
   // at runtime; when env is set it matches the target — the ≠ case was
   // refused before apply).
@@ -862,7 +879,7 @@ export async function runMigrateEmbeddings(
     console.log(`  Brain: ${identity.engine} (${identity.target}); scope: brain-wide (all sources)`);
     console.log(`  Env plane:  GBRAIN_EMBEDDING_MODEL=${envPresence.model ?? '(unset)'} GBRAIN_EMBEDDING_DIMENSIONS=${envPresence.dims ?? '(unset)'}`);
     console.log(`  Keys:       ${Object.entries(keyPresence).map(([k, v]) => `${k}=${v ? 'set' : 'unset'}`).join(' ')}`);
-    console.log(`  File plane: ${filePlane ? `${filePlane.model ?? '(none)'} @ ${filePlane.dims ?? '?'}d${filePlane.embedding_disabled ? ' (embedding_disabled set: a successful migrate clears it)' : ''}` : '(no ~/.gbrain/config.json)'}`);
+    console.log(`  File plane: ${filePlane ? `${filePlane.model ?? '(none)'} @ ${filePlane.dims ?? '?'}d${filePlane.embedding_disabled ? ` (embedding_disabled set: ${FILE_PLANE_SENTINEL_HINT})` : ''}` : '(no ~/.gbrain/config.json)'}`);
     console.log(`  DB plane:   ${report.db_plane.model ?? '(none)'} @ ${report.db_plane.dims ?? '?'}d`);
     console.log(`  Column:     content_chunks.embedding ${report.column_dims === null ? 'absent/unreadable' : `${report.column_dims}d`}${report.pinned_widths.map((p) => `; ${p.table} ${p.dims === null ? '?' : `${p.dims}d`}`).join('')}`);
     console.log(`  Vectors:    ${report.missing_embeddings ?? '?'} chunk(s) missing; ${report.chunkless_pages ?? '?'} contentful page(s) without chunks; facts pending: ${report.facts_pending ?? 'n/a'}`);

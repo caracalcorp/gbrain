@@ -12,7 +12,7 @@ import {
 } from '../core/embed-stall.ts';
 import { createProgress, type ProgressReporter } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
-import { assertEmbeddingEnabled } from '../core/embedding-dim-check.ts';
+import { assertEmbeddingEnabled, ENABLE_EMBEDDINGS_HINT } from '../core/embedding-dim-check.ts';
 import { invalidateStaleSignatureEmbeddingsGuarded } from '../core/embedding-invalidation.ts';
 import { loadConfig } from '../core/config.ts';
 import { slog, serr } from '../core/console-prefix.ts';
@@ -835,7 +835,7 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
     process.stderr.write(
       '[embed] Embeddings are disabled on this brain (keyless install). '
       + 'Nothing to backfill; keyword search keeps working. '
-      + 'Enable later: set embedding_model via gbrain config, then re-run gbrain init with the force flag.\n',
+      + `To embed, ${ENABLE_EMBEDDINGS_HINT}.\n`,
     );
     return {
       embedded: 0, skipped: 0, would_embed: 0, total_chunks: 0,
