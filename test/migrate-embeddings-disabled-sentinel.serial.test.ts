@@ -13,7 +13,8 @@ import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { loadConfig } from '../src/core/config.ts';
 import { getRecipe } from '../src/core/ai/recipes/index.ts';
-import { assertEmbeddingEnabled } from '../src/core/embedding-dim-check.ts';
+import { assertEmbeddingEnabled, EmbeddingDisabledError } from '../src/core/embedding-dim-check.ts';
+import { _resetDbPlaneMergeMemoForTests } from '../src/core/config-db-merge.ts';
 import {
   persistEmbeddingFileConfig,
   planMigrationFlow,
@@ -142,6 +143,12 @@ test('persistEmbeddingFileConfig flags only required keys, never optional settin
       target: ['openai:text-embedding-3-small', 1536],
     },
     {
+      name: 'voyage: required key both exported and stored in the config file',
+      cfg: { voyage_api_key: 'pa-file' },
+      env: { VOYAGE_API_KEY: 'pa-env' },
+      target: ['voyage:voyage-4', 1024],
+    },
+    {
       name: 'ollama: no required keys, base URL in env and provider_base_urls',
       cfg: { provider_base_urls: { ollama: 'http://127.0.0.1:11434/v1' } },
       env: { OLLAMA_BASE_URL: 'http://127.0.0.1:11434/v1' },
@@ -165,6 +172,52 @@ test('persistEmbeddingFileConfig flags only required keys, never optional settin
     // Restore the shared seed for the next test, pass or fail.
     writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
   }
+});
+
+test('persistEmbeddingFileConfig: no warning on a brain that was never keyless', async () => {
+  // Env-only keys are a normal, supported setup; only leaving keyless mode warns.
+  writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite' }, null, 2));
+  process.env.VOYAGE_API_KEY = 'pa-env-only';
+  try {
+    let envOnly: string[] = ['unset'];
+    const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('voyage:voyage-4', 1024); });
+    expect(envOnly).toEqual([]);
+    expect(err).not.toContain('embedding_disabled cleared');
+  } finally {
+    delete process.env.VOYAGE_API_KEY;
+    writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
+  }
+});
+
+test('persistEmbeddingFileConfig: a key stored in the DB plane counts as durable', async () => {
+  writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true }, null, 2));
+  process.env.VOYAGE_API_KEY = 'pa-env';
+  _resetDbPlaneMergeMemoForTests();
+  const dbReader = { getConfig: async (k: string) => (k === 'voyage_api_key' ? 'pa-db' : null) };
+  try {
+    let envOnly: string[] = ['unset'];
+    const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('voyage:voyage-4', 1024, dbReader); });
+    expect(envOnly).toEqual([]);
+    expect(err).not.toContain('embedding_disabled cleared');
+  } finally {
+    delete process.env.VOYAGE_API_KEY;
+    _resetDbPlaneMergeMemoForTests();
+    writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
+  }
+});
+
+test('assertEmbeddingEnabled points blocked users at commands that work', () => {
+  let message = '';
+  try {
+    assertEmbeddingEnabled({ embedding_disabled: true });
+  } catch (e) {
+    expect(e).toBeInstanceOf(EmbeddingDisabledError);
+    message = (e as Error).message;
+  }
+  expect(message).toContain('gbrain migrate embeddings --to');
+  expect(message).toContain('gbrain init --force --embedding-model');
+  // `config set embedding_model` is refused by design; never recommend it.
+  expect(message).not.toContain('config set embedding_model');
 });
 
 test('persistEmbeddingFileConfig clears the deferred-setup sentinel', async () => {
@@ -313,6 +366,22 @@ describe('stuck sentinel (model already at target)', () => {
       }
     }, 30000);
 
+    test('--status counts a key stored only in the DB plane', async () => {
+      await engine().setConfig('voyage_api_key', 'pa-db');
+      _resetDbPlaneMergeMemoForTests();
+      try {
+        const report = JSON.parse((await runMigrate(engine(), ['--status', '--json'])).out) as {
+          keys: Record<string, boolean>; key_sources: Record<string, string | null>;
+        };
+        expect(report.keys.VOYAGE_API_KEY).toBe(true);
+        expect(report.key_sources.VOYAGE_API_KEY).toBe('db');
+        expect(JSON.stringify(report)).not.toContain('pa-db');
+      } finally {
+        await engine().unsetConfig('voyage_api_key');
+        _resetDbPlaneMergeMemoForTests();
+      }
+    }, 30000);
+
     test('--status names the sentinel in the human file-plane line', async () => {
       const { code, out } = await runMigrate(engine(), ['--status']);
       expect(code).toBe(0);
@@ -352,6 +421,30 @@ describe('stuck sentinel (model already at target)', () => {
         delete process.env.OPENAI_API_KEY;
       }
       expect(readCfg().embedding_disabled).toBeUndefined();
+    }, 120000);
+  });
+
+  describe('fresh keyless-init brain, key only in env, --no-embed', () => {
+    const engine = useFreshEngine();
+    beforeEach(() => {
+      writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true }, null, 2));
+    });
+
+    test('the deferred re-embed path reports the env-only key and repeats the note', async () => {
+      process.env.OPENAI_API_KEY = 'sk-env-only';
+      try {
+        let run = { code: -1, out: '' };
+        const err = await captureStderr(async () => {
+          run = await runMigrate(engine(), ['--to', TARGET, '--dim', String(TARGET_DIMS), '--yes', '--no-embed', '--json']);
+        });
+        expect(run.code).toBe(0);
+        const report = JSON.parse(run.out) as { status: string; env_only_keys?: string[] };
+        expect(report.status).toBe('applied_no_embed');
+        expect(report.env_only_keys).toEqual(['OPENAI_API_KEY']);
+        expect(err).toContain("[migrate] NOTE: OPENAI_API_KEY came only from this shell's environment");
+      } finally {
+        delete process.env.OPENAI_API_KEY;
+      }
     }, 120000);
   });
 

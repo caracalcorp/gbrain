@@ -40,9 +40,10 @@ brain has content, `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024`
 is the way out: it embeds the backlog and clears the flag. `gbrain migrate
 embeddings --status` and the dry-run plan flag a brain stuck behind the flag
 (`embedding_disabled set: a successful migrate clears it`). Keep the provider
-key where every `gbrain` process can read it (`~/.gbrain/config.json` via
-`gbrain config set voyage_api_key ...`); the migration warns when it only
-found the key in its own shell environment.
+key where every `gbrain` process can read it (the `voyage_api_key` field in
+`~/.gbrain/config.json`, or `VOYAGE_API_KEY` in the environment cron and
+hooks run with); the migration warns when it only found the key in its own
+shell environment.
 
 **Say to your agent:** *"turn on embeddings for my brain"* — your agent runs
 `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024`.

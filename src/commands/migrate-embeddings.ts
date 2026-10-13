@@ -35,6 +35,7 @@
 
 import type { BrainEngine } from '../core/engine.ts';
 import type { GBrainConfig } from '../core/config.ts';
+import { applyDbPlaneReadSideMerge, type DbPlaneEngineReader } from '../core/config-db-merge.ts';
 import { serr, slog } from '../core/console-prefix.ts';
 import {
   planEmbeddingMigration,
@@ -417,6 +418,8 @@ function filePlaneSnapshot(
 export async function persistEmbeddingFileConfig(
   toModel: string,
   toDims: number,
+  /** When given, provider keys stored in the DB plane count as durable too. */
+  engine?: DbPlaneEngineReader,
 ): Promise<string[]> {
   const { loadConfig, loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
   const { configureGateway } = await import('../core/ai/gateway.ts');
@@ -471,9 +474,12 @@ export async function persistEmbeddingFileConfig(
     // store it differs per provider, so the advice stays generic.
     const { getRecipe } = await import('../core/ai/recipes/index.ts');
     const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
-    const fileKeys = mergedProviderEnv(fileCfg, {});
+    // Durable = config file, then DB plane: the same file > DB order runtime uses.
+    const durableCfg: GBrainConfig = { ...fileCfg };
+    if (engine) await applyDbPlaneReadSideMerge(durableCfg, engine);
+    const durableKeys = mergedProviderEnv(durableCfg, {});
     envOnly = (getRecipe(toModel.split(':')[0])?.auth_env?.required ?? [])
-      .filter((k) => process.env[k] && !fileKeys[k]);
+      .filter((k) => process.env[k] && !durableKeys[k]);
     if (envOnly.length > 0) {
       serr(`  [migrate] embedding_disabled cleared — ${envOnly.join(', ')} came only from this shell's environment; make it available to every gbrain process (cron, hooks) or later embeds will fail.`);
     }
@@ -737,7 +743,7 @@ export async function executeMigrationFlow(
     const applied = await applyEmbeddingMigration(engine, plan, {
       ignoreEnvOverride: opts.ignoreEnvOverride,
       forceSunsetTarget: opts.forceSunsetTarget,
-      persistConfig: async (m, d) => { envOnlyKeys = await persistEmbeddingFileConfig(m, d); },
+      persistConfig: async (m, d) => { envOnlyKeys = await persistEmbeddingFileConfig(m, d, engine); },
     });
     const envOnlyField = envOnlyKeys.length > 0 ? { env_only_keys: envOnlyKeys } : {};
     if (applied.status === 'refused') return { status: 'refused_env', warning: applied.warning };
@@ -859,10 +865,10 @@ export async function runMigrateEmbeddings(
   if (args.includes('--status')) {
     const report = await readMigrationStatus(engine);
     const envPresence = detectEnvPresence();
-    // API-key PRESENCE only — never values (Section 3). A key counts when
-    // either env or the config file supplies it; key_sources says which.
+    // API-key PRESENCE only — never values (Section 3). A key counts when env,
+    // the config file or the DB plane supplies it; key_sources says which.
     const keyPresence: Record<string, boolean> = {};
-    const keySources: Record<string, 'env' | 'file' | 'env+file' | null> = {};
+    const keySources: Record<string, string | null> = {};
     let filePlane: FilePlaneSnapshot | null = null;
     let identity = { engine: 'unknown', target: 'unknown' };
     try {
@@ -870,11 +876,13 @@ export async function runMigrateEmbeddings(
       const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
       const fileCfg = loadConfigFileOnly();
       const fileKeys = mergedProviderEnv(fileCfg, {});
+      const dbOnly = {} as GBrainConfig;
+      await applyDbPlaneReadSideMerge(dbOnly, engine);
+      const dbKeys = mergedProviderEnv(dbOnly, {});
       for (const k of ['VOYAGE_API_KEY', 'OPENAI_API_KEY', 'ZEROENTROPY_API_KEY', 'OPENROUTER_API_KEY']) {
-        const env = Boolean(process.env[k]);
-        const file = Boolean(fileKeys[k]);
-        keyPresence[k] = env || file;
-        keySources[k] = env && file ? 'env+file' : env ? 'env' : file ? 'file' : null;
+        const sources = [process.env[k] && 'env', fileKeys[k] && 'file', dbKeys[k] && 'db'].filter(Boolean);
+        keyPresence[k] = sources.length > 0;
+        keySources[k] = sources.length > 0 ? sources.join('+') : null;
       }
       filePlane = fileCfg
         ? filePlaneSnapshot(fileCfg)

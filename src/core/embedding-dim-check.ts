@@ -80,7 +80,8 @@ export class EmbeddingDisabledError extends Error {
 export const ENABLE_EMBEDDINGS_HINT =
   'enable with `gbrain init --force --embedding-model voyage:voyage-4` on an empty brain, ' +
   'or `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024` once it has content ' +
-  '(store the key first: `gbrain config set voyage_api_key <key>`)';
+  '(first store the key where every gbrain process can read it: `voyage_api_key` in ~/.gbrain/config.json, ' +
+  'or VOYAGE_API_KEY in the environment your cron and hooks run with)';
 
 export function assertEmbeddingEnabled(cfg: { embedding_disabled?: boolean } | null): void {
   if (cfg?.embedding_disabled) {
