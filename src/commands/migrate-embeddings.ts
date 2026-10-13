@@ -380,9 +380,9 @@ export async function probeTargetReranker(
 }
 
 /**
- * The file plane's effective embedding target. A persisted deferred-setup
- * sentinel (`embedding_disabled: true`) means no model is live, whatever
- * `embedding_model` says, so verify keeps the config step outstanding.
+ * The file plane's effective embedding target, as verify sees it. A persisted
+ * deferred-setup sentinel (`embedding_disabled: true`) means no model is live,
+ * whatever `embedding_model` says, so verify keeps the config step outstanding.
  */
 function filePlaneEmbedding(
   fileCfg: { embedding_model?: string; embedding_dimensions?: number; embedding_disabled?: boolean },
@@ -822,13 +822,19 @@ export async function runMigrateEmbeddings(
     for (const k of ['VOYAGE_API_KEY', 'OPENAI_API_KEY', 'ZEROENTROPY_API_KEY', 'OPENROUTER_API_KEY']) {
       keyPresence[k] = Boolean(process.env[k]);
     }
-    let filePlane: { model?: string | null; dims?: number | null } | null = null;
+    let filePlane: { model?: string | null; dims?: number | null; embedding_disabled?: true } | null = null;
     let identity = { engine: 'unknown', target: 'unknown' };
     try {
       const { loadConfigFileOnly, loadConfig } = await import('../core/config.ts');
       const fileCfg = loadConfigFileOnly();
+      // Status shows the raw model/dims plus the deferred-setup sentinel, so a
+      // brain stuck behind `embedding_disabled` reads as stuck, not unconfigured.
       filePlane = fileCfg
-        ? filePlaneEmbedding(fileCfg)
+        ? {
+            model: fileCfg.embedding_model ?? null,
+            dims: fileCfg.embedding_dimensions ?? null,
+            ...(fileCfg.embedding_disabled ? { embedding_disabled: true as const } : {}),
+          }
         : null;
       const cfg = loadConfig();
       if (cfg?.database_url) identity = { engine: 'postgres', target: redactPgUrl(cfg.database_url) };
@@ -857,7 +863,7 @@ export async function runMigrateEmbeddings(
     console.log(`  Brain: ${identity.engine} (${identity.target}); scope: brain-wide (all sources)`);
     console.log(`  Env plane:  GBRAIN_EMBEDDING_MODEL=${envPresence.model ?? '(unset)'} GBRAIN_EMBEDDING_DIMENSIONS=${envPresence.dims ?? '(unset)'}`);
     console.log(`  Keys:       ${Object.entries(keyPresence).map(([k, v]) => `${k}=${v ? 'set' : 'unset'}`).join(' ')}`);
-    console.log(`  File plane: ${filePlane ? `${filePlane.model ?? '(none)'} @ ${filePlane.dims ?? '?'}d` : '(no ~/.gbrain/config.json)'}`);
+    console.log(`  File plane: ${filePlane ? `${filePlane.model ?? '(none)'} @ ${filePlane.dims ?? '?'}d${filePlane.embedding_disabled ? ' (embedding_disabled set: migrate clears it)' : ''}` : '(no ~/.gbrain/config.json)'}`);
     console.log(`  DB plane:   ${report.db_plane.model ?? '(none)'} @ ${report.db_plane.dims ?? '?'}d`);
     console.log(`  Column:     content_chunks.embedding ${report.column_dims === null ? 'absent/unreadable' : `${report.column_dims}d`}${report.pinned_widths.map((p) => `; ${p.table} ${p.dims === null ? '?' : `${p.dims}d`}`).join('')}`);
     console.log(`  Vectors:    ${report.missing_embeddings ?? '?'} chunk(s) missing; ${report.chunkless_pages ?? '?'} contentful page(s) without chunks; facts pending: ${report.facts_pending ?? 'n/a'}`);

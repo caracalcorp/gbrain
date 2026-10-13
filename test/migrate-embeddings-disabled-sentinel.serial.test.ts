@@ -73,25 +73,24 @@ test('persistEmbeddingFileConfig clears the deferred-setup sentinel', async () =
 
 /**
  * Value: protects=a brain stuck with embedding_model==target AND the
- *   embedding_disabled sentinel still on is reported as NOT converged (plan
- *   verify + `--status` file_plane) and a re-run of `migrate embeddings --to X
- *   --yes` clears the sentinel instead of verified-skipping;
- * fails_when=the plan/status file-plane read reverts to raw
- *   embedding_model/dims (ignores embedding_disabled), so verify says complete,
- *   the run exits skipped_no_work and the sentinel stays on forever;
+ *   embedding_disabled sentinel still on is reported as NOT converged by plan
+ *   verify, shown as stuck (not unconfigured) by `--status`, and a re-run of
+ *   `migrate embeddings --to X --yes` clears the sentinel instead of
+ *   verified-skipping, with or without an embedding backlog;
+ * fails_when=the verify file-plane read ignores embedding_disabled (verify says
+ *   complete, a backlog-free run exits skipped_no_work, the sentinel stays on
+ *   forever), or --status hides the sentinel behind a (none) model;
  * why_new=existing flow/hardening tests never seed embedding_disabled, and the
  *   persist test above only covers the write path, not the self-heal verdict;
  * seam=none (reached via planMigrationFlow + runMigrateEmbeddings CLI entry).
  */
-describe('stuck sentinel (model already at target) self-heals on re-run', () => {
+describe('stuck sentinel (model already at target)', () => {
   class ExitError extends Error {
     constructor(public code: number) { super(`exit ${code}`); }
   }
   const exitSeam = (code: number): never => { throw new ExitError(code); };
 
-  let engine: PGLiteEngine;
-
-  async function runMigrate(args: string[]): Promise<{ code: number; out: string }> {
+  async function runMigrate(engine: PGLiteEngine, args: string[]): Promise<{ code: number; out: string }> {
     const lines: string[] = [];
     const orig = console.log;
     console.log = (...a: unknown[]) => { lines.push(a.map(String).join(' ')); };
@@ -106,9 +105,43 @@ describe('stuck sentinel (model already at target) self-heals on re-run', () => 
     }
   }
 
-  // A converged-looking brain: file plane already naming the target model,
-  // but the keyless sentinel never got cleared (the pre-fix persist left it
-  // behind). Re-seeded per test so no test depends on another's mutation.
+  // Each group gets its own empty brain at the target width, so a group that
+  // runs the migration can't leave state behind for another.
+  function useFreshEngine(): () => PGLiteEngine {
+    let engine: PGLiteEngine;
+    beforeAll(async () => {
+      engine = new PGLiteEngine();
+      await engine.connect({ embedding_dimensions: TARGET_DIMS } as never);
+      await engine.initSchema();
+    }, 60000);
+    afterAll(async () => {
+      await engine?.disconnect();
+    });
+    return () => engine;
+  }
+
+  async function expectSelfHeal(engine: PGLiteEngine, expectedEmbedded: number): Promise<void> {
+    const first = await runMigrate(engine, ['--to', TARGET, '--dim', String(TARGET_DIMS), '--yes', '--json']);
+    expect(first.code).toBe(0);
+    const firstReport = JSON.parse(first.out) as { status: string; embedded: number };
+    expect(firstReport.status).toBe('completed');
+    expect(firstReport.embedded).toBe(expectedEmbedded);
+    expect(await engine.countStaleChunks()).toBe(0);
+
+    const cfg = readCfg();
+    expect(cfg.embedding_disabled).toBeUndefined();
+    expect(cfg.embedding_model).toBe(TARGET);
+    expect(cfg.embedding_dimensions).toBe(TARGET_DIMS);
+    // The embed callsites' own guard now lets work through.
+    expect(() => assertEmbeddingEnabled(loadConfig())).not.toThrow();
+
+    const second = await runMigrate(engine, ['--to', TARGET, '--dim', String(TARGET_DIMS), '--yes', '--json']);
+    expect(second.code).toBe(0);
+    expect((JSON.parse(second.out) as { status: string }).status).toBe('skipped_no_work');
+  }
+
+  // The file plane already names the target model, but the keyless sentinel
+  // never got cleared (the pre-fix persist left it behind). Re-seeded per test.
   beforeEach(() => {
     writeFileSync(cfgPath(), JSON.stringify({
       engine: 'pglite',
@@ -119,7 +152,7 @@ describe('stuck sentinel (model already at target) self-heals on re-run', () => 
     }, null, 2));
   });
 
-  beforeAll(async () => {
+  beforeAll(() => {
     resetGateway();
     configureGateway({
       embedding_model: TARGET,
@@ -130,51 +163,50 @@ describe('stuck sentinel (model already at target) self-heals on re-run', () => 
       embeddings: values.map(() => new Array(TARGET_DIMS).fill(0).map((_, i) => Math.sin(i) * 0.01 + 0.001)),
       usage: { tokens: values.length * 4 },
     }) as never);
-    engine = new PGLiteEngine();
-    await engine.connect({ embedding_dimensions: TARGET_DIMS } as never);
-    await engine.initSchema();
-  }, 60000);
-
-  afterAll(async () => {
-    await engine?.disconnect();
   });
 
-  test('plan verify keeps the config step outstanding while the sentinel is on', async () => {
-    const ctx = await planMigrationFlow(engine, { to: TARGET, dim: TARGET_DIMS });
-    expect(ctx.verify.details.file_plane_ok).toBe(false);
-    expect(ctx.verify.complete).toBe(false);
-  }, 30000);
+  describe('read-only surfaces', () => {
+    const engine = useFreshEngine();
 
-  test('--status --json reports no live file-plane model while the sentinel is on', async () => {
-    const { code, out } = await runMigrate(['--status', '--json']);
-    expect(code).toBe(0);
-    const report = JSON.parse(out) as { file_plane: { model: string | null; dims: number | null } | null };
-    expect(report.file_plane).toEqual({ model: null, dims: null });
-  }, 30000);
+    test('plan verify keeps the config step outstanding', async () => {
+      const ctx = await planMigrationFlow(engine(), { to: TARGET, dim: TARGET_DIMS });
+      expect(ctx.verify.details.file_plane_ok).toBe(false);
+      expect(ctx.verify.complete).toBe(false);
+    }, 30000);
 
-  test('re-run embeds the backlog, clears the sentinel, then verified-skips', async () => {
-    await engine.putPage('notes/sentinel', { type: 'note', title: 'sentinel', compiled_truth: '# sentinel\n\nbody' });
-    await engine.upsertChunks('notes/sentinel', [
-      { chunk_index: 0, chunk_text: 'chunk text for sentinel', chunk_source: 'compiled_truth', token_count: 5 },
-    ]);
-    expect(await engine.countStaleChunks()).toBe(1);
+    test('--status --json shows the model and flags the sentinel', async () => {
+      const { code, out } = await runMigrate(engine(), ['--status', '--json']);
+      expect(code).toBe(0);
+      const report = JSON.parse(out) as { file_plane: Record<string, unknown> | null };
+      expect(report.file_plane).toEqual({ model: TARGET, dims: TARGET_DIMS, embedding_disabled: true });
+    }, 30000);
 
-    const first = await runMigrate(['--to', TARGET, '--dim', String(TARGET_DIMS), '--yes', '--json']);
-    expect(first.code).toBe(0);
-    const firstReport = JSON.parse(first.out) as { status: string; embedded: number };
-    expect(firstReport.status).toBe('completed');
-    expect(firstReport.embedded).toBe(1);
-    expect(await engine.countStaleChunks()).toBe(0);
+    test('--status names the sentinel in the human file-plane line', async () => {
+      const { code, out } = await runMigrate(engine(), ['--status']);
+      expect(code).toBe(0);
+      expect(out).toContain(`File plane: ${TARGET} @ ${TARGET_DIMS}d (embedding_disabled set: migrate clears it)`);
+    }, 30000);
+  });
 
-    const cfg = readCfg();
-    expect(cfg.embedding_disabled).toBeUndefined();
-    expect(cfg.embedding_model).toBe(TARGET);
-    expect(cfg.embedding_dimensions).toBe(TARGET_DIMS);
-    // The embed callsites' own guard now lets work through.
-    expect(() => assertEmbeddingEnabled(loadConfig())).not.toThrow();
+  describe('re-run with no backlog', () => {
+    const engine = useFreshEngine();
 
-    const second = await runMigrate(['--to', TARGET, '--dim', String(TARGET_DIMS), '--yes', '--json']);
-    expect(second.code).toBe(0);
-    expect((JSON.parse(second.out) as { status: string }).status).toBe('skipped_no_work');
-  }, 120000);
+    test('does the config step instead of verified-skipping, then converges', async () => {
+      expect(await engine().countStaleChunks()).toBe(0);
+      await expectSelfHeal(engine(), 0);
+    }, 120000);
+  });
+
+  describe('re-run with a backlog', () => {
+    const engine = useFreshEngine();
+
+    test('embeds the backlog, clears the sentinel, then converges', async () => {
+      await engine().putPage('notes/sentinel', { type: 'note', title: 'sentinel', compiled_truth: '# sentinel\n\nbody' });
+      await engine().upsertChunks('notes/sentinel', [
+        { chunk_index: 0, chunk_text: 'chunk text for sentinel', chunk_source: 'compiled_truth', token_count: 5 },
+      ]);
+      expect(await engine().countStaleChunks()).toBe(1);
+      await expectSelfHeal(engine(), 1);
+    }, 120000);
+  });
 });
