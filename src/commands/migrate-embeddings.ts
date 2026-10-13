@@ -408,8 +408,8 @@ function filePlaneSnapshot(
  * Persist the target model+dims to the FILE plane and reconfigure the
  * in-process gateway. The gateway reads file/env config, not the DB plane —
  * without this the re-embed would silently run against the OLD provider.
- * Also clears the keyless-init `embedding_disabled` sentinel, warning when
- * the target's API key lives only in this process's env, and returns those
+ * Also clears the keyless-init `embedding_disabled` sentinel, warning when a
+ * required provider key came only from this process's env, and returns those
  * env-only key names (empty in env-canonical mode, where there is no file
  * plane to write).
  * Shared by the CLI command and the `migrate_embeddings` op handler.
@@ -418,7 +418,7 @@ export async function persistEmbeddingFileConfig(
   toModel: string,
   toDims: number,
 ): Promise<string[]> {
-  const { loadConfig, loadConfigFileOnly, saveConfig, configPath } = await import('../core/config.ts');
+  const { loadConfig, loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
   const { configureGateway } = await import('../core/ai/gateway.ts');
   const { buildGatewayConfig } = await import('../core/ai/build-gateway-config.ts');
   // Round-2 #2: read the FILE plane, not env-merged loadConfig(). Persisting
@@ -465,31 +465,17 @@ export async function persistEmbeddingFileConfig(
   saveConfig(fileCfg);
   let envOnly: string[] = [];
   if (leavingKeylessMode) {
-    // Leaving keyless mode is durable, so the provider settings must be too:
-    // one passed only to this run would make every later embed (cron, hooks)
-    // fail where keyless mode exited quietly. Optional vars count only when
-    // this run actually took them from env.
+    // Leaving keyless mode is durable, so the provider key must be too: a
+    // required key this run took only from the shell would make every later
+    // embed (cron, hooks) fail where keyless mode exited quietly. Where to
+    // store it differs per provider, so the advice stays generic.
     const { getRecipe } = await import('../core/ai/recipes/index.ts');
     const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
-    const providerId = toModel.split(':')[0];
     const fileKeys = mergedProviderEnv(fileCfg, {});
-    // Every env name the file plane CAN supply: mergedProviderEnv over a config
-    // whose every field is set.
-    const slotted = new Set(Object.keys(mergedProviderEnv(new Proxy({}, { get: () => 'x' }) as GBrainConfig, {})));
-    const stored = (k: string) =>
-      Boolean(fileKeys[k]) || (k.endsWith('_BASE_URL') && Boolean(fileCfg.provider_base_urls?.[providerId]));
-    const auth = getRecipe(providerId)?.auth_env;
-    envOnly = [
-      ...(auth?.required ?? []),
-      ...(auth?.optional ?? []).filter((k) => process.env[k]),
-    ].filter((k) => !stored(k));
-    const storable = envOnly.filter((k) => slotted.has(k));
-    const noSlot = envOnly.filter((k) => !slotted.has(k));
-    if (storable.length > 0) {
-      serr(`  [migrate] embedding_disabled cleared — ${storable.join(', ')} is not in ${configPath()}; store it there (gbrain config set ${storable[0].toLowerCase()} <value>) or later embeds (cron, hooks) will fail.`);
-    }
-    if (noSlot.length > 0) {
-      serr(`  [migrate] embedding_disabled cleared — ${noSlot.join(', ')} can only come from the environment; export it for every gbrain process (cron, hooks) or later embeds will fail.`);
+    envOnly = (getRecipe(toModel.split(':')[0])?.auth_env?.required ?? [])
+      .filter((k) => process.env[k] && !fileKeys[k]);
+    if (envOnly.length > 0) {
+      serr(`  [migrate] embedding_disabled cleared — ${envOnly.join(', ')} came only from this shell's environment; make it available to every gbrain process (cron, hooks) or later embeds will fail.`);
     }
   }
   // Reconfigure the in-process gateway from the MERGED view (env still wins

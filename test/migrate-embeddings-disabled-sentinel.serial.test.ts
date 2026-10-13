@@ -116,8 +116,7 @@ test('persistEmbeddingFileConfig warns when the target key lives only in this pr
     let envOnly: string[] = [];
     const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('voyage:voyage-4', 1024); });
     expect(envOnly).toEqual(['VOYAGE_API_KEY']);
-    // Names the config file gbrain actually reads (GBRAIN_HOME-relative), not a hardcoded path.
-    expect(err).toContain(`embedding_disabled cleared — VOYAGE_API_KEY is not in ${cfgPath()}; store it there (gbrain config set voyage_api_key <value>)`);
+    expect(err).toContain("embedding_disabled cleared — VOYAGE_API_KEY came only from this shell's environment; make it available to every gbrain process");
     expect(readCfg().embedding_disabled).toBeUndefined();
   } finally {
     delete process.env.VOYAGE_API_KEY;
@@ -126,57 +125,44 @@ test('persistEmbeddingFileConfig warns when the target key lives only in this pr
   }
 });
 
-test('persistEmbeddingFileConfig also flags optional auth vars this run takes from env', async () => {
-  // Azure: endpoint + deployment are required and stored; the API key is optional
-  // and here present only in env, so later processes would fall back without it.
-  writeFileSync(cfgPath(), JSON.stringify({
-    engine: 'pglite',
-    embedding_disabled: true,
-    azure_openai_endpoint: 'https://example.invalid',
-    azure_openai_deployment: 'embed',
-  }, null, 2));
-  const saved = process.env.AZURE_OPENAI_API_KEY;
-  process.env.AZURE_OPENAI_API_KEY = 'az-env-only';
+test('persistEmbeddingFileConfig flags only required keys, never optional settings or stored base URLs', async () => {
+  // Where an optional setting lives differs per provider (file, DB plane,
+  // env-only), and most are harmless without it, so only required keys warn.
+  const rows: Array<{ name: string; cfg: Record<string, unknown>; env: Record<string, string>; target: [string, number] }> = [
+    {
+      name: 'azure: optional API key only in env, required endpoint+deployment stored',
+      cfg: { azure_openai_endpoint: 'https://example.invalid', azure_openai_deployment: 'embed' },
+      env: { AZURE_OPENAI_API_KEY: 'az-env-only', AZURE_OPENAI_API_VERSION: '2024-env' },
+      target: ['azure-openai:text-embedding-3-small', 1536],
+    },
+    {
+      name: 'openai: required key stored, optional org id only in env',
+      cfg: { openai_api_key: 'sk-file' },
+      env: { OPENAI_ORG_ID: 'org-env-only' },
+      target: ['openai:text-embedding-3-small', 1536],
+    },
+    {
+      name: 'ollama: no required keys, base URL in env and provider_base_urls',
+      cfg: { provider_base_urls: { ollama: 'http://127.0.0.1:11434/v1' } },
+      env: { OLLAMA_BASE_URL: 'http://127.0.0.1:11434/v1' },
+      target: ['ollama:nomic-embed-text', 768],
+    },
+  ];
   try {
-    let envOnly: string[] = [];
-    await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('azure-openai:text-embedding-3-small', 1536); });
-    expect(envOnly).toEqual(['AZURE_OPENAI_API_KEY']);
+    for (const row of rows) {
+      writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, ...row.cfg }, null, 2));
+      Object.assign(process.env, row.env);
+      try {
+        let envOnly: string[] = ['unset'];
+        const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig(...row.target); });
+        expect(envOnly, row.name).toEqual([]);
+        expect(err, row.name).not.toContain('embedding_disabled cleared');
+      } finally {
+        for (const k of Object.keys(row.env)) delete process.env[k];
+      }
+    }
   } finally {
-    if (saved === undefined) delete process.env.AZURE_OPENAI_API_KEY;
-    else process.env.AZURE_OPENAI_API_KEY = saved;
-    writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
-  }
-});
-
-test('persistEmbeddingFileConfig: a base URL stored in provider_base_urls is not env-only', async () => {
-  writeFileSync(cfgPath(), JSON.stringify({
-    engine: 'pglite',
-    embedding_disabled: true,
-    provider_base_urls: { ollama: 'http://127.0.0.1:11434/v1' },
-  }, null, 2));
-  process.env.OLLAMA_BASE_URL = 'http://127.0.0.1:11434/v1';
-  try {
-    let envOnly: string[] = ['unset'];
-    const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('ollama:nomic-embed-text', 768); });
-    expect(envOnly).toEqual([]);
-    expect(err).not.toContain('embedding_disabled cleared');
-  } finally {
-    delete process.env.OLLAMA_BASE_URL;
-    writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
-  }
-});
-
-test('persistEmbeddingFileConfig: a setting config.json cannot hold gets export advice, not store advice', async () => {
-  writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, openai_api_key: 'sk-file' }, null, 2));
-  process.env.OPENAI_ORG_ID = 'org-env-only';
-  try {
-    let envOnly: string[] = [];
-    const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('openai:text-embedding-3-small', 1536); });
-    expect(envOnly).toEqual(['OPENAI_ORG_ID']);
-    expect(err).toContain('OPENAI_ORG_ID can only come from the environment; export it for every gbrain process');
-    expect(err).not.toContain('store it there');
-  } finally {
-    delete process.env.OPENAI_ORG_ID;
+    // Restore the shared seed for the next test, pass or fail.
     writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
   }
 });
