@@ -121,7 +121,15 @@ const WORKER_SRC = `
 const { workerData } = require('node:worker_threads');
 const { deadlineMs, graceMs, label, heartbeatMs } = workerData;
 const t0 = Date.now();
-function w(m) { try { require('node:fs').writeSync(2, '[' + label + '] ' + m + '\\n'); } catch (e) {} }
+// Async fd-2 write: lands even when the main loop is starved (Bun relays
+// process.stderr through it), and never blocks this thread on a stalled
+// stderr reader. A signal waits for the write, capped at 100ms.
+function w(m, then) {
+  let done = false;
+  const go = () => { if (!done) { done = true; if (then) then(); } };
+  try { require('node:fs').write(2, '[' + label + '] ' + m + '\\n', go); } catch (e) { go(); return; }
+  if (then) setTimeout(go, 100);
+}
 if (heartbeatMs > 0) {
   const hb = setInterval(() => {
     const elapsed = Math.round((Date.now() - t0) / 1000);
@@ -131,12 +139,14 @@ if (heartbeatMs > 0) {
   if (typeof hb.unref === 'function') hb.unref();
 }
 setTimeout(() => {
-  w('deadline reached (' + Math.round(deadlineMs/1000) + 's) — sending SIGTERM for graceful shutdown');
-  try { process.kill(process.pid, 'SIGTERM'); } catch (e) {}
+  w('deadline reached (' + Math.round(deadlineMs/1000) + 's) — sending SIGTERM for graceful shutdown', () => {
+    try { process.kill(process.pid, 'SIGTERM'); } catch (e) {}
+  });
 }, deadlineMs);
 setTimeout(() => {
-  w('grace expired — sending SIGKILL (event loop was starved; this is the orphan-pileup backstop)');
-  try { process.kill(process.pid, 'SIGKILL'); } catch (e) {}
+  w('grace expired — sending SIGKILL (event loop was starved; this is the orphan-pileup backstop)', () => {
+    try { process.kill(process.pid, 'SIGKILL'); } catch (e) {}
+  });
 }, deadlineMs + graceMs);
 `;
 
@@ -352,7 +362,15 @@ const { stallMs, graceMs, label, checkIntervalMs } = workerData;
 let lastPet = Date.now();
 let lastCheck = Date.now();
 let latched = false;
-function w(m) { try { require('node:fs').writeSync(2, '[' + label + '] ' + m + '\\n'); } catch (e) {} }
+// Async fd-2 write: lands even when the main loop is starved (Bun relays
+// process.stderr through it), and never blocks this thread on a stalled
+// stderr reader. A signal waits for the write, capped at 100ms.
+function w(m, then) {
+  let done = false;
+  const go = () => { if (!done) { done = true; if (then) then(); } };
+  try { require('node:fs').write(2, '[' + label + '] ' + m + '\\n', go); } catch (e) { go(); return; }
+  if (then) setTimeout(go, 100);
+}
 if (parentPort) parentPort.on('message', () => { lastPet = Date.now(); });
 setInterval(() => {
   const now = Date.now();
@@ -366,12 +384,14 @@ setInterval(() => {
   }
   const lag = now - lastPet;
   if (lag >= stallMs + graceMs) {
-    w('main loop unresponsive for ' + Math.round(lag / 1000) + 's (stall ' + Math.round(stallMs / 1000) + 's + grace ' + Math.round(graceMs / 1000) + 's) — sending SIGKILL (loop starved through the grace window; orphan-lock backstop)');
-    try { process.kill(process.pid, 'SIGKILL'); } catch (e) {}
+    w('main loop unresponsive for ' + Math.round(lag / 1000) + 's (stall ' + Math.round(stallMs / 1000) + 's + grace ' + Math.round(graceMs / 1000) + 's) — sending SIGKILL (loop starved through the grace window; orphan-lock backstop)', () => {
+      try { process.kill(process.pid, 'SIGKILL'); } catch (e) {}
+    });
   } else if (lag >= stallMs && !latched) {
     latched = true;
-    w('main loop unresponsive for ' + Math.round(lag / 1000) + 's (>= ' + Math.round(stallMs / 1000) + 's stall threshold) — sending SIGTERM for graceful shutdown');
-    try { process.kill(process.pid, 'SIGTERM'); } catch (e) {}
+    w('main loop unresponsive for ' + Math.round(lag / 1000) + 's (>= ' + Math.round(stallMs / 1000) + 's stall threshold) — sending SIGTERM for graceful shutdown', () => {
+      try { process.kill(process.pid, 'SIGTERM'); } catch (e) {}
+    });
   } else if (latched && lag < stallMs) {
     // mirrors nextStallLatch: the loop recovered (pets resumed), so a later
     // re-stall is a NEW stall — re-arm the graceful SIGTERM rather than

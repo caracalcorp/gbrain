@@ -22,11 +22,22 @@
  *   stall-dispose  — install, dispose immediately, then genuinely starve past
  *                    stall+grace. A disposed watchdog must never kill.
  *
+ * A `-full-stderr` suffix (starve-with-full-stderr, stall-with-full-stderr)
+ * first fills stderr (64KiB), which the test never reads until exit, so the
+ * pipe is full when the watchdog logs: its signal must still fire.
+ *
  * Safety net: the busy loop self-exits after 8s so a failed test kill can't hang CI.
  */
 import { installProcessWatchdog, installLoopStallWatchdog } from '../../src/core/process-watchdog.ts';
 
-const mode = process.argv[2] ?? 'starve-with';
+const rawMode = process.argv[2] ?? 'starve-with';
+const fullStderr = rawMode.endsWith('-full-stderr');
+const mode = rawMode.replace(/-full-stderr$/, '');
+if (fullStderr) {
+  // Exactly fill a default 64KiB Linux pipe; the next blocking write would hang.
+  const { writeSync } = await import('node:fs');
+  writeSync(2, 'x'.repeat(65536));
+}
 const deadlineMs = Number(process.argv[3] ?? 300);
 const graceMs = Number(process.argv[4] ?? 150);
 
