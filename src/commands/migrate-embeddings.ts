@@ -421,8 +421,10 @@ async function durableKeySources(fileCfg: GBrainConfig | null, engine?: DbPlaneE
   if (engine) await applyDbPlaneReadSideMerge(fileThenDb, engine);
   const db = Object.fromEntries(Object.entries(mergedProviderEnv(fileThenDb, {})).filter(([k]) => !file[k]));
   const dotenvRaw = readGbrainEnvFile(configDir);
-  // The loader never overrides a set variable, even an empty one, and runtime
-  // drops empty values: an empty export hides the .env key from every process.
+  // The loader never overrides a set variable, and runtime drops empty values,
+  // so an empty export leaves this process with no key at all. (A non-empty
+  // export also hides the .env value, but a key is still there: --status
+  // shows both as env+dotenv.)
   const dotenvLive = Object.fromEntries(Object.entries(dotenvRaw).filter(([k]) => process.env[k] !== ''));
   return { dotenv: mergedProviderEnv(null, dotenvLive), dotenvRaw, file, db };
 }

@@ -89,6 +89,12 @@ describe('process-watchdog integration (Bun-pinned)', () => {
     expect(r.elapsedMs).toBeLessThan(3000);
   }, 15000);
 
+  test.skipIf(process.platform !== 'linux')('on a stderr pipe, worker logs use a non-blocking reopen (no write can pin a disposed worker)', async () => {
+    // Value: protects=dispose frees the watchdog worker during a stderr outage; fails_when=worker logs go through a write that can stay pending on a stalled pipe; why_new=the kill tests pass even when a pending write pins the worker; seam=watchdogLogTarget (non-test callers: 2, via grep -n "watchdogLogTarget()" src/core/process-watchdog.ts)
+    const r = await runHarnessStalledStderr('log-target', 0, 0, 4000);
+    expect(r.rc).toBe(0);
+  }, 15000);
+
   test('control: a starved process WITHOUT the watchdog does not self-exit', async () => {
     // Proves the busy loop genuinely starves (so the death above is the watchdog).
     // No watchdog installed; the test's hard cap (1.2s) is what kills it.

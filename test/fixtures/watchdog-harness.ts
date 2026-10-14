@@ -26,9 +26,11 @@
  * first fills stderr to capacity (the test never reads it), so the pipe is
  * full when the watchdog logs: its signal must still fire. Linux only.
  *
+ *   log-target     — exit 0 iff watchdog logs use a non-blocking pipe reopen.
+ *
  * Safety net: the busy loop self-exits after 8s so a failed test kill can't hang CI.
  */
-import { installProcessWatchdog, installLoopStallWatchdog } from '../../src/core/process-watchdog.ts';
+import { installProcessWatchdog, installLoopStallWatchdog, watchdogLogTarget } from '../../src/core/process-watchdog.ts';
 
 const rawMode = process.argv[2] ?? 'starve-with';
 const fullStderr = rawMode.endsWith('-full-stderr');
@@ -44,6 +46,13 @@ if (fullStderr) {
 }
 const deadlineMs = Number(process.argv[3] ?? 300);
 const graceMs = Number(process.argv[4] ?? 150);
+
+if (mode === 'log-target') {
+  // Exit 0 only when worker logs would use a non-blocking reopen of the pipe,
+  // so no write can stay pending (and pin the worker) on a stalled reader.
+  const t = watchdogLogTarget();
+  process.exit(t.logSync && t.logFd !== 2 ? 0 : 5);
+}
 
 if (mode.startsWith('stall-')) {
   const installStall = () => installLoopStallWatchdog({
