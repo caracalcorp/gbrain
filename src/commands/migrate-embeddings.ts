@@ -406,6 +406,24 @@ function filePlaneSnapshot(
 }
 
 /**
+ * Durable provider-key sources, each as recipe env names: ~/.gbrain/.env
+ * (every gbrain process loads it), the config file, and the DB plane where
+ * the file leaves the field undefined (runtime fills only those, so an
+ * empty file value shadows a DB key). `dotenvRaw` is the file as written.
+ */
+async function durableKeySources(fileCfg: GBrainConfig | null, engine?: DbPlaneEngineReader) {
+  const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
+  const { readGbrainEnvFile } = await import('../core/gbrain-env-file.ts');
+  const { configDir } = await import('../core/config.ts');
+  const file = mergedProviderEnv(fileCfg, {});
+  const fileThenDb = { ...(fileCfg ?? {}) } as GBrainConfig;
+  if (engine) await applyDbPlaneReadSideMerge(fileThenDb, engine);
+  const db = Object.fromEntries(Object.entries(mergedProviderEnv(fileThenDb, {})).filter(([k]) => !file[k]));
+  const dotenvRaw = readGbrainEnvFile(configDir);
+  return { dotenv: mergedProviderEnv(null, dotenvRaw), dotenvRaw, file, db };
+}
+
+/**
  * Persist the target model+dims to the FILE plane and reconfigure the
  * in-process gateway. The gateway reads file/env config, not the DB plane —
  * without this the re-embed would silently run against the OLD provider.
@@ -476,15 +494,12 @@ export async function persistEmbeddingFileConfig(
     try {
       const { resolveRecipe } = await import('../core/ai/model-resolver.ts');
       const { mergedProviderEnv, PROVIDER_ENV_ALIASES } = await import('../core/ai/provider-env.ts');
-      // Durable = config file, then DB plane: the same file > DB order runtime uses.
-      const durableCfg: GBrainConfig = { ...fileCfg };
-      if (engine) await applyDbPlaneReadSideMerge(durableCfg, engine);
-      const durableKeys = mergedProviderEnv(durableCfg, {});
+      const durable = await durableKeySources(fileCfg, engine);
       // Normalized env, so provider aliases (GEMINI_API_KEY) count as the key;
       // the note names whichever variable the user actually exported.
       const envKeys = mergedProviderEnv(null, process.env);
       envOnly = (resolveRecipe(toModel).recipe.auth_env?.required ?? [])
-        .filter((k) => envKeys[k] && !durableKeys[k])
+        .filter((k) => envKeys[k] && !durable.dotenv[k] && !durable.file[k] && !durable.db[k])
         .map((k) => (process.env[k] || !PROVIDER_ENV_ALIASES[k] ? k : PROVIDER_ENV_ALIASES[k]));
     } catch { envOnly = []; }
     if (envOnly.length > 0) {
@@ -873,21 +888,20 @@ export async function runMigrateEmbeddings(
     const report = await readMigrationStatus(engine);
     const envPresence = detectEnvPresence();
     // API-key PRESENCE only — never values (Section 3). A key counts when env,
-    // the config file or the DB plane supplies it; key_sources says which.
+    // ~/.gbrain/.env, the config file or the DB plane supplies it; key_sources
+    // says which.
     const keyPresence: Record<string, boolean> = {};
     const keySources: Record<string, string | null> = {};
     let filePlane: FilePlaneSnapshot | null = null;
     let identity = { engine: 'unknown', target: 'unknown' };
     try {
       const { loadConfigFileOnly, loadConfig } = await import('../core/config.ts');
-      const { mergedProviderEnv, PROVIDER_ENV_ALIASES } = await import('../core/ai/provider-env.ts');
       const fileCfg = loadConfigFileOnly();
-      const fileKeys = mergedProviderEnv(fileCfg, {});
-      const dbOnly = {} as GBrainConfig;
-      await applyDbPlaneReadSideMerge(dbOnly, engine);
-      const dbKeys = mergedProviderEnv(dbOnly, {});
+      const src = await durableKeySources(fileCfg, engine);
       for (const k of ['VOYAGE_API_KEY', 'OPENAI_API_KEY', 'ZEROENTROPY_API_KEY', 'OPENROUTER_API_KEY']) {
-        const sources = [process.env[k] && 'env', fileKeys[k] && 'file', dbKeys[k] && 'db'].filter(Boolean);
+        // A value loadConfig copied in from ~/.gbrain/.env is not a shell export.
+        const shell = process.env[k] && process.env[k] !== src.dotenvRaw[k];
+        const sources = [shell && 'env', src.dotenv[k] && 'dotenv', src.file[k] && 'file', src.db[k] && 'db'].filter(Boolean);
         keyPresence[k] = sources.length > 0;
         keySources[k] = sources.length > 0 ? sources.join('+') : null;
       }

@@ -87,7 +87,7 @@ export const ENABLE_EMBEDDINGS_HINT =
   `enable with \`gbrain init --force --embedding-model ${NEW_INSTALL_DEFAULT_EMBEDDING_MODEL}\` on an empty brain, ` +
   `or \`gbrain migrate embeddings --to ${NEW_INSTALL_DEFAULT_EMBEDDING_MODEL} --dim ${NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS}\` once it has content ` +
   `(first store the key where every gbrain process can read it: \`${NEW_INSTALL_DEFAULT_EMBEDDING_KEY_FIELD}\` in ~/.gbrain/config.json, ` +
-  `or ${NEW_INSTALL_DEFAULT_EMBEDDING_KEY_ENV} in the environment your cron and hooks run with)`;
+  `${NEW_INSTALL_DEFAULT_EMBEDDING_KEY_ENV} in ~/.gbrain/.env, or ${NEW_INSTALL_DEFAULT_EMBEDDING_KEY_ENV} in the environment your cron and hooks run with)`;
 
 export function assertEmbeddingEnabled(cfg: { embedding_disabled?: boolean } | null): void {
   if (cfg?.embedding_disabled) {

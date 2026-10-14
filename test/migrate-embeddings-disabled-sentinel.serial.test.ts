@@ -150,6 +150,24 @@ test('persistEmbeddingFileConfig: env-only detection sees provider aliases and a
   }
 });
 
+test('persistEmbeddingFileConfig: a key kept in ~/.gbrain/.env is durable, not env-only', async () => {
+  // Value: protects=no false env-only warning for keys in ~/.gbrain/.env; fails_when=durability ignores the .env file loadConfig copies into process.env; why_new=other rows only use config.json, DB or shell env; seam=none
+  const dotenvPath = join(tmpHome, '.gbrain', '.env');
+  writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true }, null, 2));
+  writeFileSync(dotenvPath, 'VOYAGE_API_KEY=pa-dotenv\n');
+  process.env.VOYAGE_API_KEY = 'pa-dotenv'; // what loadConfig's .env loader does
+  try {
+    let envOnly: string[] = ['unset'];
+    const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('voyage:voyage-4', 1024); });
+    expect(envOnly).toEqual([]);
+    expect(err).not.toContain('embedding_disabled cleared');
+  } finally {
+    delete process.env.VOYAGE_API_KEY;
+    rmSync(dotenvPath, { force: true });
+    writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
+  }
+});
+
 test('persistEmbeddingFileConfig flags only required keys, never optional settings or stored base URLs', async () => {
   // Where an optional setting lives differs per provider (file, DB plane,
   // env-only), and most are harmless without it, so only required keys warn.
@@ -428,6 +446,47 @@ describe('stuck sentinel (model already at target)', () => {
         expect(report.key_sources.VOYAGE_API_KEY).toBe('db');
         expect(JSON.stringify(report)).not.toContain('pa-db');
       } finally {
+        await engine().unsetConfig('voyage_api_key');
+        _resetDbPlaneMergeMemoForTests();
+      }
+    }, 30000);
+
+    test('--status labels a ~/.gbrain/.env key as dotenv, not a shell export', async () => {
+      // Value: protects=--status source for .env keys; fails_when=a value loaded from ~/.gbrain/.env is reported as (env); why_new=other rows cover env/file/db only; seam=none
+      const dotenvPath = join(tmpHome, '.gbrain', '.env');
+      writeFileSync(dotenvPath, 'VOYAGE_API_KEY=pa-dotenv\n');
+      process.env.VOYAGE_API_KEY = 'pa-dotenv'; // as loaded by loadConfig
+      try {
+        const report = JSON.parse((await runMigrate(engine(), ['--status', '--json'])).out) as {
+          keys: Record<string, boolean>; key_sources: Record<string, string | null>;
+        };
+        expect(report.keys.VOYAGE_API_KEY).toBe(true);
+        expect(report.key_sources.VOYAGE_API_KEY).toBe('dotenv');
+        process.env.VOYAGE_API_KEY = 'pa-shell'; // a real export overriding the file
+        const both = JSON.parse((await runMigrate(engine(), ['--status', '--json'])).out) as {
+          key_sources: Record<string, string | null>;
+        };
+        expect(both.key_sources.VOYAGE_API_KEY).toBe('env+dotenv');
+      } finally {
+        delete process.env.VOYAGE_API_KEY;
+        rmSync(dotenvPath, { force: true });
+      }
+    }, 30000);
+
+    test('--status does not count a DB key that an empty config-file value shadows', async () => {
+      // Value: protects=--status matches runtime precedence; fails_when=a DB key is reported set although an empty file value blocks it at runtime; why_new=the DB-plane row has no file value; seam=none
+      const before = readFileSync(cfgPath(), 'utf8');
+      writeFileSync(cfgPath(), JSON.stringify({ ...JSON.parse(before), voyage_api_key: '' }, null, 2));
+      await engine().setConfig('voyage_api_key', 'pa-db');
+      _resetDbPlaneMergeMemoForTests();
+      try {
+        const report = JSON.parse((await runMigrate(engine(), ['--status', '--json'])).out) as {
+          keys: Record<string, boolean>; key_sources: Record<string, string | null>;
+        };
+        expect(report.keys.VOYAGE_API_KEY).toBe(false);
+        expect(report.key_sources.VOYAGE_API_KEY).toBeNull();
+      } finally {
+        writeFileSync(cfgPath(), before);
         await engine().unsetConfig('voyage_api_key');
         _resetDbPlaneMergeMemoForTests();
       }
