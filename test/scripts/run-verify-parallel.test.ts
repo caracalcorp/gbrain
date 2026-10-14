@@ -399,7 +399,7 @@ exit 0
     const testYml = read("test.yml");
     const verifyJob = testYml.slice(testYml.indexOf("\n  verify:\n"), testYml.indexOf("\n  verify:\n") + 4000);
     expect(verifyJob).toContain("- run: bun run verify");
-    expect(verifyJob).toMatch(/runs-on: ubicloud-standard-\d+-ubuntu/);
+    expect(verifyJob).toMatch(/runs-on: ubuntu-24\.04$/m); // caracal: runners patch
     const dry = spawnSync("bash", [SCRIPT, "--dry-list"], { encoding: "utf8" }).stdout.split("\n");
     expect(dry).toContain("typecheck");
     const pkgScripts = (JSON.parse(readFileSync("package.json", "utf8")) as { scripts: Record<string, string> }).scripts;

@@ -10,23 +10,29 @@ type Job = {
 };
 const root = join(import.meta.dir, '../..');
 const load = (name: string) => loadYaml(readFileSync(join(root, '.github/workflows', name), 'utf8')) as { jobs: Record<string, Job> };
-const normal = 'ubicloud-standard-16-ubuntu-2404';
-const heavy = 'ubicloud-standard-30-ubuntu-2404';
-const small = 'ubicloud-standard-2-ubuntu-2404';
-const report = 'ubicloud-standard-4-ubuntu-2404';
+// caracal: the fork has no Ubicloud runners, so every Ubicloud label is routed
+// to the GitHub-hosted runner of the same architecture (CARACAL-PATCHES.md, runners).
+const upstreamLabels = ['ubicloud-standard-2-ubuntu-2404', 'ubicloud-standard-4-ubuntu-2404', 'ubicloud-standard-8-ubuntu-2404',
+  'ubicloud-standard-16-ubuntu-2404', 'ubicloud-standard-30-ubuntu-2404', 'ubicloud-standard-4-arm-ubuntu-2404'];
+const routed = (label: string) =>
+  label.replace(/^ubicloud-standard-\d+-arm-ubuntu-2404$/, 'ubuntu-24.04-arm').replace(/^ubicloud-standard-\d+-ubuntu-2404$/, 'ubuntu-24.04');
+const normal = routed('ubicloud-standard-16-ubuntu-2404');
+const heavy = routed('ubicloud-standard-30-ubuntu-2404');
+const small = routed('ubicloud-standard-2-ubuntu-2404');
+const report = routed('ubicloud-standard-4-ubuntu-2404');
 const single = report;
-const pooled = 'ubicloud-standard-8-ubuntu-2404';
-const arm = 'ubicloud-standard-4-arm-ubuntu-2404';
+const pooled = routed('ubicloud-standard-8-ubuntu-2404');
+const arm = routed('ubicloud-standard-4-arm-ubuntu-2404');
 const targetRunners = (job: Job) =>
   JSON.parse(/fromJSON\('([^']+)'\)\[matrix\.target\]/.exec(job['runs-on']!)![1]!) as Record<string, string>;
 
 describe('CI runner routing', () => {
-  test('owned Linux validation jobs use Ubicloud without moving release publishing', () => {
+  test('owned Linux validation jobs use the routed runner without moving release publishing', () => {
     for (const file of ['test.yml', 'e2e.yml', 'heavy-tests.yml', 'persistence-validation.yml', 'native-locks.yml', 'actionlint.yml', 'semgrep.yml']) {
       for (const job of Object.values(load(file).jobs)) {
         const runner = job['runs-on'];
         if (!runner || runner.startsWith('${{')) continue;
-        expect(runner, file).toMatch(/^ubicloud-standard-(2|4|8|16|30)-ubuntu-2404$/);
+        expect(runner, file).toBe('ubuntu-24.04');
       }
     }
     const release = readFileSync(join(root, '.github/workflows/release.yml'), 'utf8');
@@ -110,7 +116,7 @@ describe('CI runner routing', () => {
 
   test('actionlint recognizes every configured custom label and watches its configuration', () => {
     const config = loadYaml(readFileSync(join(root, '.github/actionlint.yaml'), 'utf8')) as { 'self-hosted-runner': { labels: string[] } };
-    expect(config['self-hosted-runner'].labels.sort()).toEqual([small, report, pooled, normal, heavy, arm].sort());
+    expect(config['self-hosted-runner'].labels.sort()).toEqual([...upstreamLabels].sort());
     const workflow = loadYaml(readFileSync(join(root, '.github/workflows/actionlint.yml'), 'utf8')) as { on: Record<string, { paths: string[] }> };
     for (const event of ['push', 'pull_request']) expect(workflow.on[event].paths).toContain('.github/actionlint.yaml');
   });
