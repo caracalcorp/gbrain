@@ -174,6 +174,26 @@ test('persistEmbeddingFileConfig flags only required keys, never optional settin
   }
 });
 
+test('persistEmbeddingFileConfig: with several required keys, flags only the env-only subset', async () => {
+  // Azure requires endpoint + deployment: endpoint stored, deployment only in env.
+  writeFileSync(cfgPath(), JSON.stringify({
+    engine: 'pglite',
+    embedding_disabled: true,
+    azure_openai_endpoint: 'https://example.invalid',
+  }, null, 2));
+  process.env.AZURE_OPENAI_DEPLOYMENT = 'embed-env-only';
+  try {
+    let envOnly: string[] = [];
+    const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('azure-openai:text-embedding-3-small', 1536); });
+    expect(envOnly).toEqual(['AZURE_OPENAI_DEPLOYMENT']);
+    expect(err).toContain("embedding_disabled cleared — AZURE_OPENAI_DEPLOYMENT came only from this shell's environment");
+    expect(err).not.toContain('AZURE_OPENAI_ENDPOINT');
+  } finally {
+    delete process.env.AZURE_OPENAI_DEPLOYMENT;
+    writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
+  }
+});
+
 test('persistEmbeddingFileConfig: no warning on a brain that was never keyless', async () => {
   // Env-only keys are a normal, supported setup; only leaving keyless mode warns.
   writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite' }, null, 2));
@@ -221,6 +241,7 @@ test('assertEmbeddingEnabled points blocked users at commands that work', () => 
 });
 
 test('persistEmbeddingFileConfig clears the deferred-setup sentinel', async () => {
+  writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
   // The key is on the file plane, so leaving keyless mode is durable: no warning.
   let envOnly: string[] = ['unset'];
   const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig('voyage:voyage-4', 1024); });

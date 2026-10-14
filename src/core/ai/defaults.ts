@@ -46,6 +46,9 @@ export const DEFAULT_EMBEDDING_DIMENSIONS = 1280;
 // recommendation copy (playbook, banners, doctor fix-hints, advisor).
 export const NEW_INSTALL_DEFAULT_EMBEDDING_MODEL = 'voyage:voyage-4';
 export const NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS = 1024;
+/** The default model's API key: env var name and ~/.gbrain/config.json field. Move with the model. */
+export const NEW_INSTALL_DEFAULT_EMBEDDING_KEY_ENV = 'VOYAGE_API_KEY';
+export const NEW_INSTALL_DEFAULT_EMBEDDING_KEY_FIELD = 'voyage_api_key';
 
 /**
  * Recommended reranker replacement (v0.46.3). The runtime reranker defaults

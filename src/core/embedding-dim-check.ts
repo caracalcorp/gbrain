@@ -20,7 +20,12 @@ import { gbrainPath } from './config.ts';
 import { resolveRecipe } from './ai/model-resolver.ts';
 import type { Recipe } from './ai/types.ts';
 import { AIConfigError } from './ai/errors.ts';
-import { NEW_INSTALL_DEFAULT_EMBEDDING_MODEL, NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
+import {
+  NEW_INSTALL_DEFAULT_EMBEDDING_MODEL,
+  NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS,
+  NEW_INSTALL_DEFAULT_EMBEDDING_KEY_ENV,
+  NEW_INSTALL_DEFAULT_EMBEDDING_KEY_FIELD,
+} from './ai/defaults.ts';
 import {
   supportsVoyageOutputDimension,
   isValidVoyageOutputDim,
@@ -81,8 +86,8 @@ export class EmbeddingDisabledError extends Error {
 export const ENABLE_EMBEDDINGS_HINT =
   `enable with \`gbrain init --force --embedding-model ${NEW_INSTALL_DEFAULT_EMBEDDING_MODEL}\` on an empty brain, ` +
   `or \`gbrain migrate embeddings --to ${NEW_INSTALL_DEFAULT_EMBEDDING_MODEL} --dim ${NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS}\` once it has content ` +
-  '(first store the key where every gbrain process can read it: `voyage_api_key` in ~/.gbrain/config.json, ' +
-  'or VOYAGE_API_KEY in the environment your cron and hooks run with)';
+  `(first store the key where every gbrain process can read it: \`${NEW_INSTALL_DEFAULT_EMBEDDING_KEY_FIELD}\` in ~/.gbrain/config.json, ` +
+  `or ${NEW_INSTALL_DEFAULT_EMBEDDING_KEY_ENV} in the environment your cron and hooks run with)`;
 
 export function assertEmbeddingEnabled(cfg: { embedding_disabled?: boolean } | null): void {
   if (cfg?.embedding_disabled) {
