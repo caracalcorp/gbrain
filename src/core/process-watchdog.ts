@@ -35,7 +35,6 @@
  */
 
 import { Worker } from 'node:worker_threads';
-import { constants as fsConstants, fstatSync, openSync } from 'node:fs';
 // Zero-import teardown-budget leaf — safe edge, no cycle (it imports nothing).
 import { MAX_TIMER_DELAY_MS } from './background-work.ts';
 
@@ -111,27 +110,6 @@ function defaultWarn(msg: string): void {
 
 const INERT: WatchdogHandle = { dispose() {}, get active() { return false; } };
 
-let logTarget: { logFd: number; logSync: boolean } | undefined;
-/**
- * Where watchdog workers log so a stalled stderr reader can never block them:
- * a pipe gets one non-blocking reopen per process (a full pipe drops the
- * line; Linux /proc), a file or tty takes a direct write, and anything else
- * (sockets) keeps the async write with a capped wait. Exported for tests.
- */
-export function watchdogLogTarget(): { logFd: number; logSync: boolean } {
-  if (logTarget) return logTarget;
-  logTarget = { logFd: 2, logSync: false };
-  try {
-    const st = fstatSync(2);
-    if (st.isFIFO()) {
-      logTarget = { logFd: openSync('/proc/self/fd/2', fsConstants.O_WRONLY | fsConstants.O_NONBLOCK), logSync: true };
-    } else if (st.isFile() || st.isCharacterDevice()) {
-      logTarget = { logFd: 2, logSync: true };
-    }
-  } catch { /* keep the async fallback */ }
-  return logTarget;
-}
-
 /**
  * Worker body (runs on its own OS thread). Inline string so `eval: true` bakes
  * it into the compiled binary. Uses only built-ins available in a Bun worker.
@@ -141,28 +119,9 @@ export function watchdogLogTarget(): { logFd: number; logSync: boolean } {
  */
 const WORKER_SRC = `
 const { workerData } = require('node:worker_threads');
-const { deadlineMs, graceMs, label, heartbeatMs, logFd, logSync } = workerData;
+const { deadlineMs, graceMs, label, heartbeatMs } = workerData;
 const t0 = Date.now();
-// Logs go straight to fd 2 (Bun relays process.stderr through the starved
-// main loop). logSync targets never block (watchdogLogTarget), so the signal
-// follows at once. Otherwise: an async write, a signal capped at 100ms, and
-// info lines dropped while one write is pending.
-let inFlight = false;
-function w(m, then) {
-  if (logSync) {
-    try { require('node:fs').writeSync(logFd, '[' + label + '] ' + m + '\\n'); } catch (e) {}
-    if (then) then();
-    return;
-  }
-  if (!then && inFlight) return;
-  let done = false;
-  const go = () => { if (!done) { done = true; if (then) then(); } };
-  inFlight = true;
-  try {
-    require('node:fs').write(2, '[' + label + '] ' + m + '\\n', () => { inFlight = false; go(); });
-  } catch (e) { inFlight = false; go(); return; }
-  if (then) setTimeout(go, 100);
-}
+function w(m) { try { process.stderr.write('[' + label + '] ' + m + '\\n'); } catch (e) {} }
 if (heartbeatMs > 0) {
   const hb = setInterval(() => {
     const elapsed = Math.round((Date.now() - t0) / 1000);
@@ -172,14 +131,12 @@ if (heartbeatMs > 0) {
   if (typeof hb.unref === 'function') hb.unref();
 }
 setTimeout(() => {
-  w('deadline reached (' + Math.round(deadlineMs/1000) + 's) — sending SIGTERM for graceful shutdown', () => {
-    try { process.kill(process.pid, 'SIGTERM'); } catch (e) {}
-  });
+  w('deadline reached (' + Math.round(deadlineMs/1000) + 's) — sending SIGTERM for graceful shutdown');
+  try { process.kill(process.pid, 'SIGTERM'); } catch (e) {}
 }, deadlineMs);
 setTimeout(() => {
-  w('grace expired — sending SIGKILL (event loop was starved; this is the orphan-pileup backstop)', () => {
-    try { process.kill(process.pid, 'SIGKILL'); } catch (e) {}
-  });
+  w('grace expired — sending SIGKILL (event loop was starved; this is the orphan-pileup backstop)');
+  try { process.kill(process.pid, 'SIGKILL'); } catch (e) {}
 }, deadlineMs + graceMs);
 `;
 
@@ -205,7 +162,7 @@ export function installProcessWatchdog(opts: ProcessWatchdogOpts): WatchdogHandl
   try {
     const worker = new Worker(WORKER_SRC, {
       eval: true,
-      workerData: { deadlineMs, graceMs, label, heartbeatMs, ...watchdogLogTarget() },
+      workerData: { deadlineMs, graceMs, label, heartbeatMs },
     });
     // Don't let the watchdog keep the process alive past clean completion.
     (worker as unknown as { unref?: () => void }).unref?.();
@@ -391,31 +348,11 @@ export interface LoopStallWatchdogOpts {
  */
 const STALL_WORKER_SRC = `
 const { parentPort, workerData } = require('node:worker_threads');
-const { stallMs, graceMs, label, checkIntervalMs, logFd, logSync } = workerData;
+const { stallMs, graceMs, label, checkIntervalMs } = workerData;
 let lastPet = Date.now();
 let lastCheck = Date.now();
 let latched = false;
-let killing = false; // SIGKILL sent once; later ticks must not re-queue it
-// Logs go straight to fd 2 (Bun relays process.stderr through the starved
-// main loop). logSync targets never block (watchdogLogTarget), so the signal
-// follows at once. Otherwise: an async write, a signal capped at 100ms, and
-// info lines dropped while one write is pending.
-let inFlight = false;
-function w(m, then) {
-  if (logSync) {
-    try { require('node:fs').writeSync(logFd, '[' + label + '] ' + m + '\\n'); } catch (e) {}
-    if (then) then();
-    return;
-  }
-  if (!then && inFlight) return;
-  let done = false;
-  const go = () => { if (!done) { done = true; if (then) then(); } };
-  inFlight = true;
-  try {
-    require('node:fs').write(2, '[' + label + '] ' + m + '\\n', () => { inFlight = false; go(); });
-  } catch (e) { inFlight = false; go(); return; }
-  if (then) setTimeout(go, 100);
-}
+function w(m) { try { process.stderr.write('[' + label + '] ' + m + '\\n'); } catch (e) {} }
 if (parentPort) parentPort.on('message', () => { lastPet = Date.now(); });
 setInterval(() => {
   const now = Date.now();
@@ -429,16 +366,12 @@ setInterval(() => {
   }
   const lag = now - lastPet;
   if (lag >= stallMs + graceMs) {
-    if (killing) return;
-    killing = true;
-    w('main loop unresponsive for ' + Math.round(lag / 1000) + 's (stall ' + Math.round(stallMs / 1000) + 's + grace ' + Math.round(graceMs / 1000) + 's) — sending SIGKILL (loop starved through the grace window; orphan-lock backstop)', () => {
-      try { process.kill(process.pid, 'SIGKILL'); } catch (e) {}
-    });
+    w('main loop unresponsive for ' + Math.round(lag / 1000) + 's (stall ' + Math.round(stallMs / 1000) + 's + grace ' + Math.round(graceMs / 1000) + 's) — sending SIGKILL (loop starved through the grace window; orphan-lock backstop)');
+    try { process.kill(process.pid, 'SIGKILL'); } catch (e) {}
   } else if (lag >= stallMs && !latched) {
     latched = true;
-    w('main loop unresponsive for ' + Math.round(lag / 1000) + 's (>= ' + Math.round(stallMs / 1000) + 's stall threshold) — sending SIGTERM for graceful shutdown', () => {
-      try { process.kill(process.pid, 'SIGTERM'); } catch (e) {}
-    });
+    w('main loop unresponsive for ' + Math.round(lag / 1000) + 's (>= ' + Math.round(stallMs / 1000) + 's stall threshold) — sending SIGTERM for graceful shutdown');
+    try { process.kill(process.pid, 'SIGTERM'); } catch (e) {}
   } else if (latched && lag < stallMs) {
     // mirrors nextStallLatch: the loop recovered (pets resumed), so a later
     // re-stall is a NEW stall — re-arm the graceful SIGTERM rather than
@@ -482,7 +415,7 @@ export function installLoopStallWatchdog(opts: LoopStallWatchdogOpts): WatchdogH
   try {
     const worker = new Worker(STALL_WORKER_SRC, {
       eval: true,
-      workerData: { stallMs, graceMs, label, checkIntervalMs, ...watchdogLogTarget() },
+      workerData: { stallMs, graceMs, label, checkIntervalMs },
     });
     // Don't let the watchdog keep the process alive past clean completion.
     (worker as unknown as { unref?: () => void }).unref?.();

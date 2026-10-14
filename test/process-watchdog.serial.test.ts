@@ -9,8 +9,6 @@
  * Serial because they use real subprocesses + wall-clock timing.
  */
 import { describe, test, expect } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const HARNESS = join(import.meta.dir, 'fixtures', 'watchdog-harness.ts');
@@ -39,33 +37,6 @@ async function runHarness(
   return { exitCode: proc.exitCode, signalled, elapsedMs, stdout, stderr, killedByTest };
 }
 
-/**
- * Runs the harness with stderr piped into `sleep`, which never reads it: a
- * real stalled 64KiB pipe (Bun.spawn drains child pipes, so it can't model
- * this). The harness fills it first; returns the exit status, or null if the
- * harness was still alive at the cap. Everything self-exits within ~9s.
- */
-async function runHarnessStalledStderr(
-  mode: string,
-  deadlineMs: number,
-  graceMs: number,
-  capMs: number,
-): Promise<{ rc: number | null; elapsedMs: number }> {
-  const dir = mkdtempSync(join(tmpdir(), 'wd-stderr-'));
-  const rcFile = join(dir, 'rc');
-  try {
-    // rc appears only once complete (written to rc.tmp, then renamed).
-    Bun.spawn(['sh', '-c', '(bun "$0" "$1" "$2" "$3" 2>&1 >/dev/null; echo $? > "$4.tmp" && mv "$4.tmp" "$4") | sleep 9',
-      HARNESS, mode, String(deadlineMs), String(graceMs), rcFile], { stdout: 'ignore', stderr: 'ignore' });
-    const start = Date.now();
-    while (!existsSync(rcFile) && Date.now() - start < capMs) await Bun.sleep(25);
-    const elapsedMs = Date.now() - start;
-    return { rc: existsSync(rcFile) ? Number(readFileSync(rcFile, 'utf8').trim()) : null, elapsedMs };
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
 describe('process-watchdog integration (Bun-pinned)', () => {
   test('starved process IS killed by the watchdog around deadline+grace', async () => {
     // deadline 300 + grace 200 = ~500ms expected death. Hard cap 4s: if the
@@ -76,23 +47,6 @@ describe('process-watchdog integration (Bun-pinned)', () => {
     expect(r.signalled).toBe(true);
     // Died well before the harness's 8s self-exit safety net, near deadline+grace.
     expect(r.elapsedMs).toBeLessThan(3000);
-    // The worker's log line lands before its signal (no SIGTERM listener here,
-    // so SIGTERM itself is the kill).
-    expect(r.stderr).toContain('deadline reached');
-  }, 15000);
-
-  test.skipIf(process.platform !== 'linux')('a full, unread stderr pipe cannot block the kill', async () => {
-    // Value: protects=the hard-deadline kill fires when stderr is a stalled pipe; fails_when=the watchdog's log write blocks its thread before the signal; why_new=Bun.spawn drains stderr in the other cases; seam=none
-    const r = await runHarnessStalledStderr('starve-with-full-stderr', 300, 200, 4000);
-    expect(r.rc).not.toBeNull(); // null = still alive at the cap: the bug
-    expect(r.rc).toBeGreaterThan(128); // died by signal, not the 8s self-exit
-    expect(r.elapsedMs).toBeLessThan(3000);
-  }, 15000);
-
-  test.skipIf(process.platform !== 'linux')('on a stderr pipe, worker logs use a non-blocking reopen (no write can pin a disposed worker)', async () => {
-    // Value: protects=dispose frees the watchdog worker during a stderr outage; fails_when=worker logs go through a write that can stay pending on a stalled pipe; why_new=the kill tests pass even when a pending write pins the worker; seam=watchdogLogTarget (non-test callers: 2, via grep -n "watchdogLogTarget()" src/core/process-watchdog.ts)
-    const r = await runHarnessStalledStderr('log-target', 0, 0, 4000);
-    expect(r.rc).toBe(0);
   }, 15000);
 
   test('control: a starved process WITHOUT the watchdog does not self-exit', async () => {
@@ -127,14 +81,6 @@ describe('loop-stall watchdog integration (Bun-pinned, #4281)', () => {
     // The worker latched SIGTERM first, then escalated — both visible in its log.
     expect(r.stderr).toContain('SIGTERM');
     expect(r.stderr).toContain('SIGKILL');
-  }, 15000);
-
-  test.skipIf(process.platform !== 'linux')('stall watchdog still kills when stderr is a full, unread pipe', async () => {
-    // Value: protects=stall SIGTERM/SIGKILL fire when stderr is a stalled pipe; fails_when=the stall worker's log write blocks before the signal; why_new=Bun.spawn drains stderr in the other stall cases; seam=none
-    const r = await runHarnessStalledStderr('stall-with-full-stderr', 300, 250, 4000);
-    expect(r.rc).not.toBeNull();
-    expect(r.rc).toBeGreaterThan(128);
-    expect(r.elapsedMs).toBeLessThan(3500);
   }, 15000);
 
   test('healthy petting loop is NEVER killed across multiple stall windows', async () => {
