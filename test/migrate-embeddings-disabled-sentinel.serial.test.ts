@@ -127,9 +127,9 @@ test('persistEmbeddingFileConfig warns when the target key lives only in this pr
 });
 
 test('persistEmbeddingFileConfig: env-only detection sees provider aliases and any --to casing', async () => {
-  // Value: protects=the env-only warning for GEMINI_API_KEY and mixed-case --to; fails_when=the check reads raw env names or splits the provider by hand; why_new=other rows use canonical names and lowercase ids; seam=none
+  // Value: protects=the env-only warning for GEMINI_API_KEY (named as exported) and mixed-case --to; fails_when=the check reads raw env names, reports the canonical name, or splits the provider by hand; why_new=other rows use canonical names and lowercase ids; seam=none
   const rows: Array<{ name: string; env: Record<string, string>; target: [string, number]; key: string }> = [
-    { name: 'google via the GEMINI_API_KEY alias', env: { GEMINI_API_KEY: 'g-env-only' }, target: ['google:gemini-embedding-001', 768], key: 'GOOGLE_GENERATIVE_AI_API_KEY' },
+    { name: 'google via the GEMINI_API_KEY alias', env: { GEMINI_API_KEY: 'g-env-only' }, target: ['google:gemini-embedding-001', 768], key: 'GEMINI_API_KEY' },
     { name: 'mixed-case provider prefix', env: { VOYAGE_API_KEY: 'pa-env-only' }, target: ['Voyage:voyage-4', 1024], key: 'VOYAGE_API_KEY' },
   ];
   try {
@@ -171,6 +171,12 @@ test('persistEmbeddingFileConfig flags only required keys, never optional settin
       cfg: { voyage_api_key: 'pa-file' },
       env: { VOYAGE_API_KEY: 'pa-env' },
       target: ['voyage:voyage-4', 1024],
+    },
+    {
+      name: 'google: GEMINI_API_KEY alias exported, google_api_key stored',
+      cfg: { google_api_key: 'g-file' },
+      env: { GEMINI_API_KEY: 'g-env' },
+      target: ['google:gemini-embedding-001', 768],
     },
     {
       name: 'ollama: no required keys, base URL in env and provider_base_urls',

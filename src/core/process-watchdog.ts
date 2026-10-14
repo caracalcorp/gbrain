@@ -123,11 +123,17 @@ const { deadlineMs, graceMs, label, heartbeatMs } = workerData;
 const t0 = Date.now();
 // Async fd-2 write: lands even when the main loop is starved (Bun relays
 // process.stderr through it), and never blocks this thread on a stalled
-// stderr reader. A signal waits for the write, capped at 100ms.
+// stderr reader. A signal waits for the write, capped at 100ms. Info lines
+// are dropped while a write is pending, so a stalled pipe holds one write.
+let inFlight = false;
 function w(m, then) {
+  if (!then && inFlight) return;
   let done = false;
   const go = () => { if (!done) { done = true; if (then) then(); } };
-  try { require('node:fs').write(2, '[' + label + '] ' + m + '\\n', go); } catch (e) { go(); return; }
+  inFlight = true;
+  try {
+    require('node:fs').write(2, '[' + label + '] ' + m + '\\n', () => { inFlight = false; go(); });
+  } catch (e) { inFlight = false; go(); return; }
   if (then) setTimeout(go, 100);
 }
 if (heartbeatMs > 0) {
@@ -362,13 +368,20 @@ const { stallMs, graceMs, label, checkIntervalMs } = workerData;
 let lastPet = Date.now();
 let lastCheck = Date.now();
 let latched = false;
+let killing = false; // SIGKILL sent once; later ticks must not re-queue it
 // Async fd-2 write: lands even when the main loop is starved (Bun relays
 // process.stderr through it), and never blocks this thread on a stalled
-// stderr reader. A signal waits for the write, capped at 100ms.
+// stderr reader. A signal waits for the write, capped at 100ms. Info lines
+// are dropped while a write is pending, so a stalled pipe holds one write.
+let inFlight = false;
 function w(m, then) {
+  if (!then && inFlight) return;
   let done = false;
   const go = () => { if (!done) { done = true; if (then) then(); } };
-  try { require('node:fs').write(2, '[' + label + '] ' + m + '\\n', go); } catch (e) { go(); return; }
+  inFlight = true;
+  try {
+    require('node:fs').write(2, '[' + label + '] ' + m + '\\n', () => { inFlight = false; go(); });
+  } catch (e) { inFlight = false; go(); return; }
   if (then) setTimeout(go, 100);
 }
 if (parentPort) parentPort.on('message', () => { lastPet = Date.now(); });
@@ -384,6 +397,8 @@ setInterval(() => {
   }
   const lag = now - lastPet;
   if (lag >= stallMs + graceMs) {
+    if (killing) return;
+    killing = true;
     w('main loop unresponsive for ' + Math.round(lag / 1000) + 's (stall ' + Math.round(stallMs / 1000) + 's + grace ' + Math.round(graceMs / 1000) + 's) — sending SIGKILL (loop starved through the grace window; orphan-lock backstop)', () => {
       try { process.kill(process.pid, 'SIGKILL'); } catch (e) {}
     });

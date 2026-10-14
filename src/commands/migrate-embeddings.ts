@@ -475,15 +475,17 @@ export async function persistEmbeddingFileConfig(
     // only: the save above already happened, so a failure here never fails it.
     try {
       const { resolveRecipe } = await import('../core/ai/model-resolver.ts');
-      const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
+      const { mergedProviderEnv, PROVIDER_ENV_ALIASES } = await import('../core/ai/provider-env.ts');
       // Durable = config file, then DB plane: the same file > DB order runtime uses.
       const durableCfg: GBrainConfig = { ...fileCfg };
       if (engine) await applyDbPlaneReadSideMerge(durableCfg, engine);
       const durableKeys = mergedProviderEnv(durableCfg, {});
-      // Normalized env, so provider aliases (GEMINI_API_KEY) count as the key.
+      // Normalized env, so provider aliases (GEMINI_API_KEY) count as the key;
+      // the note names whichever variable the user actually exported.
       const envKeys = mergedProviderEnv(null, process.env);
       envOnly = (resolveRecipe(toModel).recipe.auth_env?.required ?? [])
-        .filter((k) => envKeys[k] && !durableKeys[k]);
+        .filter((k) => envKeys[k] && !durableKeys[k])
+        .map((k) => (process.env[k] || !PROVIDER_ENV_ALIASES[k] ? k : PROVIDER_ENV_ALIASES[k]));
     } catch { envOnly = []; }
     if (envOnly.length > 0) {
       serr(`  [migrate] embedding_disabled cleared — ${envOnly.join(', ')} came only from this shell's environment; make it available to every gbrain process (cron, hooks) or later embeds will fail.`);
@@ -878,7 +880,7 @@ export async function runMigrateEmbeddings(
     let identity = { engine: 'unknown', target: 'unknown' };
     try {
       const { loadConfigFileOnly, loadConfig } = await import('../core/config.ts');
-      const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
+      const { mergedProviderEnv, PROVIDER_ENV_ALIASES } = await import('../core/ai/provider-env.ts');
       const fileCfg = loadConfigFileOnly();
       const fileKeys = mergedProviderEnv(fileCfg, {});
       const dbOnly = {} as GBrainConfig;

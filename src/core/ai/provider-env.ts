@@ -28,6 +28,11 @@
 
 import type { GBrainConfig } from '../config.ts';
 
+/** Canonical recipe env name → the alias a user may export instead. */
+export const PROVIDER_ENV_ALIASES: Readonly<Record<string, string>> = {
+  GOOGLE_GENERATIVE_AI_API_KEY: 'GEMINI_API_KEY',
+};
+
 export function mergedProviderEnv(
   cfg: GBrainConfig | null,
   env: Record<string, string | undefined> = process.env,
@@ -58,8 +63,8 @@ export function mergedProviderEnv(
     Object.entries(env).filter(([, v]) => v !== undefined && v !== ''),
   ) as Record<string, string>;
   const merged = { ...fromConfig, ...envReal };
-  if (!envReal.GOOGLE_GENERATIVE_AI_API_KEY && envReal.GEMINI_API_KEY) {
-    merged.GOOGLE_GENERATIVE_AI_API_KEY = envReal.GEMINI_API_KEY;
+  for (const [canonical, alias] of Object.entries(PROVIDER_ENV_ALIASES)) {
+    if (!envReal[canonical] && envReal[alias]) merged[canonical] = envReal[alias];
   }
   return merged;
 }

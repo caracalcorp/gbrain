@@ -23,8 +23,8 @@
  *                    stall+grace. A disposed watchdog must never kill.
  *
  * A `-full-stderr` suffix (starve-with-full-stderr, stall-with-full-stderr)
- * first fills stderr (64KiB), which the test never reads until exit, so the
- * pipe is full when the watchdog logs: its signal must still fire.
+ * first fills stderr to capacity (the test never reads it), so the pipe is
+ * full when the watchdog logs: its signal must still fire. Linux only.
  *
  * Safety net: the busy loop self-exits after 8s so a failed test kill can't hang CI.
  */
@@ -34,9 +34,13 @@ const rawMode = process.argv[2] ?? 'starve-with';
 const fullStderr = rawMode.endsWith('-full-stderr');
 const mode = rawMode.replace(/-full-stderr$/, '');
 if (fullStderr) {
-  // Exactly fill a default 64KiB Linux pipe; the next blocking write would hang.
-  const { writeSync } = await import('node:fs');
-  writeSync(2, 'x'.repeat(65536));
+  // Fill the pipe to its real capacity through a non-blocking reopen of fd 2
+  // (Linux /proc); fd 2 itself stays blocking, so the next write to it hangs.
+  const { openSync, writeSync, closeSync, constants } = await import('node:fs');
+  const fd = openSync('/proc/self/fd/2', constants.O_WRONLY | constants.O_NONBLOCK);
+  const chunk = Buffer.alloc(4096, 120);
+  try { for (;;) writeSync(fd, chunk); } catch { /* EAGAIN: full */ }
+  closeSync(fd);
 }
 const deadlineMs = Number(process.argv[3] ?? 300);
 const graceMs = Number(process.argv[4] ?? 150);
