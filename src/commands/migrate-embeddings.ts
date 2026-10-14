@@ -471,15 +471,20 @@ export async function persistEmbeddingFileConfig(
     // Leaving keyless mode is durable, so the provider key must be too: a
     // required key this run took only from the shell would make every later
     // embed (cron, hooks) fail where keyless mode exited quietly. Where to
-    // store it differs per provider, so the advice stays generic.
-    const { getRecipe } = await import('../core/ai/recipes/index.ts');
-    const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
-    // Durable = config file, then DB plane: the same file > DB order runtime uses.
-    const durableCfg: GBrainConfig = { ...fileCfg };
-    if (engine) await applyDbPlaneReadSideMerge(durableCfg, engine);
-    const durableKeys = mergedProviderEnv(durableCfg, {});
-    envOnly = (getRecipe(toModel.split(':')[0])?.auth_env?.required ?? [])
-      .filter((k) => process.env[k] && !durableKeys[k]);
+    // store it differs per provider, so the advice stays generic. Advisory
+    // only: the save above already happened, so a failure here never fails it.
+    try {
+      const { resolveRecipe } = await import('../core/ai/model-resolver.ts');
+      const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
+      // Durable = config file, then DB plane: the same file > DB order runtime uses.
+      const durableCfg: GBrainConfig = { ...fileCfg };
+      if (engine) await applyDbPlaneReadSideMerge(durableCfg, engine);
+      const durableKeys = mergedProviderEnv(durableCfg, {});
+      // Normalized env, so provider aliases (GEMINI_API_KEY) count as the key.
+      const envKeys = mergedProviderEnv(null, process.env);
+      envOnly = (resolveRecipe(toModel).recipe.auth_env?.required ?? [])
+        .filter((k) => envKeys[k] && !durableKeys[k]);
+    } catch { envOnly = []; }
     if (envOnly.length > 0) {
       serr(`  [migrate] embedding_disabled cleared — ${envOnly.join(', ')} came only from this shell's environment; make it available to every gbrain process (cron, hooks) or later embeds will fail.`);
     }

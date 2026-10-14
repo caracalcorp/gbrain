@@ -69,11 +69,11 @@ async function runMigrate(engine: PGLiteEngine, args: string[]): Promise<{ code:
 beforeAll(() => {
   // Every auth var (required + optional) of the recipes used here, so the
   // env-only checks never see a developer's exported OPENAI_ORG_ID et al.
-  const recipeAuthVars = ['openai', 'voyage', 'azure-openai', 'ollama'].flatMap((id) => {
+  const recipeAuthVars = ['openai', 'voyage', 'azure-openai', 'ollama', 'google'].flatMap((id) => {
     const auth = getRecipe(id)?.auth_env;
     return [...(auth?.required ?? []), ...(auth?.optional ?? [])];
   });
-  for (const k of ['GBRAIN_HOME', 'GBRAIN_EMBEDDING_MODEL', 'GBRAIN_EMBEDDING_DIMENSIONS', 'DATABASE_URL', 'ZEROENTROPY_API_KEY', ...recipeAuthVars]) {
+  for (const k of ['GBRAIN_HOME', 'GBRAIN_EMBEDDING_MODEL', 'GBRAIN_EMBEDDING_DIMENSIONS', 'DATABASE_URL', 'ZEROENTROPY_API_KEY', 'GEMINI_API_KEY', ...recipeAuthVars]) {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }
@@ -122,6 +122,30 @@ test('persistEmbeddingFileConfig warns when the target key lives only in this pr
   } finally {
     delete process.env.VOYAGE_API_KEY;
     // Restore the shared seed for the next test, pass or fail.
+    writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
+  }
+});
+
+test('persistEmbeddingFileConfig: env-only detection sees provider aliases and any --to casing', async () => {
+  // Value: protects=the env-only warning for GEMINI_API_KEY and mixed-case --to; fails_when=the check reads raw env names or splits the provider by hand; why_new=other rows use canonical names and lowercase ids; seam=none
+  const rows: Array<{ name: string; env: Record<string, string>; target: [string, number]; key: string }> = [
+    { name: 'google via the GEMINI_API_KEY alias', env: { GEMINI_API_KEY: 'g-env-only' }, target: ['google:gemini-embedding-001', 768], key: 'GOOGLE_GENERATIVE_AI_API_KEY' },
+    { name: 'mixed-case provider prefix', env: { VOYAGE_API_KEY: 'pa-env-only' }, target: ['Voyage:voyage-4', 1024], key: 'VOYAGE_API_KEY' },
+  ];
+  try {
+    for (const row of rows) {
+      writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true }, null, 2));
+      Object.assign(process.env, row.env);
+      try {
+        let envOnly: string[] = [];
+        const err = await captureStderr(async () => { envOnly = await persistEmbeddingFileConfig(...row.target); });
+        expect(envOnly, row.name).toEqual([row.key]);
+        expect(err, row.name).toContain('embedding_disabled cleared');
+      } finally {
+        for (const k of Object.keys(row.env)) delete process.env[k];
+      }
+    }
+  } finally {
     writeFileSync(cfgPath(), JSON.stringify({ engine: 'pglite', embedding_disabled: true, voyage_api_key: 'pa-test-fake' }, null, 2));
   }
 });
