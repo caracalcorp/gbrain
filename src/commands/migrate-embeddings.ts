@@ -409,7 +409,8 @@ function filePlaneSnapshot(
  * Durable provider-key sources, each as recipe env names: ~/.gbrain/.env
  * (every gbrain process loads it), the config file, and the DB plane where
  * the file leaves the field undefined (runtime fills only those, so an
- * empty file value shadows a DB key). `dotenvRaw` is the file as written.
+ * empty file value shadows a DB key). `dotenvRaw` is the file as written;
+ * `dotenv` drops keys an empty export shadows.
  */
 async function durableKeySources(fileCfg: GBrainConfig | null, engine?: DbPlaneEngineReader) {
   const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
@@ -420,7 +421,10 @@ async function durableKeySources(fileCfg: GBrainConfig | null, engine?: DbPlaneE
   if (engine) await applyDbPlaneReadSideMerge(fileThenDb, engine);
   const db = Object.fromEntries(Object.entries(mergedProviderEnv(fileThenDb, {})).filter(([k]) => !file[k]));
   const dotenvRaw = readGbrainEnvFile(configDir);
-  return { dotenv: mergedProviderEnv(null, dotenvRaw), dotenvRaw, file, db };
+  // The loader never overrides a set variable, even an empty one, and runtime
+  // drops empty values: an empty export hides the .env key from every process.
+  const dotenvLive = Object.fromEntries(Object.entries(dotenvRaw).filter(([k]) => process.env[k] !== ''));
+  return { dotenv: mergedProviderEnv(null, dotenvLive), dotenvRaw, file, db };
 }
 
 /**

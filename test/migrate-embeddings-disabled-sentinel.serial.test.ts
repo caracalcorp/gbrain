@@ -473,6 +473,23 @@ describe('stuck sentinel (model already at target)', () => {
       }
     }, 30000);
 
+    test('--status does not count a ~/.gbrain/.env key that an empty export shadows', async () => {
+      // Value: protects=--status matches what the loader can deliver; fails_when=a .env key hidden by an empty exported variable is reported as dotenv; why_new=the dotenv row has the variable unset or equal; seam=none
+      const dotenvPath = join(tmpHome, '.gbrain', '.env');
+      writeFileSync(dotenvPath, 'VOYAGE_API_KEY=pa-dotenv\n');
+      process.env.VOYAGE_API_KEY = ''; // a launcher's empty export blocks the loader
+      try {
+        const report = JSON.parse((await runMigrate(engine(), ['--status', '--json'])).out) as {
+          keys: Record<string, boolean>; key_sources: Record<string, string | null>;
+        };
+        expect(report.keys.VOYAGE_API_KEY).toBe(false);
+        expect(report.key_sources.VOYAGE_API_KEY).toBeNull();
+      } finally {
+        delete process.env.VOYAGE_API_KEY;
+        rmSync(dotenvPath, { force: true });
+      }
+    }, 30000);
+
     test('--status does not count a DB key that an empty config-file value shadows', async () => {
       // Value: protects=--status matches runtime precedence; fails_when=a DB key is reported set although an empty file value blocks it at runtime; why_new=the DB-plane row has no file value; seam=none
       const before = readFileSync(cfgPath(), 'utf8');

@@ -49,8 +49,8 @@ export function readGbrainEnvFile(resolveDir: () => string): Record<string, stri
         const hash = value.indexOf(' #');
         if (hash !== -1) value = value.slice(0, hash).trim();
       }
-      // Empty values never land.
-      if (value) out[key] = value;
+      // Empty values never land; the first assignment of a key wins.
+      if (value && !(key in out)) out[key] = value;
     }
   } catch {
     // The file is optional — missing, unreadable, or an invalid home dir
