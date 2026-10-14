@@ -150,13 +150,17 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
  */
 function processStartMs(pid: number): number | null {
   try {
+    // `lstart` is printed in ps's local time with no zone; pin ps to UTC and
+    // parse as UTC so a process TZ that differs from the system's (bun test
+    // forces UTC) can't skew the start time by the offset.
     const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf8',
       timeout: 2000,
       stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, TZ: 'UTC' },
     }).trim();
     if (!out) return null;
-    const t = Date.parse(out);
+    const t = Date.parse(`${out} UTC`);
     return Number.isNaN(t) ? null : t;
   } catch {
     return null;
