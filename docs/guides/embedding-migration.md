@@ -32,6 +32,22 @@ onto a dying API would strand the brain). Self-hosting a wire-compatible
 endpoint behind a `provider_base_urls` override? `--force-sunset-target` is
 the explicit escape hatch.
 
+## Leaving keyless mode
+
+A brain created with `gbrain init --no-embedding` (or keyless) carries
+`embedding_disabled: true`, which makes every embed callsite refuse. Once the
+brain has content, `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024`
+is the way out: it embeds the backlog and clears the flag. `gbrain migrate
+embeddings --status` and the dry-run plan flag a brain stuck behind the flag
+(`embedding_disabled set: a successful migrate clears it`). Keep the provider
+key where every `gbrain` process can read it (the `voyage_api_key` field in
+`~/.gbrain/config.json`, `VOYAGE_API_KEY` in `~/.gbrain/.env`, or
+`VOYAGE_API_KEY` in the environment cron and hooks run with); the migration
+warns when it only found the key in its own shell environment.
+
+**Say to your agent:** *"turn on embeddings for my brain"* — your agent runs
+`gbrain migrate embeddings --to voyage:voyage-4 --dim 1024`.
+
 ## Recommended targets
 
 - **`voyage:voyage-4 --dim 1024`** (the new-install default). One
@@ -224,7 +240,9 @@ failed reranker probe keeps the previous config and is reported as
 ## Status (read-only, spend-free)
 
 `gbrain migrate embeddings --status [--json]` reports every config plane (env
-presence, file, DB — API keys as presence booleans only), actual column
+presence, file, DB — API keys as presence only, with which source supplies
+each: `env`, `dotenv` for `~/.gbrain/.env`, `file`, `db`; never values), a
+still-set `embedding_disabled` sentinel, actual column
 widths (including `facts` / `query_cache`), NULL and chunkless censuses, the
 page-signature census, the in-flight marker with the exact resume command,
 and the last completion record including its smoke-check outcome. It is the

@@ -21,6 +21,12 @@ import { resolveRecipe } from './ai/model-resolver.ts';
 import type { Recipe } from './ai/types.ts';
 import { AIConfigError } from './ai/errors.ts';
 import {
+  NEW_INSTALL_DEFAULT_EMBEDDING_MODEL,
+  NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS,
+  NEW_INSTALL_DEFAULT_EMBEDDING_KEY_ENV,
+  NEW_INSTALL_DEFAULT_EMBEDDING_KEY_FIELD,
+} from './ai/defaults.ts';
+import {
   supportsVoyageOutputDimension,
   isValidVoyageOutputDim,
   VOYAGE_VALID_OUTPUT_DIMS,
@@ -71,14 +77,23 @@ export class EmbeddingDisabledError extends Error {
   }
 }
 
+/**
+ * How to leave deferred-setup (keyless) mode: re-init an empty brain, or
+ * `migrate embeddings` once it has content (which also clears
+ * `embedding_disabled`). `config set embedding_model` is refused by design.
+ * Shared by every surface that meets the sentinel so the advice can't drift.
+ */
+export const ENABLE_EMBEDDINGS_HINT =
+  `enable with \`gbrain init --force --embedding-model ${NEW_INSTALL_DEFAULT_EMBEDDING_MODEL}\` on an empty brain, ` +
+  `or \`gbrain migrate embeddings --to ${NEW_INSTALL_DEFAULT_EMBEDDING_MODEL} --dim ${NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS}\` once it has content ` +
+  `(first store the key where every gbrain process can read it: \`${NEW_INSTALL_DEFAULT_EMBEDDING_KEY_FIELD}\` in ~/.gbrain/config.json, ` +
+  `${NEW_INSTALL_DEFAULT_EMBEDDING_KEY_ENV} in ~/.gbrain/.env, or ${NEW_INSTALL_DEFAULT_EMBEDDING_KEY_ENV} in the environment your cron and hooks run with)`;
+
 export function assertEmbeddingEnabled(cfg: { embedding_disabled?: boolean } | null): void {
   if (cfg?.embedding_disabled) {
     throw new EmbeddingDisabledError(
       'This brain was initialized with `--no-embedding` (deferred setup).\n' +
-      'Configure an embedding provider before running embed / import:\n' +
-      '  gbrain config set embedding_model <provider>:<model>\n' +
-      '  gbrain config set embedding_dimensions <N>\n' +
-      '  gbrain init --force --embedding-model <provider>:<model>   # re-init to size schema\n',
+      `To run embed / import, ${ENABLE_EMBEDDINGS_HINT}.\n`,
     );
   }
 }

@@ -303,7 +303,7 @@ describe('v0.37 T12 — D9 --no-embedding deferred-setup mode', () => {
     expect(cfg.embedding_model).toBeUndefined();
   }, 120000);
 
-  test('gbrain import refuses with config-set hint after --no-embedding init', async () => {
+  test('gbrain import refuses with the two-path enable hint after --no-embedding init', async () => {
     // Seed a markdown file to import.
     const repoDir = join(tmpHome, 'sample-repo');
     mkdirSync(repoDir, { recursive: true });
@@ -314,7 +314,10 @@ describe('v0.37 T12 — D9 --no-embedding deferred-setup mode', () => {
       env: {},
     });
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toMatch(/deferred setup|no-embedding|gbrain config set embedding_model/);
+    expect(r.stderr).toMatch(/deferred setup|no-embedding/);
+    // Points at commands that work; `config set embedding_model` is refused by design.
+    expect(r.stderr).toContain('gbrain migrate embeddings --to');
+    expect(r.stderr).not.toContain('config set embedding_model');
   }, 120000);
 
   test('gbrain import --no-embed flag bypasses the refusal (chunks land without vectors)', async () => {

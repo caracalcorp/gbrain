@@ -19,16 +19,18 @@ import { join } from 'path';
 const ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/;
 
 /**
- * Parse `<dir>/.env` and fill process.env with its assignments.
+ * Parse `<dir>/.env` into its non-empty assignments without touching
+ * process.env. Missing, unreadable, or an invalid home dir yields `{}`.
  *
  * `resolveDir` is a thunk (not a precomputed string) so an invalid
  * GBRAIN_HOME — configDir() throws on relative or `..` paths — stays inside
  * this function's catch instead of turning loadConfig into a throw site.
  */
-export function loadGbrainEnvFile(resolveDir: () => string): void {
+export function readGbrainEnvFile(resolveDir: () => string): Record<string, string> {
+  const out: Record<string, string> = {};
   try {
     const envPath = join(resolveDir(), '.env');
-    if (!existsSync(envPath)) return;
+    if (!existsSync(envPath)) return out;
     const raw = readFileSync(envPath, 'utf-8');
     for (const rawLine of raw.split('\n')) {
       const line = rawLine.trim();
@@ -47,11 +49,19 @@ export function loadGbrainEnvFile(resolveDir: () => string): void {
         const hash = value.indexOf(' #');
         if (hash !== -1) value = value.slice(0, hash).trim();
       }
-      // Shell-exported env always wins; empty values never land.
-      if (value && !(key in process.env)) process.env[key] = value;
+      // Empty values never land; the first assignment of a key wins.
+      if (value && !(key in out)) out[key] = value;
     }
   } catch {
     // The file is optional — missing, unreadable, or an invalid home dir
     // must not break config loading.
+  }
+  return out;
+}
+
+/** Fill process.env from `<dir>/.env`; a shell-exported variable always wins. */
+export function loadGbrainEnvFile(resolveDir: () => string): void {
+  for (const [key, value] of Object.entries(readGbrainEnvFile(resolveDir))) {
+    if (!(key in process.env)) process.env[key] = value;
   }
 }

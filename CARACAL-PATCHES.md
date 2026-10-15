@@ -1,6 +1,6 @@
 # Caracal patches
 
-**Three, as of `0.47.9.0+caracal.3`.** Everything else below is either a version
+**Six, as of `0.47.9.0+caracal.4`.** Everything else below is either a version
 string or a file GENERATED from one — see *Patches* for the hand-written changes.
 
 Source-identical to upstream v0.47.9.0 (commit
@@ -33,6 +33,9 @@ against VERSION, so bumping one alone fails the build job and publishes nothing.
 | 1 | `probeProcessLiveness(version)` + `GET /livez` — a DB-free liveness route, additive, `/health` untouched | ACA's `tcpSocket` liveness probe cannot see a wedged event loop (W18); the DB-aware `/health` cannot be the liveness target without dying on every Postgres blip (W17). Splitting the two questions needs an endpoint upstream doesn't have | **not yet opened** — opening the PR against `garrytan/gbrain` is an operator call (`caracalcorp/it` TODOS.md W18 step 1), not automated by this release | `src/commands/serve-http.ts`, `test/serve-http-health.test.ts` |
 | 2 | Widen the `+build` metadata rejection at FOUR independent sites (TODOS.md W9 named two; the other two were found by actually running CI on this release and reading the failures, not by assuming a fix worked): `semver.ts`'s `VERSION_RE`/`parseSemver`, `check-bootstrap-tag.sh`'s stamp-extraction class, `thin-client-upgrade-prompt.ts`'s `isValidSemverLike` (feeds `doctor-remote.ts`'s `runUpgradeDriftCheck`), and `skillpack/manifest-v1.ts`'s `SEMVER_RE` (gates `gbrain_min_version` in every skillpack/brain-resident-pack manifest) all now strip-and-validate or otherwise accept a `+identifier[.identifier]*` suffix per the semver spec (build metadata never affects precedence) before parsing/matching the numeric core | **The plausible-upstream case, unlike patch #1.** `+build` is valid semver and upstream's own regexes/validators are simply too narrow — a spec-compliance fix with no ACA/Caracal-specific shape. Confirmed each site by reading its own call chain rather than trusting a job-name match: `pendingUpgradeVersion(VERSION, now)` → `isNewerVersion` → `parseSemver(VERSION)` returned null, silently killing the self-upgrade marker; `runUpgradeDriftCheck` → `safeCompare`/`driftLevel` → `isValidSemverLike(VERSION)` returned false via a SECOND independent digit-only validator, failing 4 tests in `test/doctor-remote.serial.test.ts` and keeping `serial-tests` red after the first two sites were already widened; `loadSkillpackManifest`/`lintBrainPackTools`/`getResidentSkillDetail` all throw `SkillpackManifestError: gbrain_min_version must be semver shape... got "0.47.9.0+caracal.3"` via a THIRD independent validator, failing `test/skillpack-init-brain-pack.test.ts` and `test/skillpack-brain-resident-locate.test.ts` (shards `test (4)`/`test (9)`) — this one was documented as "still open, verify at first boot" through two prior releases before CI proved it live-breaking, not hypothetical | **not yet opened** — same operator-call reasoning as patch #1 | `src/core/semver.ts`, `scripts/check-bootstrap-tag.sh`, `src/core/thin-client-upgrade-prompt.ts`, `src/core/skillpack/manifest-v1.ts` |
 | 3 | `scripts/module-size-limits.tsv`: raise `src/commands/serve-http.ts`'s ratchet ceiling 3343 → 3379 | The guard is doing its job, not a bug: patch #1's `/livez` route added exactly 36 lines, and the ratchet freezes each oversized file at a committed ceiling specifically so growth needs a reviewer-visible TSV edit (`scripts/check-module-size.sh`'s own header). This was ALREADY the state at `+caracal.2` — `verify` was red there too, for this AND the `check:bootstrap-tag` cause, but the `+caracal.2` release only checked the E2E job's actual assertions and trusted `verify`'s job-name match without diffing its own failure list, so this cause went unrecorded for one release | N/A — a repo-dev-tooling ceiling, not application behavior; nothing to upstream | `scripts/module-size-limits.tsv` |
+| 4 | `gbrain migrate embeddings` leaves keyless (deferred-setup) mode: a successful migrate clears the `embedding_disabled` sentinel a keyless `gbrain init` wrote to `~/.gbrain/config.json`, `verify` treats a still-set sentinel as not done, `--status` names it and reports each provider key's source (`env`, `dotenv`, `file`, `db`, by runtime precedence), and leaving keyless mode warns (and returns `env_only_keys`) when a required key came only from this shell. `~/.gbrain/.env`, `config.json` and the DB plane count as durable; aliases such as `GEMINI_API_KEY` are named as exported. Every keyless surface (`embed`, `import`, both `init --no-embedding` banners, advisor) now gives one shared hint, `ENABLE_EMBEDDINGS_HINT`, instead of the refused `config set embedding_model`. `readGbrainEnvFile` is split out of the `.env` loader (first assignment still wins) | Found configuring this deployment: a keyless-init brain migrated to `voyage:voyage-4` embedded nothing, because every embed callsite refuses while the sentinel is set and nothing ever cleared it; the refusal message pointed at a command that is itself refused. The env-only warning exists because clearing the sentinel is durable while a shell-only key is not, so cron and hooks would start failing where keyless mode exited quietly | **not yet opened** — a plain upstream bug with no Caracal-specific shape; same operator-call reasoning as patch #1 | `src/commands/migrate-embeddings.ts`, `src/core/embedding-migration.ts`, `src/core/embedding-dim-check.ts`, `src/core/ai/defaults.ts`, `src/core/ai/provider-env.ts`, `src/core/gbrain-env-file.ts`, `src/commands/embed.ts`, `src/commands/init.ts`, `src/core/advisor/collect-setup-smells.ts`, `src/core/config.ts` (comment), `test/migrate-embeddings-disabled-sentinel.serial.test.ts`, `test/config-gbrain-env-file.test.ts`, `test/advisor-core.test.ts`, `test/e2e/init-fresh-pglite.test.ts`, `README.md`, `docs/guides/embedding-migration.md`, `docs/integrations/embedding-providers.md`, `docs/operations/headless-install.md`, `docs/architecture/KEY_FILES.md` (current-state entries for this row's files and row 5's), `llms-full.txt` (regenerated), `src/core/cli-flag-registry.generated.ts` (regenerated: `bun run build:flag-registry`; the new `model-resolver.ts` import also brings that file's doc-comment mention of `--judge-model` into `migrate`/`retrieval-upgrade`'s accepted flags, where it is a no-op) |
+| 5 | `processStartMs` in `src/core/minions/worker-registry.ts` runs `ps -o lstart=` with `TZ=UTC LC_ALL=C` and parses the output as UTC | `ps` prints the start time in local time with no zone; any process whose TZ differs from the system's (bun test forces UTC) skewed it by the offset, so the PID-reuse guard dropped live workers. A localized `ps` made it unparseable | **not yet opened** — upstream bug; same operator-call reasoning as patch #1 | `src/core/minions/worker-registry.ts` |
+| 6 | `test/ai/sunset-warn.test.ts` pins the existing sunset clock seam to a date before the ZeroEntropy sunset | Upstream test rot (see *Known-red checks*): the fixture's hard-coded 2026-09-04 sunset has passed in wall-clock time. Test-only | **not yet opened** — trivially upstreamable | `test/ai/sunset-warn.test.ts` |
 
 Patch 1 cherry-picked from `feat/livez` (`f497a50e5`, cut off the `v0.47.9.0` tag
 per *Upstreaming* below) onto this release branch; `bun test
@@ -48,9 +51,11 @@ Final state leaves `bun run verify` (54/54 checks), `tsc --noEmit`,
 `test/skillpack-init-brain-pack.test.ts`, `test/skillpack-brain-resident-locate.test.ts`
 (23/23 combined) and `test/e2e/self-upgrade-marker.test.ts` (8/8, was 6/8 at
 `+caracal.1`/`.2`) green locally, plus `bash scripts/check-bootstrap-tag.sh`
-(exit 0). Policy #1 (*each patch has an upstream issue or PR*) is open for all
-three until the PRs/decision above land; recorded here rather than silently
-satisfied.
+(exit 0). Patches 4-6 (`+caracal.4`): `bun run verify` 54/54, and the full
+unit lane on the release content shows only the two known-red watchdog
+assertions below (22,726 pass). Policy #1 (*each patch has an upstream issue or
+PR*) is open for patches 1, 2, 4, 5 and 6 (3 is N/A) until the PRs/decision
+above land; recorded here rather than silently satisfied.
 
 ## Delta from upstream, and why the rest of it is not a patch
 
@@ -91,8 +96,8 @@ over its ratchet ceiling). Not a `+`-suffix issue — the module-size guard was
 doing exactly what it's for. Fixed as *Patches* row 3
 (`scripts/module-size-limits.tsv`), first push.
 
-**A THIRD, still-open, unrelated cause hides behind `test (9)`'s job-name
-match, present since before `+caracal.1` and NOT fixed by this release:**
+**A THIRD unrelated cause hid behind `test (9)`'s job-name match from before
+`+caracal.1` through `+caracal.3`; FIXED in `+caracal.4` by patch #6:**
 `test/ai/sunset-warn.test.ts`, 3 of 5 tests, on a hardcoded 2026-09-04
 ZeroEntropy reranker sunset date that has since passed in wall-clock time —
 the production code correctly short-circuits past the sunset instead of
@@ -102,6 +107,18 @@ fork's patches applied — pure upstream test rot, no upstream story of ours to
 carry, and not this release's to fix. Recorded here so `test (9)` staying red
 on a future release doesn't get re-diagnosed from scratch or silently accepted
 as "the same old known-red" without checking it is still only this.
+
+**Known-red as of `+caracal.4`: two Bun 1.4 watchdog log-line assertions,
+present on upstream `v0.47.9.0` and unchanged here.** `test/process-watchdog.serial.test.ts`
+("starved loop with a SIGTERM listener is SIGTERMed then SIGKILLed") and
+`test/pglite-disconnect-watchdog.serial.test.ts` ("wedge-watchdog ... SIGKILLs a
+loop-starved close") assert the watchdog's stderr lines, which Bun 1.4 relays
+through the starved main thread, so they never appear. The kill itself works
+(both tests' signal assertions pass). A fix was attempted on the `+caracal.4`
+branch and dropped: every way of logging from the worker thread let a stalled
+stderr reader (full pipe, paused terminal, socket) delay or block the kill
+backstop, which matters more than the log line. `src/core/process-watchdog.ts`
+stays identical to upstream.
 
 **The methodology, not just the count, is what changed.** Two releases running,
 `verify` and (once `+caracal.3` started) `serial-tests` matched their expected
@@ -152,7 +169,7 @@ assert it:
 
     git diff --stat <upstream-tag>..master
 
-Checked for `+caracal.3` — the ten release paths, `CARACAL-PATCHES.md`, and exactly
-the seven files across the three rows in the *Patches* table above; nothing else moved.
+Checked for `+caracal.4` — the ten release paths, `CARACAL-PATCHES.md`, and exactly
+the 30 files across the six rows in the *Patches* table above; nothing else moved.
 
 Runbook: `infra/brain/FORK.md` in `caracalcorp/it`.

@@ -14,6 +14,7 @@ import {
   resetGateway,
   rerank,
   __setRerankTransportForTests,
+  __setSunsetClockForTests,
   _resetSunsetWarningsForTest,
 } from '../../src/core/ai/gateway.ts';
 
@@ -28,6 +29,10 @@ let stderrChunks: string[] = [];
 let origWrite: typeof process.stderr.write;
 
 beforeEach(() => {
+  // Warn-on-use is the pre-sunset behavior; past 2026-09-04 rerank
+  // short-circuits instead (rerank-sunset-short-circuit covers that). Pin the
+  // clock before the sunset so these tests don't rot with the wall clock.
+  __setSunsetClockForTests(() => new Date('2026-08-01T00:00:00Z'));
   _resetSunsetWarningsForTest();
   stderrChunks = [];
   origWrite = process.stderr.write.bind(process.stderr);
@@ -47,6 +52,7 @@ beforeEach(() => {
 afterEach(() => {
   process.stderr.write = origWrite;
   __setRerankTransportForTests(null);
+  __setSunsetClockForTests(null);
   _resetSunsetWarningsForTest();
   resetGateway();
 });

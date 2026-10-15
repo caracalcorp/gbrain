@@ -12,7 +12,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, test } from 'bun:test';
-import { loadConfig, saveConfig } from '../src/core/config.ts';
+import { loadConfig, saveConfig, configDir } from '../src/core/config.ts';
+import { readGbrainEnvFile } from '../src/core/gbrain-env-file.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 /**
@@ -63,6 +64,19 @@ describe('loadConfig — ~/.gbrain/.env secrets file (#3893)', () => {
         const cfg = loadConfig();
         expect(process.env.OPENAI_API_KEY).toBe('sk-shell-winner');
         expect(cfg?.openai_api_key).toBe('sk-shell-winner');
+      },
+    );
+  });
+
+  test('a key assigned twice keeps its first value', async () => {
+    // Value: protects=duplicate-key precedence in ~/.gbrain/.env (first wins, as before the parser split); fails_when=the parser lets a later line overwrite an earlier one; why_new=no case repeats a key; seam=none
+    await withEnvFile(
+      'GBRAIN_TEST_ENV_FILE_DUP=first\nGBRAIN_TEST_ENV_FILE_DUP=second\n',
+      { GBRAIN_TEST_ENV_FILE_DUP: undefined },
+      () => {
+        expect(readGbrainEnvFile(configDir).GBRAIN_TEST_ENV_FILE_DUP).toBe('first');
+        loadConfig();
+        expect(process.env.GBRAIN_TEST_ENV_FILE_DUP).toBe('first');
       },
     );
   });
