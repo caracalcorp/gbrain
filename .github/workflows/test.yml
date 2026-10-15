@@ -314,6 +314,9 @@ jobs:
       # timeout, self-skip) as one JUnit testcase; logs stay on failure.
       - run: bun run verify
         env:
+          # caracal (runners patch): a 4-vCPU GitHub runner, not upstream's 8-vCPU
+          # Ubicloud one; typecheck crossed the 120 s per-check cap on PR #7.
+          GBRAIN_VERIFY_TIMEOUT: '240'
           GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
           GBRAIN_VERIFY_LOG_DIR: ${{ runner.temp }}/verify-logs
       - name: Upload verify logs

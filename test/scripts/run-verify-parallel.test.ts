@@ -389,7 +389,7 @@ exit 0
   it("typecheck runs on every platform: only the macOS 26 workflow raises the per-check cap, Linux keeps 120 s (#6056)", () => {
     const workflows = readdirSync(".github/workflows").filter((f) => /\.ya?ml$/.test(f));
     const read = (f: string) => readFileSync(join(".github/workflows", f), "utf8");
-    expect(workflows.filter((f) => read(f).includes("GBRAIN_VERIFY_TIMEOUT"))).toEqual(["macos-validation.yml"]);
+    expect(workflows.filter((f) => read(f).includes("GBRAIN_VERIFY_TIMEOUT"))).toEqual(["macos-validation.yml", "test.yml"]); // caracal: runners patch raises verify's cap on 4 vCPUs
     const mac = read("macos-validation.yml");
     expect(mac).toMatch(/^\s+runs-on: macos-26$/m);
     expect(mac).toMatch(/^\s+GBRAIN_VERIFY_TIMEOUT: '240'$/m);
