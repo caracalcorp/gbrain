@@ -78,14 +78,15 @@ export const HTTP_SHOWN_CAP = 500;
 const CLIENT_ID_MAX = 128;
 /** The baseline recorded for a brain that existed before baselines were kept. */
 const PREDATES = '0';
-const RELEASE = /^\d+(\.\d+)*$/;
+// caracal: a `+build` suffix (our `+caracal.N`) is valid semver and never affects precedence.
+const RELEASE = /^\d+(\.\d+)*(\+[0-9A-Za-z.-]+)?$/;
 
 export type BehaviorChannel = 'cli' | 'stdio' | 'http';
 
 /** Release order over every numeric segment (`0.60.65.0` style; missing segments are 0). */
 export function compareReleases(a: string, b: string): number {
-  const pa = a.split('.').map(n => parseInt(n, 10) || 0);
-  const pb = b.split('.').map(n => parseInt(n, 10) || 0);
+  const pa = a.split('+')[0]!.split('.').map(n => parseInt(n, 10) || 0);
+  const pb = b.split('+')[0]!.split('.').map(n => parseInt(n, 10) || 0);
   for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
     const d = (pa[i] ?? 0) - (pb[i] ?? 0);
     if (d !== 0) return d < 0 ? -1 : 1;

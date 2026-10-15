@@ -279,7 +279,7 @@ export const FIRST_GRADUATION_RELEASE = '0.60.52.0';
  * need an unaware writer, so the newest tags at or after FIRST_GRADUATION_RELEASE never qualify.
  */
 export function previousReleaseTags(count = 2): string[] {
-  const version = [readFileSync(join(REPO, 'VERSION'), 'utf8').trim(), FIRST_GRADUATION_RELEASE]
+  const version = [readFileSync(join(REPO, 'VERSION'), 'utf8').trim().replace(/\+.*$/, ''), FIRST_GRADUATION_RELEASE]
     .sort((a, b) => cmpVersion(a.split('.').map(Number), b.split('.').map(Number)))[0]!;
   const out = Bun.spawnSync(['git', '-C', REPO, 'ls-remote', '--tags', '--refs', 'origin', 'v*'], { stdout: 'pipe', stderr: 'pipe' });
   if (out.exitCode !== 0) throw new Error(`git ls-remote failed: ${out.stderr.toString()}`);

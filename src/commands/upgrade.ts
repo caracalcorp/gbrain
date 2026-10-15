@@ -426,7 +426,7 @@ export function bunGlobalExactTagPin(globalRoot: string): string | null {
     const pkg = JSON.parse(readFileSync(join(globalRoot, 'package.json'), 'utf-8')) as { dependencies?: Record<string, string> };
     const spec = pkg.dependencies?.gbrain;
     if (typeof spec !== 'string') return null;
-    return /#v?\d+\.\d+(\.\d+)*$/.test(spec.trim()) ? spec.trim() : null;
+    return /#v?\d+\.\d+(\.\d+)*(\+[0-9A-Za-z.-]+)?$/.test(spec.trim()) ? spec.trim() : null;
   } catch {
     return null;
   }
