@@ -18,8 +18,10 @@
 import type { BrainEngine } from './engine.ts';
 import type { LinkBatchInput } from './engine.ts';
 import { buildGazetteer, findMentionedEntities, type Gazetteer } from './by-mention.ts';
+import { isCrossSourceLinksEnabled } from './link-extraction.ts';
 import { inferLinkTypeFromPack } from './schema-pack/link-inference.ts';
 import { loadActivePackForLocalEngine, packSupportsNerInference } from './schema-pack/best-effort.ts';
+import { isQuarantined } from './quarantine.ts';
 
 export interface ExtractNerOpts {
   /** When true: enumerate but don't write. */
@@ -81,7 +83,7 @@ export function inferNerLinkType(
 ): string | null {
   if (!targetType) return null;
   try {
-    return inferLinkTypeFromPack(pack, targetType, context);
+    return inferLinkTypeFromPack(pack, targetType, context, undefined, undefined, { ner: true });
   } catch {
     return null;
   }
@@ -123,6 +125,7 @@ export async function extractNerLinks(
   if (gazetteer.size === 0) {
     return { pages: 0, created: 0, pack_unavailable: false };
   }
+  const allowCrossSource = await isCrossSourceLinksEnabled(engine);
 
   // Pre-fetch target entity types so inferLinkType has the type signal
   // without an N+1 getPage round-trip. Pulls the slug→type map from
@@ -155,7 +158,7 @@ export async function extractNerLinks(
 
   for (const { slug, source_id } of allRefs) {
     const page = await engine.getPage(slug, { sourceId: source_id });
-    if (!page) continue;
+    if (!page || isQuarantined(page.frontmatter)) continue;
     if (opts.typeFilter && page.type !== opts.typeFilter) continue;
     if (sinceMs !== null) {
       const updatedMs = new Date(page.updated_at).getTime();
@@ -170,6 +173,7 @@ export async function extractNerLinks(
     const mentions = findMentionedEntities(body, gazetteer, {
       fromSlug: slug,
       fromSourceId: source_id,
+      allowCrossSource,
     });
     if (mentions.length === 0) continue;
 

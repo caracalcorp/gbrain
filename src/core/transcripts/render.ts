@@ -27,17 +27,17 @@
  * per-session id would make parts 2..N skip as cross-slug duplicates.
  */
 
-import { safeDump } from 'js-yaml';
+import { dumpFrontmatterYaml } from '../data-frontmatter.ts';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { DEFAULT_BYTES_BLOCK } from '../content-sanity.ts';
-import { redactFindings } from '../secret-scan.ts';
+import { DEFAULT_BYTES_WARN } from '../content-sanity.ts';
+import { applyRedaction, planRedaction, type EchoDictionary, type RedactionPlan } from '../secret-scan.ts';
 import { loadPatterns } from '../skillpack/harvest-lint.ts';
 import { sanitizeForJsonb } from '../batch-rows.ts';
 import { ensureWellFormed, truncateUtf8 } from '../text-safe.ts';
 import { BUILTIN_PATTERNS } from '../conversation-parser/builtins.ts';
 import type { ParsedSession, TranscriptMessage } from './types.ts';
-import { buildTranscriptSlug, transcriptFullId } from './types.ts';
+import { buildTranscriptSlug, transcriptFullId, utcTimestamp } from './types.ts';
 
 // ── Shared line format (imessage-slack builtin) ─────────────────────────────
 
@@ -60,8 +60,18 @@ export const MESSAGE_CHAR_CAP = 4000;
  * would import as a zero-chunk, unsearchable page, defeating the split.
  * (Operators can lower the threshold via config; the 0.6 factor leaves
  * headroom for frontmatter overhead and modest overrides.)
+ *
+ * #5427: with the prior `min(300KB, floor(BLOCK * 0.6))` shape, the target
+ * landed at 300KB — six times the content-sanity WARN line (50KB). Every
+ * transcript-import part between 50KB and 300KB therefore took the
+ * content-sanity warn branch (`oversize_warn` audit row + stderr
+ * `exceeds warn threshold, consider splitting` — pointing at the very
+ * splitter that produced the page) on every re-ingest, drowning the doctor
+ * recent-events signal. The block tier stays untouched (the hard floor for
+ * the no-zero-chunk invariant). The 0.9 headroom against WARN gives the
+ * part header + OVERLAP_MESSAGES duplicates room to breathe.
  */
-export const PART_TARGET_BYTES = Math.min(300 * 1024, Math.floor(DEFAULT_BYTES_BLOCK * 0.6));
+export const PART_TARGET_BYTES = Math.floor(DEFAULT_BYTES_WARN * 0.9);
 /** Messages repeated at each part boundary for cross-part fact grounding. */
 export const OVERLAP_MESSAGES = 2;
 
@@ -79,9 +89,10 @@ export function defaultUserPatternsPath(): string {
  * Agent-directed imperative shapes. Detection only STAMPS A COUNT into the
  * page's transcript_import frontmatter (hash-covered, idempotent) so readers
  * and future triage can see the page carries instruction-shaped content —
- * it never hides or rewrites the text.
+ * it never hides or rewrites the text. The write gate
+ * (`src/core/write-gate-patterns.ts`) reuses them as `override` patterns.
  */
-const IMPERATIVE_RES: readonly RegExp[] = [
+export const IMPERATIVE_RES: readonly RegExp[] = [
   /\b(ignore|disregard|forget)\s+(all\s+|any\s+)?(previous|prior|above|earlier)\s+(instructions|context|rules)\b/i,
   /\byou\s+(must|should)\s+now\s+(act|behave|respond)\b/i,
   /\bnew\s+system\s+prompt\b/i,
@@ -113,6 +124,35 @@ export function loadImportRedactionPatterns(userPatternsPath?: string): ImportRe
  * persisted (message text, SPEAKER labels, title, raw-meta string fields).
  * Throws on scanner or pattern failure — page writes are FAIL-CLOSED (unlike
  * the hook corpus lane, these pages are searchable and synced).
+ *
+ * Detector classes (all from `secret-scan.ts`, format-based — not just vendor
+ * prefixes): vendor key shapes (anthropic/openai/voyage/github/gitlab/slack/
+ * aws/google/stripe/sendgrid/twilio/supabase/npm/huggingface/gbrain), JWTs,
+ * whole-block PEM private keys, `Bearer <token>` headers, connection strings
+ * carrying inline credentials, and — opted in for THIS lane — the
+ * high-entropy `KEY=`/`TOKEN=`/`PASSWORD=` assignment heuristic (value must
+ * carry a digit and clear the entropy gate). Transcripts are the corpus where
+ * a pasted `.env` line is most likely, so recall wins over the false-positive
+ * cost here; the push gate and compiled-context scan keep the heuristic off.
+ * Also opted in for this lane only: the `labeled_credential` detector
+ * (`secret-scan-labeled.ts`), which claims a low-entropy value typed after a
+ * password / login / credentials label (`password: hunter2`, `login alice /
+ * hunter2`); a claimed value of 8+ characters that is not a stoplisted word
+ * joins the echo dictionary below.
+ * Every match becomes `<REDACTED:pattern>`; user patterns become
+ * `<REDACTED:user-pattern>`.
+ *
+ * TWO PHASES, ONE SESSION-WIDE ECHO DICTIONARY. Phase 1 PLANS every persisted
+ * field (scan + claimed spans); the eligible bearer / high-entropy values
+ * every field claims accumulate in one `echoValues` map under the scanner's
+ * shared floors and single cap. Phase 2 APPLIES each plan, and the splice
+ * reads the FULL map — so a token claimed in a tool message's
+ * `Authorization: Bearer …` header is also scrubbed where the assistant
+ * echoed it bare in ANOTHER message (or the title, a speaker label, a
+ * metadata value), whichever order the two appear in. Redacting each field
+ * independently left those cross-field echoes in the page. The per-field
+ * `redactions` that feed `redactionCount` (the receipt) are unchanged by the
+ * echo pass: an echo is not a claim and adds no finding.
  */
 export function redactSession(
   session: ParsedSession,
@@ -121,15 +161,20 @@ export function redactSession(
   const patterns = opts.patterns ?? loadImportRedactionPatterns(opts.userPatternsPath);
   let redactionCount = 0;
   let imperativesFlagged = 0;
+  const echoValues: EchoDictionary = new Map();
 
-  const clean = (text: string): string => {
+  const plan = (text: string): RedactionPlan =>
     // sanitizeForJsonb (NUL-strip + well-form): transcripts capture raw tool
     // output that legitimately carries U+0000, which Postgres text/jsonb
     // reject at the write boundary (#4392).
-    let out = sanitizeForJsonb(text);
-    const r = redactFindings(out);
-    redactionCount += r.redactions.length;
-    out = r.text;
+    // highEntropy + labeledCredentials: transcripts opt into the assignment
+    // heuristic and the labeled-credential detector (see doc comment above);
+    // the shared scanner keeps both off by default.
+    planRedaction(sanitizeForJsonb(text), { highEntropy: true, labeledCredentials: true, echoValues });
+
+  const apply = (p: RedactionPlan): string => {
+    redactionCount += p.redactions.length;
+    let out = applyRedaction(p);
     for (const { regex } of patterns) {
       out = out.replace(regex, () => {
         redactionCount++;
@@ -139,7 +184,8 @@ export function redactSession(
     return out;
   };
 
-  const messages = session.messages.map((m) => {
+  // Phase 1: plan every field.
+  const planned = session.messages.map((m) => {
     for (const re of IMPERATIVE_RES) {
       if (re.test(m.text)) {
         imperativesFlagged++;
@@ -149,25 +195,34 @@ export function redactSession(
     // Speaker labels are persisted into the anchor line, so they get the
     // same redaction as bodies (a secret or private name in a display name
     // must not bypass the scan).
-    return {
-      ...m,
-      text: clean(m.text),
-      ...(m.speaker ? { speaker: clean(m.speaker) } : {}),
-    };
+    return { m, text: plan(m.text), speaker: m.speaker ? plan(m.speaker) : undefined };
   });
-
-  const meta = { ...session.meta };
-  if (meta.title) meta.title = clean(meta.title);
-  if (meta.raw) {
-    // Flatness is ENFORCED, not assumed: strings are cleaned; primitive
-    // scalars pass; anything nested (arrays/objects an adapter let through
-    // from hostile export data) is DROPPED — it would reach putRawData
-    // unscanned otherwise.
-    const raw: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(meta.raw)) {
-      if (typeof v === 'string') raw[k] = clean(v);
-      else if (v === null || typeof v === 'number' || typeof v === 'boolean') raw[k] = v;
+  const titlePlan = session.meta.title ? plan(session.meta.title) : undefined;
+  // Flatness is ENFORCED, not assumed: strings are planned; primitive
+  // scalars pass; anything nested (arrays/objects an adapter let through
+  // from hostile export data) is DROPPED — it would reach putRawData
+  // unscanned otherwise.
+  const rawEntries: Array<{ key: string; plan: RedactionPlan | null; scalar: unknown }> = [];
+  if (session.meta.raw) {
+    for (const [key, v] of Object.entries(session.meta.raw)) {
+      if (typeof v === 'string') rawEntries.push({ key, plan: plan(v), scalar: undefined });
+      else if (v === null || typeof v === 'number' || typeof v === 'boolean') {
+        rawEntries.push({ key, plan: null, scalar: v });
+      }
     }
+  }
+
+  // Phase 2: apply with the complete dictionary.
+  const messages = planned.map(({ m, text, speaker }) => ({
+    ...m,
+    text: apply(text),
+    ...(speaker ? { speaker: apply(speaker) } : {}),
+  }));
+  const meta = { ...session.meta };
+  if (titlePlan) meta.title = apply(titlePlan);
+  if (meta.raw) {
+    const raw: Record<string, unknown> = {};
+    for (const e of rawEntries) raw[e.key] = e.plan ? apply(e.plan) : e.scalar;
     meta.raw = raw;
   }
 
@@ -179,7 +234,7 @@ export function redactSession(
 /** `2026-08-01T10:00:05.000Z` → `(2026-08-01 10:00 AM)` (UTC), matching the builtin. */
 function anchorTimestamp(iso: string): string {
   const d = new Date(iso);
-  const day = iso.slice(0, 10);
+  const day = Number.isNaN(d.getTime()) ? iso.slice(0, 10) : d.toISOString().slice(0, 10);
   let h = d.getUTCHours();
   const ampm = h >= 12 ? 'PM' : 'AM';
   h = h % 12 || 12;
@@ -200,6 +255,22 @@ export function escapeAnchorLines(text: string): string {
     .join('\n');
 }
 
+/**
+ * Neutralize QUOTED facts/takes fence markers in a message body:
+ * `gbrain:facts:begin` → `gbrain\:facts:begin`. A session that read another
+ * page (context pack, get_page) quotes that page's `<!--- gbrain:facts:begin -->`
+ * verbatim, and the per-message char cap routinely keeps the begin marker
+ * while dropping the end — a live, unbalanced fence on a transcript page that
+ * has no fence (FACTS_FENCE_UNBALANCED on every dream cycle), or a quoted
+ * fence indexed as the transcript's own facts. Every fence consumer is an
+ * exact-substring matcher on the marker token, so the backslash lands INSIDE
+ * the token (a leading space would not break them); the text stays readable
+ * and greppable, matching the backslash idiom of escapeAnchorLines (#4821).
+ */
+export function escapeFenceMarkers(text: string): string {
+  return text.replace(/gbrain:(facts|takes):(begin|end)/g, 'gbrain\\:$1:$2');
+}
+
 export interface RenderedPart {
   slug: string;
   /** Full page content: YAML frontmatter + body. */
@@ -208,6 +279,13 @@ export interface RenderedPart {
   frontmatterId: string;
   part: number;
   of: number;
+  /** The keys this collector renders (and so owns on re-ingest), and the body. */
+  frontmatter: Record<string, unknown>;
+  body: string;
+}
+
+export function renderPartContent(frontmatter: Record<string, unknown>, body: string): string {
+  return `---\n${dumpFrontmatterYaml(frontmatter, { lineWidth: 1000 })}---\n\n${body}\n`;
 }
 
 export interface RenderSessionResult {
@@ -239,8 +317,9 @@ function speakerLabel(m: TranscriptMessage): string {
  */
 export function renderSessionParts(
   redacted: RedactedSession,
-  opts: { sourcePath: string } = { sourcePath: '' },
+  opts: { sourcePath: string; partTargetBytes?: number } = { sourcePath: '' },
 ): RenderSessionResult {
+  const partTargetBytes = opts.partTargetBytes ?? PART_TARGET_BYTES;
   const { session, imperativesFlagged } = redacted;
   const { meta, messages } = session;
   if (!messages.length) throw new Error('renderSessionParts: session has no messages');
@@ -251,7 +330,7 @@ export function renderSessionParts(
       `session ${meta.sessionId} carries no timestamps — refusing to fabricate provenance`,
     );
   }
-  const dateIso = firstTs;
+  const dateIso = utcTimestamp(firstTs);
   const baseSlug = buildTranscriptSlug(meta.harness, dateIso, {
     sessionId: meta.sessionId,
     title: meta.title,
@@ -266,7 +345,7 @@ export function renderSessionParts(
   const blocks: string[] = messages.map((m) => {
     const ts = m.timestamp || lastTs;
     lastTs = ts;
-    const text = escapeAnchorLines(truncateUtf8(m.text, MESSAGE_CHAR_CAP));
+    const text = escapeFenceMarkers(escapeAnchorLines(truncateUtf8(m.text, MESSAGE_CHAR_CAP)));
     const [head, ...rest] = text.split('\n');
     const anchor = `**${speakerLabel(m)}** (${anchorTimestamp(ts)}): ${head}`;
     return rest.length ? `${anchor}\n${rest.join('\n')}` : anchor;
@@ -279,7 +358,7 @@ export function renderSessionParts(
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i];
     const bytes = Buffer.byteLength(b, 'utf8') + 2;
-    if (current.length > 0 && currentBytes + bytes > PART_TARGET_BYTES) {
+    if (current.length > 0 && currentBytes + bytes > partTargetBytes) {
       groups.push(current);
       const overlap = current.slice(-OVERLAP_MESSAGES);
       current = [...overlap];
@@ -312,8 +391,7 @@ export function renderSessionParts(
       },
     };
     const body = group.join('\n\n');
-    const content = `---\n${safeDump(fm, { lineWidth: 1000 })}---\n\n${body}\n`;
-    return { slug, content, frontmatterId, part, of };
+    return { slug, content: renderPartContent(fm, body), frontmatterId, part, of, frontmatter: fm, body };
   });
 
   return { parts, baseSlug, dateIso };

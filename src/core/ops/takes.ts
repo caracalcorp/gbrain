@@ -1,3 +1,5 @@
+import { submitPageMutation } from '../persistence/page-mutations.ts';
+import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 /**
  * Takes + think operation cluster — pure move from operations.ts (v0.46.x
  * tranche 1). Op consts stay module-private; `takesOperations` below lists
@@ -5,27 +7,28 @@
  * in ../operations.ts. Never import from '../operations.ts' here (cycle).
  */
 
-import { OperationError, type Operation, type OperationContext } from './contract.ts';
+import { opError, type Operation, type OperationContext } from './contract.ts';
+import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
+import { stampRowTrust } from '../eligibility/stamp.ts';
+import { opTransport, paramUse } from './op-fix.ts';
 import {
-  sourceScopeOpts,
+  readPolicyOpts,
+  readHolders,
   thinkSourceScopeOpts,
   enforceClientSlugFence,
   validatePageSlug,
 } from './context.ts';
-import {
-  addTakeToPage,
-  updateTakeOnPage,
-  supersedeTakeOnPage,
-  resolveTakeOnPage,
-  resolveTakesRepoDir,
-  TakesWriteError,
-} from '../takes-write.ts';
 import { embedQuery } from '../embedding.ts';
+import { ALL_SOURCES } from '../source-id.ts';
+import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 
 // --- v0.28: Takes ---
 
 const takes_list: Operation = {
   name: 'takes_list',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'retrieval',
   description: 'List takes (typed/weighted/attributed claims) filtered by holder/kind/active/etc.',
   scope: 'read',
   params: {
@@ -37,11 +40,13 @@ const takes_list: Operation = {
     sort_by: { type: 'string', description: 'weight | since_date | created_at (default created_at)' },
     limit: { type: 'number', description: 'Max rows (default 100, cap 500)' },
     offset: { type: 'number', description: 'Skip first N rows' },
+    min_trust: MIN_TRUST_PARAM,
   },
   handler: async (ctx, p) => {
-    return ctx.engine.listTakes({
+    const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust });
+    const rows = await ctx.engine.listTakes({
       // #2200-class: honor federated/source scope (via the take's page.source_id).
-      ...sourceScopeOpts(ctx),
+      ...await readPolicyOpts(ctx),
       page_slug: p.page_slug as string | undefined,
       holder: p.holder as string | undefined,
       kind: p.kind as never,
@@ -52,26 +57,35 @@ const takes_list: Operation = {
       offset: p.offset as number | undefined,
       // Per-token allow-list — server-side filter for MCP-bound calls.
       // Local CLI callers leave takesHoldersAllowList unset and see all holders.
-      takesHoldersAllowList: ctx.takesHoldersAllowList,
+      takesHoldersAllowList: readHolders(ctx),
+      eligibility,
     });
+    return stampRowTrust(ctx.engine, 'takes', rows, r => r.id);
   },
   cliHints: { name: 'takes-list' },
 };
 
 const takes_search: Operation = {
   name: 'takes_search',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'retrieval',
   description: 'Keyword search across takes (pg_trgm similarity over claim text)',
   scope: 'read',
   params: {
     query: { type: 'string', required: true, description: "Search text matched against take claim text via trigram similarity, e.g. 'valuation cap'. This is the search text param — there is no `text` param." },
     limit: { type: 'number', description: 'Max results (default 30, cap 100)' },
+    min_trust: MIN_TRUST_PARAM,
   },
   handler: async (ctx, p) => {
-    return ctx.engine.searchTakes(p.query as string, {
-      ...sourceScopeOpts(ctx),
+    const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust });
+    const hits = await ctx.engine.searchTakes(p.query as string, {
+      ...await readPolicyOpts(ctx),
       limit: p.limit as number | undefined,
-      takesHoldersAllowList: ctx.takesHoldersAllowList,
+      takesHoldersAllowList: readHolders(ctx),
+      eligibility,
     });
+    return stampRowTrust(ctx.engine, 'takes', hits, h => h.take_id);
   },
   cliHints: { name: 'takes-search', positional: ['query'] },
 };
@@ -86,6 +100,9 @@ const takes_search: Operation = {
  */
 const takes_scorecard: Operation = {
   name: 'takes_scorecard',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
   description: 'Calibration scorecard for resolved bets: counts, accuracy, Brier (correct ∨ incorrect only), partial_rate.',
   scope: 'read',
   params: {
@@ -97,13 +114,13 @@ const takes_scorecard: Operation = {
   handler: async (ctx, p) => {
     const card = await ctx.engine.getScorecard(
       {
-        ...sourceScopeOpts(ctx),
+        ...await readPolicyOpts(ctx),
         holder: p.holder as string | undefined,
         domainPrefix: p.domain_prefix as string | undefined,
         since: p.since as string | undefined,
         until: p.until as string | undefined,
       },
-      ctx.takesHoldersAllowList,
+      readHolders(ctx),
     );
     // [OV8/EV5] Resolver-provenance visibility: remote resolutions are
     // server-stamped resolved_by='mcp:<client>' (takes_resolve below), and
@@ -122,6 +139,9 @@ const takes_scorecard: Operation = {
  */
 const takes_calibration: Operation = {
   name: 'takes_calibration',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
   description: 'Calibration curve: resolved correct/incorrect bets binned by stated weight; observed vs predicted per bucket.',
   scope: 'read',
   params: {
@@ -134,11 +154,11 @@ const takes_calibration: Operation = {
     // a breaking change; the scorecard is the segregation surface.)
     return ctx.engine.getCalibrationCurve(
       {
-        ...sourceScopeOpts(ctx),
+        ...await readPolicyOpts(ctx),
         holder: p.holder as string | undefined,
         bucketSize: p.bucket_size as number | undefined,
       },
-      ctx.takesHoldersAllowList,
+      readHolders(ctx),
     );
   },
   cliHints: { name: 'takes-calibration' },
@@ -151,8 +171,9 @@ const takes_calibration: Operation = {
  * signal, not a scorecard dimension).
  */
 async function countMcpResolved(ctx: OperationContext): Promise<number> {
-  const scope = sourceScopeOpts(ctx);
+  const scope = await readPolicyOpts(ctx);
   const where: string[] = [`t.resolved_at IS NOT NULL`, `t.resolved_by LIKE 'mcp:%'`];
+  if (scope.excludePrivate) where.push(privatePagesFilterFragment('p'));
   const params: unknown[] = [];
   if (scope.sourceIds && scope.sourceIds.length > 0) {
     params.push(scope.sourceIds);
@@ -161,8 +182,9 @@ async function countMcpResolved(ctx: OperationContext): Promise<number> {
     params.push(scope.sourceId);
     where.push(`p.source_id = $${params.length}`);
   }
-  if (ctx.takesHoldersAllowList) {
-    params.push(ctx.takesHoldersAllowList);
+  const holders = readHolders(ctx);
+  if (holders !== undefined) {
+    params.push(holders);
     where.push(`t.holder = ANY($${params.length}::text[])`);
   }
   try {
@@ -177,9 +199,24 @@ async function countMcpResolved(ctx: OperationContext): Promise<number> {
   }
 }
 
+/** runThink names the CLI flag; op callers get the param on their own surface and a caller-class code. */
+function thinkModelError(ctx: OperationContext, e: unknown): unknown {
+  if (e instanceof Error && e.name === 'ReferenceDateError') {
+    return opError('invalid_params', `think: ${e.message}`,
+      `Nothing was synthesized. Pass ${opTransport(ctx) === 'cli' ? paramUse(ctx, 'reference_date') : '`reference_date`'} as a past or current YYYY-MM-DD, or omit it to use today in brain.timezone.`);
+  }
+  if (!(e instanceof Error) || !e.message.startsWith('think: --model ')) return e;
+  const name = opTransport(ctx) === 'cli' ? paramUse(ctx, 'model') : '`model`';
+  return opError('invalid_params',
+    e.message.replace('think: --model ', 'think: model ').replace(' or omit --model.', ' or omit it.'),
+    `Nothing was synthesized. Omit ${name} to use the configured think model (models.think, then models.default), or pass a model id this brain can reach.`);
+}
+
 const think: Operation = {
   name: 'think',
-  description: 'Multi-hop synthesis across pages + takes + graph. Pulls relevant evidence and produces a cited answer with conflict + gap analysis.',
+  idempotent: false,
+  outputRedaction: 'retrieval',
+  description: 'Multi-hop synthesis across pages + takes + graph. Pulls relevant evidence and produces a cited answer with conflict + gap analysis. Needs a chat-model API key (Anthropic or OpenAI) for the synthesized answer, a paid call; a keyless brain returns the gathered evidence only (a synthesis_keyless notice explains). save/take persist for the local CLI only.',
   scope: 'read',
   params: {
     question: { type: 'string', required: true, description: 'The question to think about' },
@@ -190,6 +227,7 @@ const think: Operation = {
     model: { type: 'string', description: 'Model override (alias or full id). Falls through models.think → models.default → GBRAIN_MODEL → opus.' },
     since: { type: 'string', description: 'Start of temporal window (YYYY-MM-DD or YYYY-MM)' },
     until: { type: 'string', description: 'End of temporal window' },
+    reference_date: { type: 'string', description: 'YYYY-MM-DD the question\'s relative time words resolve against (default: today in brain.timezone).' },
   },
   // Local CLI can persist with save/take; remote/MCP callers are forced
   // read-only below before runThink/persistSynthesis sees those flags.
@@ -222,16 +260,32 @@ const think: Operation = {
       modelExplicit: !!p.model,
       since: p.since ? String(p.since) : undefined,
       until: p.until ? String(p.until) : undefined,
-      takesHoldersAllowList: ctx.takesHoldersAllowList,
+      ...(typeof p.reference_date === 'string' ? { referenceDate: p.reference_date } : {}),
+      takesHoldersAllowList: readHolders(ctx),
       ...thinkScope,
+      excludePrivate: (await readPolicyOpts(ctx)).excludePrivate,
       remote: ctx.remote !== false, // fail-closed: anything not strictly false is untrusted (CLAUDE.md invariant)
-    });
+    }).catch((e: unknown) => { throw thinkModelError(ctx, e); });
+    result.answer = result.answer.replace(' or pass `client`', ' on the brain host');
+    if (ctx.transport === 'http' && (result.synthesis_status === 'no_llm' || result.synthesis_status === 'model_unusable')) {
+      // A6 HTTP view: a remote caller is never told the host's key names or provider posture. The stub
+      // answer and gaps are prose for the operator; synthesis_status and the warning codes stay as data.
+      const { redactForTransport } = await import('../agent-output.ts');
+      result.answer = result.synthesis_status === 'no_llm'
+        ? '(no LLM available on the brain host — the gathered evidence is returned without a synthesized answer)'
+        : redactForTransport(result.answer, 'http');
+      result.gaps = redactForTransport(result.gaps, 'http');
+    }
 
     // Persist if --save was passed locally
     let savedSlug: string | undefined;
     let evidenceInserted = 0;
     if (safeSave) {
-      const persisted = await persistSynthesis(ctx.engine, result);
+      const persisted = await persistSynthesis(ctx.engine, result, {
+        // '__all__' is a read scope, not a write destination: an unscoped save keeps the default source.
+        sourceId: ctx.sourceId === ALL_SOURCES ? undefined : ctx.sourceId,
+        ...(thinkScope.allowedSources ? { allowedSources: thinkScope.allowedSources } : {}),
+      });
       savedSlug = persisted.slug;
       evidenceInserted = persisted.evidenceInserted;
       for (const w of persisted.warnings) result.warnings.push(w);
@@ -257,8 +311,17 @@ const think: Operation = {
       }
     }
 
+    // F8: the explanations the CLI formatter prints, as model-visible notices.
+    const { keylessThinkNotice, thinkNotSavedNotice } = await import('../interop-notices.ts');
+    if (result.synthesis_status === 'no_llm') ctx.emitNotice?.(keylessThinkNotice());
+    if (remote && (Boolean(p.save) || Boolean(p.take))) ctx.emitNotice?.(thinkNotSavedNotice());
+    const { recordThinkAnswer, feedbackMetaFields } = await import('../feedback/record.ts');
+    const feedbackMeta = feedbackMetaFields(await recordThinkAnswer(ctx, 'think', result));
+    delete result.feedback_evidence; delete result.taint_refs;
+    const { persist: _persist, ...visible } = result;
     return {
-      ...result,
+      ...visible,
+      ...feedbackMeta,
       // #1698 (#10): the persist-skip signal returns slug '' — map it (and any
       // falsy) to null so callers never see an empty-string "slug".
       saved_slug: savedSlug || null,
@@ -306,79 +369,11 @@ const think: Operation = {
 // ---------------------------------------------------------------------------
 
 const TAKE_KINDS = ['fact', 'take', 'bet', 'hunch'] as const;
-/** Ops hold the MCP request at most this long waiting for the page lock. */
-const OP_LOCK_TIMEOUT_MS = 2000;
-
-/** Remote callers get the read allow-list as the WRITE fence; local CLI is unfenced. */
-function takesWriteAllowList(ctx: OperationContext): readonly string[] | null {
-  return ctx.remote !== false ? (ctx.takesHoldersAllowList ?? ['world']) : null;
-}
-
-async function opBrainDir(ctx: OperationContext): Promise<string> {
-  const dir = await resolveTakesRepoDir(ctx.engine);
-  if (!dir) {
-    const err = new OperationError(
-      'unavailable',
-      'Takes are markdown-canonical and this brain has no writable markdown repo configured.',
-      'Configure sync.repo_path on the brain host, then retry.',
-    );
-    err.detail = 'takes_mirror_unavailable';
-    throw err;
-  }
-  return dir;
-}
-
-function mapTakesWriteError(err: unknown): never {
-  if (err instanceof TakesWriteError) {
-    switch (err.code) {
-      case 'page_not_found':
-        throw new OperationError('page_not_found', err.message, 'Sync the brain first, or check the slug/source.');
-      case 'row_not_found':
-        // Fenced rows deliberately share this shape (no-existence-leak of
-        // content/holder — see the trust-model comment above).
-        throw new OperationError('not_found', err.message);
-      case 'holder_denied': {
-        const e = new OperationError('permission_denied', err.message,
-          "Ask the brain owner to widen this caller's takes-holder allow-list.");
-        e.detail = 'holder_not_in_allowlist';
-        throw e;
-      }
-      case 'mirror_unavailable': {
-        const e = new OperationError('unavailable', err.message,
-          'Configure sync.repo_path on the brain host, then retry.');
-        e.detail = 'takes_mirror_unavailable';
-        throw e;
-      }
-      case 'page_locked': {
-        const e = new OperationError('unavailable', err.message, 'Retry shortly.');
-        e.detail = 'retryable';
-        throw e;
-      }
-      case 'already_resolved':
-        throw new OperationError('invalid_params', err.message, err.hint ?? 'Resolved takes are immutable; supersede instead.');
-      case 'fence_unparsed':
-      case 'row_inactive':
-      case 'no_fields':
-      case 'invalid_input':
-        throw new OperationError('invalid_params', err.message, err.hint);
-    }
-  }
-  throw err;
-}
-
-/**
- * P1-4/F4: the markdown write already succeeded; a non-empty `mirror_warning`
- * means only the DB mirror deferred to the next reconcile. Surface it so the
- * agent knows the durable row is on disk and MUST NOT retry.
- */
-function mirrorWarnFields(mirror: { mirror_warning?: string }): Record<string, string> {
-  return mirror.mirror_warning
-    ? { mirror_warning: `row written to markdown; DB mirror deferred to reconcile: ${mirror.mirror_warning}` }
-    : {};
-}
 
 const takes_add: Operation = {
   name: 'takes_add',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
   description:
     'Record a take (typed claim) on a page: fact / take / bet / hunch, with a holder (who ' +
     'holds the belief: world, people/<slug>, companies/<slug>, or brain), weight 0..1, and ' +
@@ -386,6 +381,8 @@ const takes_add: Operation = {
     'canonical) and mirrors to the DB. Remote callers can only write holders in their ' +
     'allow-list (stdio default: world).',
   params: {
+    request_id: WRITE_REQUEST_PARAM,
+    local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
     slug: { type: 'string', required: true, description: 'Page slug to attach the take to (page must exist).' },
     claim: { type: 'string', required: true, description: 'The claim text (one line).' },
     kind: { type: 'string', required: true, enum: [...TAKE_KINDS], description: 'Claim type. Base kinds only; pack-extended kinds are a filed follow-up.' },
@@ -402,34 +399,22 @@ const takes_add: Operation = {
     enforceClientSlugFence(ctx, slug, 'takes_add');
     validatePageSlug(slug); // defense-in-depth, matching put_page
     if (ctx.dryRun) return { dry_run: true, action: 'takes_add', slug };
-    const brainDir = await opBrainDir(ctx);
-    try {
-      const { rowNum, mirror } = await addTakeToPage(
-        { engine: ctx.engine, slug, brainDir, sourceId: ctx.sourceId, allowList: takesWriteAllowList(ctx), lockTimeoutMs: OP_LOCK_TIMEOUT_MS },
-        {
-          claim: p.claim as string,
-          kind: p.kind as string,
-          holder: p.holder as string,
-          weight: p.weight as number | undefined,
-          source: p.source as string | undefined,
-          sinceDate: p.since as string | undefined,
-        },
-      );
-      return { slug, row_num: rowNum, holder: p.holder, mirror_written: true, ...mirrorWarnFields(mirror) };
-    } catch (err) {
-      mapTakesWriteError(err);
-    }
+    return submitPageMutation(ctx, { operation: 'takes_add', params: p });
   },
 };
 
 const takes_update: Operation = {
   name: 'takes_update',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
   description:
     'Update a take\'s mutable fields (weight, source, since date). Claim/kind/holder are ' +
     'immutable — supersede instead. Markdown-canonical: the target row must exist in the ' +
     'page\'s takes fence. Remote callers can only touch rows whose holder is in their ' +
     'allow-list; other rows present as not_found.',
   params: {
+    request_id: WRITE_REQUEST_PARAM,
+    local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
     slug: { type: 'string', required: true, description: 'Page slug.' },
     row_num: { type: 'number', required: true, description: 'Take row number on the page (from takes_list).' },
     weight: { type: 'number', required: false, description: 'New confidence 0..1.' },
@@ -444,32 +429,22 @@ const takes_update: Operation = {
     enforceClientSlugFence(ctx, slug, 'takes_update');
     validatePageSlug(slug); // defense-in-depth, matching put_page
     if (ctx.dryRun) return { dry_run: true, action: 'takes_update', slug, row_num: p.row_num };
-    const brainDir = await opBrainDir(ctx);
-    try {
-      const { rowNum, mirror } = await updateTakeOnPage(
-        { engine: ctx.engine, slug, brainDir, sourceId: ctx.sourceId, allowList: takesWriteAllowList(ctx), lockTimeoutMs: OP_LOCK_TIMEOUT_MS },
-        p.row_num as number,
-        {
-          weight: p.weight as number | undefined,
-          source: p.source as string | undefined,
-          sinceDate: p.since as string | undefined,
-        },
-      );
-      return { slug, row_num: rowNum, updated: true, ...mirrorWarnFields(mirror) };
-    } catch (err) {
-      mapTakesWriteError(err);
-    }
+    return submitPageMutation(ctx, { operation: 'takes_update', params: p });
   },
 };
 
 const takes_supersede: Operation = {
   name: 'takes_supersede',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
   description:
     'Supersede a take with a replacement claim: the old row is struck through (kept for ' +
     'archaeology), the replacement appends at the next fence row number. Kind/holder inherit ' +
     'from the target row unless overridden; unset weight decays the target\'s by 0.1. ' +
     'Markdown-canonical; remote holder fencing as in takes_update.',
   params: {
+    request_id: WRITE_REQUEST_PARAM,
+    local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
     slug: { type: 'string', required: true, description: 'Page slug.' },
     row_num: { type: 'number', required: true, description: 'Row number of the take being superseded.' },
     claim: { type: 'string', required: true, description: 'The replacement claim text.' },
@@ -487,29 +462,14 @@ const takes_supersede: Operation = {
     enforceClientSlugFence(ctx, slug, 'takes_supersede');
     validatePageSlug(slug); // defense-in-depth, matching put_page
     if (ctx.dryRun) return { dry_run: true, action: 'takes_supersede', slug, row_num: p.row_num };
-    const brainDir = await opBrainDir(ctx);
-    try {
-      const { oldRow, newRow, mirror } = await supersedeTakeOnPage(
-        { engine: ctx.engine, slug, brainDir, sourceId: ctx.sourceId, allowList: takesWriteAllowList(ctx), lockTimeoutMs: OP_LOCK_TIMEOUT_MS },
-        p.row_num as number,
-        {
-          claim: p.claim as string,
-          kind: p.kind as string | undefined,
-          holder: p.holder as string | undefined,
-          weight: p.weight as number | undefined,
-          source: p.source as string | undefined,
-          sinceDate: p.since as string | undefined,
-        },
-      );
-      return { slug, old_row: oldRow, new_row: newRow, ...mirrorWarnFields(mirror) };
-    } catch (err) {
-      mapTakesWriteError(err);
-    }
+    return submitPageMutation(ctx, { operation: 'takes_supersede', params: p });
   },
 };
 
 const takes_resolve: Operation = {
   name: 'takes_resolve',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
   description:
     'Resolve a take: quality correct / incorrect / partial / unresolvable, with optional ' +
     'evidence text and measured value/unit. Resolutions feed the calibration scorecard. ' +
@@ -517,6 +477,8 @@ const takes_resolve: Operation = {
     'ignored) so agent resolutions stay segregable from owner ground truth; the target row ' +
     'must be in the caller\'s holder allow-list. Markdown-canonical.',
   params: {
+    request_id: WRITE_REQUEST_PARAM,
+    local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
     slug: { type: 'string', required: true, description: 'Page slug.' },
     row_num: { type: 'number', required: true, description: 'Take row number to resolve.' },
     quality: { type: 'string', required: true, enum: ['correct', 'incorrect', 'partial', 'unresolvable'], description: 'Resolution verdict.' },
@@ -533,36 +495,68 @@ const takes_resolve: Operation = {
     enforceClientSlugFence(ctx, slug, 'takes_resolve');
     validatePageSlug(slug); // defense-in-depth, matching put_page
     if (ctx.dryRun) return { dry_run: true, action: 'takes_resolve', slug, row_num: p.row_num };
-    const brainDir = await opBrainDir(ctx);
-    // CV6 posture: remote resolutions are provenance-stamped server-side —
-    // clamp + sanitize the client id: hostile DCR client names must not carry
-    // newlines/pipes into the markdown fence, and must not bloat the column.
-    let resolvedBy: string;
-    if (ctx.remote !== false) {
-      const id = (ctx.auth?.clientId ?? ctx.transport ?? 'remote').replace(/[^\w.:-]/g, '_').slice(0, 64);
-      resolvedBy = `mcp:${id}`;
-    } else if (typeof p.resolved_by === 'string' && p.resolved_by.length > 0) {
-      resolvedBy = p.resolved_by;
-    } else {
-      const { resolveOwnerHolder } = await import('../owner-holder.ts');
-      resolvedBy = resolveOwnerHolder({ configValue: await ctx.engine.getConfig('emotional_weight.user_holder') });
-    }
-    try {
-      const { rowNum, quality, mirror } = await resolveTakeOnPage(
-        { engine: ctx.engine, slug, brainDir, sourceId: ctx.sourceId, allowList: takesWriteAllowList(ctx), lockTimeoutMs: OP_LOCK_TIMEOUT_MS },
-        p.row_num as number,
-        {
-          quality: p.quality as 'correct' | 'incorrect' | 'partial' | 'unresolvable',
-          evidence: p.evidence as string | undefined,
-          value: p.value as number | undefined,
-          unit: p.unit as string | undefined,
-          resolvedBy,
-        },
-      );
-      return { slug, row_num: rowNum, quality, resolved_by: resolvedBy, ...mirrorWarnFields(mirror) };
-    } catch (err) {
-      mapTakesWriteError(err);
-    }
+    return submitPageMutation(ctx, { operation: 'takes_resolve', params: p });
+  },
+};
+
+const takes_remove: Operation = {
+  name: 'takes_remove',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description:
+    'Remove one take row from a page\'s takes fence and the takes table together. Local-only. ' +
+    'Other rows keep their numbers. Refuses a resolved row, a row another row cites as "superseded by" it, ' +
+    'and a row whose database copy disagrees with the fence (run `gbrain takes rebuild <slug>` first). ' +
+    'CLI: `gbrain takes remove <slug> --row N`.',
+  params: {
+    request_id: WRITE_REQUEST_PARAM,
+    local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
+    slug: { type: 'string', required: true, description: 'Page slug.' },
+    row_num: { type: 'number', required: true, description: 'Take row number to remove (from takes_list).' },
+  },
+  scope: 'write',
+  mutating: true,
+  localOnly: true,
+  area: 'takes',
+  handler: async (ctx, p) => {
+    const slug = p.slug as string;
+    validatePageSlug(slug);
+    if (ctx.dryRun) return { dry_run: true, action: 'takes_remove', slug, row_num: p.row_num };
+    return submitPageMutation(ctx, { operation: 'takes_remove', params: p });
+  },
+};
+
+/**
+ * W9F item 8: `gbrain takes rebuild <slug>` as an operation, so the CLI can
+ * delegate it to a resident owner (`gbrain serve` holding PGLite) instead of
+ * waiting on the owner's lock. Same work as the local rebuild: the page's
+ * takes index is rebuilt from its canonical fence (`extractTakes` rebuild;
+ * on a managed brain `reextractCoordinated` publishes it, the integration
+ * point for Lane R's receipted takes intent).
+ */
+const takes_rebuild: Operation = {
+  name: 'takes_rebuild',
+  idempotent: true,
+  outputRedaction: { exempt: 'local-only: rebuild warnings quote malformed takes fence rows to the trusted local CLI owner, as the local rebuild always printed them' },
+  description:
+    'Rebuild one page\'s takes index from the takes fence the page holds. Local-only. ' +
+    'Rows whose number and claim still match keep their resolution; rows the index and the fence disagree on are re-inserted from the fence. ' +
+    'CLI: `gbrain takes rebuild <slug>`.',
+  params: {
+    request_id: WRITE_REQUEST_PARAM,
+    slug: { type: 'string', required: true, description: 'Page slug.' },
+  },
+  scope: 'write',
+  mutating: true,
+  localOnly: true,
+  area: 'takes',
+  handler: async (ctx, p) => {
+    const slug = p.slug as string;
+    validatePageSlug(slug);
+    const sourceId = ctx.sourceId ?? 'default';
+    if (ctx.dryRun) return { dry_run: true, action: 'takes_rebuild', slug, source_id: sourceId };
+    const { extractTakes } = await import('../cycle/extract-takes.ts');
+    return { slug, source_id: sourceId, ...await extractTakes(ctx.engine, { source: 'db', slugs: [slug], sourceId, rebuild: true }) };
   },
 };
 
@@ -572,5 +566,5 @@ const takes_resolve: Operation = {
 export const takesOperations: Operation[] = [
   takes_list, takes_search, think,
   takes_scorecard, takes_calibration,
-  takes_add, takes_update, takes_resolve, takes_supersede,
+  takes_add, takes_update, takes_resolve, takes_supersede, takes_remove, takes_rebuild,
 ];

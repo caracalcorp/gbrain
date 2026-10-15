@@ -27,6 +27,9 @@ import {
   _resetCliExitVerdictForTests,
 } from '../src/core/cli-force-exit.ts';
 import {
+  addSuppression,
+  closeOpenLoop,
+  listOpenLoops,
   loadSuppressions,
   upsertOpenLoop,
   type OpenLoopUpsert,
@@ -87,6 +90,7 @@ interface Captured {
 async function captured(fn: () => Promise<void>): Promise<Captured> {
   const outOrig = process.stdout.write.bind(process.stdout);
   const errOrig = process.stderr.write.bind(process.stderr);
+  const cerrOrig = console.error;
   const exitOrig = process.exit;
   const prevExitCode = process.exitCode;
   const outChunks: string[] = [];
@@ -101,6 +105,11 @@ async function captured(fn: () => Promise<void>): Promise<Captured> {
     errChunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
     return true;
   }) as typeof process.stderr.write;
+  // Bun's console.error does NOT route through the process.stderr.write
+  // swap; the usage / source-resolution refusals in loops.ts use it.
+  console.error = (...a: unknown[]) => {
+    errChunks.push(a.map(String).join(' ') + '\n');
+  };
   process.exit = ((code?: number) => {
     exitCalled = code ?? 0;
     throw new Error('__exit__');
@@ -111,6 +120,7 @@ async function captured(fn: () => Promise<void>): Promise<Captured> {
     if ((e as Error).message !== '__exit__') throw e;
   } finally {
     process.exit = exitOrig;
+    console.error = cerrOrig;
     process.stdout.write = outOrig;
     process.stderr.write = errOrig;
   }
@@ -182,6 +192,52 @@ describe('runWaiting', () => {
     expect(r.out).toContain('You are clean');
     expect(r.out).not.toContain('gbrain loops done');
     expect(r.verdict).toBe(0);
+  });
+
+  // #5871: no-counterparty loops are listed in their own section, never as a person.
+  test('only no-counterparty loops → their section and the management hint, never "You are clean"', async () => {
+    await upsertOpenLoop(engine, loop({ dedupKey: 'decision:solo', loopType: 'decision_pending', counterpartyEmail: null, threadId: null,
+      summary: 'Decide on the offsite venue', detector: 'llm_extract' }));
+    const r = await captured(() => runWaiting(engine, []));
+    expect(r.out).toContain('## No counterparty (1 open: decision_pending 1)');
+    expect(r.out).not.toContain('You are clean');
+    expect(r.out).toContain('gbrain loops done <id>');
+    const j = await captured(() => runWaiting(engine, ['--json']));
+    expect(JSON.parse(j.out)).toMatchObject({ ok: true, groups: [], no_counterparty: { loop_count: 1, loops_omitted: 0 } });
+  });
+
+  test('partially stale google sources warn with source ids without refusing, including JSON', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config, last_sync_at)
+       VALUES ('g-stale', 'g-stale', '{"kind":"google"}'::jsonb, NULL)`,
+    );
+
+    const text = await captured(() => runWaiting(engine, []));
+    expect(text.out).toContain('⚠ some google sources have not synced recently');
+    expect(text.out).toContain('g-stale');
+    expect(text.out).toBe(
+      '⚠ some google sources have not synced recently — this may be out of date: g-stale.\n' +
+        'No open loops — no unanswered threads older than 24h and no tracked promises. You are clean.\n',
+    );
+    expect(text.err).toBe('');
+    expect(text.verdict).toBe(0);
+
+    const json = await captured(() => runWaiting(engine, ['--json']));
+    const envelope = JSON.parse(json.out) as {
+      ok: boolean;
+      status: string;
+      stale: boolean;
+      stale_sources?: string[];
+      sources: Array<{ id: string; stale: boolean }>;
+      text: string;
+    };
+    expect(envelope.ok).toBe(true);
+    expect(envelope.status).toBe('ok');
+    expect(envelope.stale).toBe(false);
+    expect(envelope.stale_sources).toEqual(['g-stale']);
+    expect(envelope.sources).toHaveLength(2);
+    expect(envelope.text).toContain('g-stale');
+    expect(json.verdict).toBe(0);
   });
 
   test('fresh --json → { ok:true, status:"ok" } envelope carrying groups + text', async () => {
@@ -333,6 +389,16 @@ describe('runLoops', () => {
     expect(rows[0].status).toBe('dropped');
   });
 
+  test('--note records a closed_by note instead of "manual" (#5446)', async () => {
+    await upsertOpenLoop(engine, loop());
+    const r = await captured(() => runLoops(engine, ['done', '1', '--note', 'handled in person']));
+    expect(r.out).toContain('Loop 1 done.');
+    const rows = await engine.executeRaw<{ closed_by: string }>(
+      `SELECT closed_by FROM open_loops WHERE id = 1`,
+    );
+    expect(rows[0].closed_by).toBe('handled in person');
+  });
+
   test('done without a numeric id hard-exits with usage code 2', async () => {
     const r = await captured(() => runLoops(engine, ['done']));
     expect(r.exitCalled).toBe(2);
@@ -362,6 +428,103 @@ describe('runLoops', () => {
     expect(r.exitCalled).toBe(2);
   });
 
+  test('unmute removes the row the mute wrote, matching case-insensitively', async () => {
+    await captured(() => runLoops(engine, ['mute', 'sender', 'Bob@Example.com']));
+    const r = await captured(() => runLoops(engine, ['unmute', 'sender', 'BOB@example.COM']));
+    expect(r.out).toContain('Unmuted sender BOB@example.COM');
+    expect(r.verdict).toBe(0);
+    expect((await loadSuppressions(engine, 'default')).senders.has('bob@example.com')).toBe(false);
+  });
+
+  test('a repeated unmute is a no-op that still exits 0', async () => {
+    await captured(() => runLoops(engine, ['mute', 'sender', 'bob@example.com']));
+    const first = await captured(() => runLoops(engine, ['unmute', 'sender', 'bob@example.com']));
+    const second = await captured(() => runLoops(engine, ['unmute', 'sender', 'bob@example.com']));
+    expect(first.out).toContain('Unmuted');
+    expect(second.out).toContain('had no suppression');
+    // The idempotency contract: a retried unmute must not look like a failure.
+    expect(second.verdict).toBe(0);
+  });
+
+  test('unmute --json envelope reports ok:true with removed true then false', async () => {
+    await captured(() => runLoops(engine, ['mute', 'thread', '18C2F4A9B3D21E07']));
+    const hit = await captured(() => runLoops(engine, ['unmute', 'thread', '18C2F4A9B3D21E07', '--json']));
+    const a = JSON.parse(hit.out) as { ok: boolean; status: string; removed: boolean; value: string };
+    expect(a.ok).toBe(true);
+    expect(a.status).toBe('unmuted');
+    expect(a.removed).toBe(true);
+    expect(a.value).toBe('18c2f4a9b3d21e07');
+    const miss = await captured(() => runLoops(engine, ['unmute', 'thread', '18C2F4A9B3D21E07', '--json']));
+    const b = JSON.parse(miss.out) as { ok: boolean; status: string; removed: boolean };
+    expect(b.ok).toBe(true);
+    expect(b.status).toBe('not_muted');
+    expect(b.removed).toBe(false);
+  });
+
+  test('unmute leaves existing loops exactly as they were', async () => {
+    await upsertOpenLoop(engine, loop({ counterpartyEmail: 'bob@example.com' }));
+    await addSuppression(engine, 'default', 'sender', 'bob@example.com');
+    const before = await listOpenLoops(engine, { sourceIds: ['default'], status: 'open' });
+    await captured(() => runLoops(engine, ['unmute', 'sender', 'bob@example.com']));
+    const after = await listOpenLoops(engine, { sourceIds: ['default'], status: 'open' });
+    expect(after.length).toBe(before.length);
+    expect(after[0].id).toBe(before[0].id);
+    expect(after[0].status).toBe('open');
+  });
+
+  test('unmute without kind/value hard-exits with usage code 2', async () => {
+    const r = await captured(() => runLoops(engine, ['unmute', 'sender']));
+    expect(r.exitCalled).toBe(2);
+  });
+
+  test('unmute with ZERO google sources exits 2 naming the unmute (not the mute) as the thing to scope', async () => {
+    // Flip 'default' back to a plain source: no google source anywhere.
+    await engine.executeRaw(`UPDATE sources SET config = '{}'::jsonb WHERE id = 'default'`);
+    const r = await captured(() => runLoops(engine, ['unmute', 'sender', 'bob@example.com']));
+    expect(r.exitCalled).toBe(2);
+    expect(r.err).toContain('No google source found');
+    expect(r.err).toContain('scope the unmute');
+    expect(r.err).not.toContain('scope the mute');
+    expect(r.out).toBe('');
+  });
+
+  test('unmute with TWO google sources exits 2 listing both ids', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config, last_sync_at)
+       VALUES ('g1', 'g1', '{"kind":"google"}'::jsonb, now())
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    const r = await captured(() => runLoops(engine, ['unmute', 'sender', 'bob@example.com']));
+    expect(r.exitCalled).toBe(2);
+    expect(r.err).toContain('Multiple google sources');
+    expect(r.err).toContain('default');
+    expect(r.err).toContain('g1');
+    expect(r.out).toBe('');
+  });
+
+  test('--source g2 lands the mute AND the unmute in g2 only (never the default google source)', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config, last_sync_at)
+       VALUES ('g2', 'g2', '{"kind":"google"}'::jsonb, now())
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    // With two google sources an unqualified mute would refuse; --source
+    // resolves it and the row must land in g2 and nowhere else.
+    const muted = await captured(() => runLoops(engine, ['mute', 'sender', 'Bob@Example.com', '--source', 'g2']));
+    expect(muted.exitCalled).toBeUndefined();
+    expect(muted.verdict).toBe(0);
+    expect((await loadSuppressions(engine, 'g2')).senders.has('bob@example.com')).toBe(true);
+    expect((await loadSuppressions(engine, 'default')).senders.has('bob@example.com')).toBe(false);
+
+    // Unmute scoped the same way removes the g2 row; a stray default row is untouched.
+    await addSuppression(engine, 'default', 'sender', 'bob@example.com');
+    const unmuted = await captured(() => runLoops(engine, ['unmute', 'sender', 'bob@example.com', '--source', 'g2']));
+    expect(unmuted.exitCalled).toBeUndefined();
+    expect(unmuted.out).toContain('Unmuted sender bob@example.com');
+    expect((await loadSuppressions(engine, 'g2')).senders.has('bob@example.com')).toBe(false);
+    expect((await loadSuppressions(engine, 'default')).senders.has('bob@example.com')).toBe(true);
+  });
+
   test('--help paths answer without touching loops', async () => {
     const w = await captured(() => runWaiting(engine, ['--help']));
     expect(w.out).toContain('gbrain waiting');
@@ -369,7 +532,120 @@ describe('runLoops', () => {
     const l = await captured(() => runLoops(engine, ['--help']));
     expect(l.out).toContain('gbrain loops');
     expect(l.out).toContain('mute');
+    expect(l.out).toContain('unmute');
     expect(w.verdict).toBe(0);
     expect(l.verdict).toBe(0);
+  });
+});
+
+// ── gbrain loops show <id> looks the id up directly (#5870) ─────────────────
+
+describe('loops show by id', () => {
+  /**
+   * One aged loop (last activity in 2019), then 230 newer fillers, so the aged
+   * loop sits below the 200-row page `loops list` prints. A second google
+   * source holds one foreign loop.
+   */
+  async function seedShowFixture(): Promise<{ aged: number; foreign: number }> {
+    const { id: aged } = await upsertOpenLoop(engine, loop({
+      threadId: 'aaaa000000000001',
+      counterpartyEmail: 'carol@example.com',
+      summary: 'Reply owed to carol@example.com: "Aged thread"',
+    }));
+    await engine.executeRaw(
+      `UPDATE open_loops SET last_activity_at = '2019-06-01T00:00:00Z' WHERE id = $1`,
+      [aged],
+    );
+    await engine.executeRaw(
+      `INSERT INTO open_loops (source_id, detector, loop_type, dedup_key, summary, counterparty_email, last_activity_at)
+       SELECT 'default', 'deterministic_thread', 'unanswered_inbound', 'thread:filler-' || n || ':unanswered_inbound',
+              'Filler loop ' || n, 'filler' || n || '@example.com',
+              now() - (n || ' minutes')::interval
+       FROM generate_series(1, 230) AS n`,
+    );
+    const googleConfig = { kind: 'google' };
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config, last_sync_at) VALUES ($1, $1, $2::jsonb, now()) ON CONFLICT (id) DO NOTHING`,
+      ['gx', googleConfig],
+    );
+    const { id: foreign } = await upsertOpenLoop(engine, loop({
+      sourceId: 'gx',
+      threadId: 'bbbb000000000002',
+      counterpartyEmail: 'dave@example.com',
+      summary: 'Reply owed to dave@example.com: "Foreign source"',
+    }));
+    return { aged, foreign };
+  }
+
+  test('an open loop below the 200 most recent is shown, verdict 0', async () => {
+    const { aged } = await seedShowFixture();
+    const r = await captured(() => runLoops(engine, ['show', String(aged)]));
+    expect(r.err).toBe('');
+    expect(r.out).toContain(`#${aged} [unanswered_inbound] open`);
+    expect(r.out).toContain('"Aged thread"');
+    expect(r.verdict).toBe(0);
+    expect(r.exitCalled).toBeUndefined();
+  });
+
+  test('a dropped loop is shown without --status, in human and --json output', async () => {
+    const { aged } = await seedShowFixture();
+    await closeOpenLoop(engine, 'default', aged, 'dropped', 'manual');
+    const human = await captured(() => runLoops(engine, ['show', String(aged)]));
+    expect(human.out).toContain(`#${aged} [unanswered_inbound] dropped`);
+    expect(human.verdict).toBe(0);
+    const machine = await captured(() => runLoops(engine, ['show', String(aged), '--json']));
+    const doc = JSON.parse(machine.out) as { ok: boolean; status: string; loop: { id: number; status: string } };
+    expect(doc.ok).toBe(true);
+    expect(doc.loop.id).toBe(aged);
+    expect(doc.loop.status).toBe('dropped');
+  });
+
+  test('--status and --type still narrow a lookup: a mismatch is not_found, verdict 1', async () => {
+    const { aged } = await seedShowFixture();
+    await closeOpenLoop(engine, 'default', aged, 'done', 'manual');
+    const wrongStatus = await captured(() => runLoops(engine, ['show', String(aged), '--status', 'open']));
+    expect(wrongStatus.err).toContain(`Error [not_found]: No loop ${aged} in the sources this command reads.`);
+    expect(wrongStatus.out).toBe('');
+    expect(wrongStatus.verdict).toBe(1);
+    const wrongType = await captured(() => runLoops(engine, ['show', String(aged), '--type', 'decision_pending']));
+    expect(wrongType.err).toContain('Error [not_found]');
+    expect(wrongType.verdict).toBe(1);
+    const matching = await captured(() => runLoops(engine, ['show', String(aged), '--status', 'done']));
+    expect(matching.out).toContain(`#${aged} [unanswered_inbound] done`);
+    expect(matching.verdict).toBe(0);
+  });
+
+  test('--source narrows the lookup: a loop in another source is not_found there', async () => {
+    const { foreign } = await seedShowFixture();
+    const narrowed = await captured(() => runLoops(engine, ['show', String(foreign), '--source', 'default']));
+    expect(narrowed.err).toContain(`No loop ${foreign} in the sources this command reads.`);
+    expect(narrowed.verdict).toBe(1);
+    const home = await captured(() => runLoops(engine, ['show', String(foreign), '--source', 'gx']));
+    expect(home.out).toContain(`#${foreign} [unanswered_inbound] open`);
+    expect(home.verdict).toBe(0);
+  });
+
+  test('a missing id renders not_found with the list fix and no --status advice', async () => {
+    await seedShowFixture();
+    const r = await captured(() => runLoops(engine, ['show', '424242']));
+    expect(r.err).toContain('Error [not_found]: No loop 424242 in the sources this command reads.');
+    expect(r.err).toContain('Fix: gbrain loops list');
+    expect(r.err).not.toContain('closed loops need --status');
+    expect(r.out).toBe('');
+    expect(r.verdict).toBe(1);
+  });
+
+  test.each([
+    ['no id at all', ['show']],
+    ['id 0', ['show', '0']],
+    ['a negative id', ['show', '-5']],
+    ['a fractional id', ['show', '2.5']],
+    ['a non-numeric id', ['show', 'abc']],
+  ])('%s is a usage error: exit 2, invalid_params, nothing on stdout', async (_label, args) => {
+    const r = await captured(() => runLoops(engine, args));
+    expect(r.exitCalled).toBe(2);
+    expect(r.err).toContain('Error [invalid_params]: gbrain loops show needs a loop id of 1 or more.');
+    expect(r.err).toContain('Usage: gbrain loops show <id> [--json]');
+    expect(r.out).toBe('');
   });
 });

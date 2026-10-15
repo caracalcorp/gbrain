@@ -16,19 +16,137 @@
  *   - injection-hardened: INJECTION_PATTERNS sanitation + <thread> DATA wrap
  *   - ALL-or-nothing parse barrier: a malformed batch writes NOTHING
  *   - kill switch: config loops.extraction_enabled (default ON for google
- *     sources), enqueue-side cap LOOPS_EXTRACT_MAX_PER_SWEEP
+ *     sources); structural eligibility gate in front of the queue, generous
+ *     LOOPS_EXTRACT_ENQUEUE_CEILING safety valve instead of a tight cap
+ *   - suppression parity: `loops mute` gates this lane too, checked before
+ *     any model call
  *   - spend honesty: runs on trickle + a bounded recent window; the
  *     historical backfill is never extracted unless opted in
  */
 
 import type { BrainEngine } from '../engine.ts';
-import { upsertOpenLoop, type LoopType } from '../loops/loops-store.ts';
-import { sha8 } from './google-render.ts';
+import { managedFactWritePreflight } from '../facts/managed-fact-write.ts';
+import { loadSuppressions, upsertOpenLoop, type LoopType } from '../loops/loops-store.ts';
+import { isCalendarSystemMail, isNoiseSender, sha8 } from './google-render.ts';
+import { bareAddress, type GmailMessageMeta, type GmailThreadData } from './types.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { deriveTrust } from '../trust/taint.ts';
+import { applyGateDecision, derivedGateConfig, derivedGateInput } from '../trust/derived-gate.ts';
+import { decideFactWrite } from '../write-gate-store.ts';
 
 export const LOOPS_EXTRACT_JOB = 'loops_extract';
+/**
+ * Historical batch size. NO LONGER an enqueue cap — every eligible thread is
+ * queued (up to the generous safety ceiling below) and the worker's
+ * concurrency sets the rate. Kept as the documented in-flight batch
+ * expectation.
+ */
 export const LOOPS_EXTRACT_MAX_PER_SWEEP = 50;
+/**
+ * Generous per-sweep enqueue safety valve (10x the old cap) — a spend
+ * backstop for pathological sweeps, NOT a rate limit. Applied as a
+ * PENDING-DEPTH budget: jobs already waiting, delayed (retry backoff) or
+ * active count against it, so a stalled worker or a flapping provider can
+ * never stack more than ~one ceiling of backlog across repeated sweeps.
+ * Overflow is deferred LOUDLY — the log says so, because a deferred thread is
+ * only re-enqueued when the thread itself changes.
+ */
+export const LOOPS_EXTRACT_ENQUEUE_CEILING = 500;
 /** Only threads whose newest message is within this window get extracted. */
 export const LOOPS_EXTRACT_WINDOW_DAYS = 30;
+/**
+ * Judge output caps (#3763 parity with propose_takes). A dense thread can
+ * extract more loops than the base cap carries, and thinking models spend
+ * reasoning tokens inside it. A retry at the same cap truncates identically,
+ * so a `length` stop retries once at the escalated cap; a second truncation
+ * fails the job with the ceiling named.
+ */
+const LOOPS_EXTRACT_MAX_TOKENS = 2048;
+const LOOPS_EXTRACT_RETRY_MAX_TOKENS = 8192;
+
+/** Gmail categories that are bulk by construction. */
+const BULK_CATEGORY_LABELS = ['CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL', 'CATEGORY_FORUMS'];
+
+export interface ExtractEligibility {
+  eligible: boolean;
+  /** Stable machine reason — safe to count and log, carries no message text. */
+  reason:
+    | 'owner_participated'
+    | 'human_correspondence'
+    | 'spam_or_trash'
+    | 'no_substantive_messages'
+    | 'bulk_category'
+    | 'list_mail';
+}
+
+/**
+ * Should this thread be sent to the extractor at all?
+ *
+ * Before this gate every rendered page under the recency window became a
+ * candidate, which was wrong in both directions at once: newsletters and
+ * promotions were paying for model calls, and because the sweep then kept
+ * only the newest N, real threads were pushed out by that same bulk mail.
+ *
+ * The rules are structural — Gmail labels and message shape — and deliberately
+ * contain no sender, domain, subject or body matching, so no vendor list has
+ * to be maintained and nobody's mail is special-cased.
+ *
+ * The load-bearing rule is `owner_participated`: a thread carrying ANY
+ * substantive (non-noise, non-calendar) message from the account owner stays
+ * eligible whatever its labels say, because the owner's own outbound message is
+ * exactly where their commitment lives. That is what makes "I'll send this by
+ * Friday", written in reply to a bulk-labelled thread, still reachable — while
+ * an RSVP notice Calendar sent on the owner's behalf does not count as writing.
+ *
+ * CATEGORY_UPDATES is deliberately NOT excluded: invoices, contracts and
+ * document requests land there, and they carry real obligations.
+ */
+export function loopExtractionEligibility(
+  thread: GmailThreadData,
+  myAddresses: Set<string> = new Set(),
+): ExtractEligibility {
+  const messages = thread.messages;
+  if (messages.length === 0) return { eligible: false, reason: 'no_substantive_messages' };
+
+  const labels = new Set<string>();
+  for (const m of messages) for (const l of m.labelIds) labels.add(l);
+
+  // Deleted or spam mail is never an obligation, whoever wrote it.
+  if (labels.has('SPAM') || labels.has('TRASH')) {
+    return { eligible: false, reason: 'spam_or_trash' };
+  }
+
+  // Machine mail carries no commitments: pure noise senders, and Calendar's
+  // invitation/response notices (which come FROM a real colleague, so the
+  // sender check alone cannot see them). Computed FIRST: the owner override
+  // below only counts messages the owner actually wrote — an "Accepted:" RSVP
+  // Calendar sends on the owner's behalf (SENT label, METHOD:REPLY) is still
+  // calendar mail, so a pure invitation exchange never pays for a model call.
+  // RFC 3834 auto-submitted mail (tracker notices, auto-replies) is machine
+  // mail by its own declaration and counts exactly like a noise sender.
+  const substantive = messages.filter(
+    (m) => !isNoiseSender(m.fromAddress) && !isCalendarSystemMail(m) && !m.autoSubmitted,
+  );
+  if (substantive.length === 0) return { eligible: false, reason: 'no_substantive_messages' };
+
+  // The owner's own message is where their promise is. This beats every
+  // exclusion below — replying to a newsletter makes the thread real.
+  const ownerWrote = (m: GmailMessageMeta): boolean =>
+    m.labelIds.includes('SENT') || myAddresses.has(m.fromAddress);
+  if (substantive.some(ownerWrote)) return { eligible: true, reason: 'owner_participated' };
+
+  // Bulk by Gmail's own classification, and the owner never joined in.
+  if (BULK_CATEGORY_LABELS.some((l) => labels.has(l))) {
+    return { eligible: false, reason: 'bulk_category' };
+  }
+
+  // Bulk by RFC 2369, and the owner never joined in.
+  if (substantive.every((m) => m.listUnsubscribe)) {
+    return { eligible: false, reason: 'list_mail' };
+  }
+
+  return { eligible: true, reason: 'human_correspondence' };
+}
 
 export async function isLoopsExtractionEnabled(engine: BrainEngine): Promise<boolean> {
   try {
@@ -158,6 +276,26 @@ export interface LoopsExtractResult {
   loop_ids: number[];
 }
 
+/**
+ * A TRANSIENT outcome (provider unavailable, truncated or malformed model
+ * output) — thrown, never returned. A returned `skipped` would complete the
+ * minion job "successfully" and permanently consume the revision-keyed
+ * idempotency slot (`loops:<src>:<slug>:<newestMs>` only regenerates when the
+ * thread is touched again), silently never extracting that revision. Throwing
+ * hands the outcome to the queue's attempt/backoff machinery; once attempts are
+ * exhausted the DEAD row frees the slot, so the next sweep that sees the thread
+ * (`sync --full` re-candidates every in-window thread) can enqueue it afresh.
+ */
+export class LoopsExtractRetryableError extends Error {
+  constructor(
+    readonly reason: 'llm_unavailable' | 'truncated' | 'parse_barrier',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'LoopsExtractRetryableError';
+  }
+}
+
 export async function runLoopsExtract(
   engine: BrainEngine,
   payload: LoopsExtractPayload,
@@ -172,26 +310,72 @@ export async function runLoopsExtract(
   const threadId =
     payload.threadId ?? (typeof fm.thread_id === 'string' ? fm.thread_id : payload.slug);
 
+  // `loops mute` is one policy surface for both detectors. Previously it only
+  // guarded deterministic opens, so the LLM lane could recreate a commitment
+  // or decision for a sender/thread the operator had explicitly suppressed.
+  // Check before provider availability and before any model/facts/edge write.
+  // Sender mutes cover every SENDER in the thread — `fm.senders`, the message
+  // authors the renderer stamps — not just fm.from (the NEWEST author), so a
+  // muted counterparty who wrote earlier still gates the lane. Senders ONLY:
+  // recipients/CC never count, or muting one person would hide everyone
+  // else's commitments in a group thread, and an outside sender could dodge
+  // extraction by CC'ing a known-muted address. Pages rendered before
+  // `senders` existed fall back to fm.from alone.
+  const suppressions = await loadSuppressions(engine, payload.sourceId);
+  const senderAddresses = new Set<string>();
+  if (typeof fm.from === 'string' && fm.from.trim() !== '') {
+    senderAddresses.add(bareAddress(fm.from));
+  }
+  if (Array.isArray(fm.senders)) {
+    for (const s of fm.senders) {
+      if (typeof s === 'string' && s.trim() !== '') senderAddresses.add(bareAddress(s));
+    }
+  }
+  if (
+    suppressions.threads.has(threadId.toLowerCase()) ||
+    [...senderAddresses].some((a) => suppressions.senders.has(a))
+  ) {
+    return { ...empty, reason: 'suppressed' };
+  }
+
+  // Managed brains publish the commitment fact through the coordinator; its
+  // authority and canonical owner are checked here, before the model call.
+  await managedFactWritePreflight(engine, payload.sourceId);
   const { isAvailable, chat } = await import('../ai/gateway.ts');
-  if (!isAvailable('chat')) return { ...empty, reason: 'llm_unavailable' };
+  // Keyless install / provider outage: NOT a skip. The sweep already refuses to
+  // enqueue while chat is unavailable; a job that reaches here mid-outage must
+  // fail visibly and retry, or its revision is never extracted (see the class).
+  if (!isAvailable('chat')) {
+    throw new LoopsExtractRetryableError(
+      'llm_unavailable',
+      'loops_extract: chat provider unavailable (no configured chat model / API key) — retryable',
+    );
+  }
 
   // Injection hardening: same sanitation the facts extractor applies.
   const { INJECTION_PATTERNS } = await import('../think/sanitize.ts');
-  let content = (page.compiled_truth ?? '').slice(0, 12_000);
+  // Open-loop extraction is recency-sensitive: the newest outer messages can
+  // fulfil an older promise or add a fresh one. Keeping the oldest 12k silently
+  // hid the latest reply on long threads. Bound the same payload size, but keep
+  // the tail so the newest evidence is always visible to the judge.
+  let content = (page.compiled_truth ?? '').slice(-12_000);
   for (const p of INJECTION_PATTERNS) content = content.replace(p.rx, p.replacement);
 
   let text: string;
   try {
-    const res = await chat({
-      system: JUDGE_SYSTEM,
-      messages: [
-        {
-          role: 'user',
-          content: `<thread subject=${JSON.stringify(page.title ?? '')} account_owner="me">\n${content}\n</thread>\n\nExtract the open loops.`,
-        },
-      ],
-      maxTokens: 2000,
-    });
+    const call = (maxTokens: number) =>
+      chat({
+        system: JUDGE_SYSTEM,
+        messages: [
+          {
+            role: 'user',
+            content: `<thread subject=${JSON.stringify(page.title ?? '')} account_owner="me">\n${content}\n</thread>\n\nExtract the open loops.`,
+          },
+        ],
+        maxTokens,
+      });
+    let res = await call(LOOPS_EXTRACT_MAX_TOKENS);
+    if (res.stopReason === 'length') res = await call(LOOPS_EXTRACT_RETRY_MAX_TOKENS);
     if (res.stopReason === 'refusal' || res.stopReason === 'content_filter') {
       return { ...empty, reason: 'refused' };
     }
@@ -201,7 +385,12 @@ export async function runLoopsExtract(
     // (`loops:<src>:<slug>:<newestMs>` only regenerates when the thread is
     // touched again), silently never extracting that revision's commitments.
     if (res.stopReason === 'length') {
-      throw new Error('loops_extract: model output truncated (stopReason=length) — retryable');
+      throw new LoopsExtractRetryableError(
+        'truncated',
+        `loops_extract: model output truncated (stopReason=length) at the ${LOOPS_EXTRACT_RETRY_MAX_TOKENS}-token ` +
+          `ceiling after one escalation from ${LOOPS_EXTRACT_MAX_TOKENS}; the thread extracts more loops than the ` +
+          'ceiling carries — retryable',
+      );
     }
     text = res.text;
   } catch (err) {
@@ -210,7 +399,10 @@ export async function runLoopsExtract(
 
   const extraction = parseLoopsJson(text);
   if (extraction === null) {
-    throw new Error('loops_extract: model response failed the all-or-nothing parse barrier — retryable');
+    throw new LoopsExtractRetryableError(
+      'parse_barrier',
+      'loops_extract: model response failed the all-or-nothing parse barrier — retryable',
+    );
   }
 
   // Evidence quotes render as receipts (`> "…"`) on the trusted-local waiting
@@ -226,6 +418,10 @@ export async function runLoopsExtract(
 
   const loopIds: number[] = [];
   const messageDate = typeof fm.date === 'string' ? fm.date : new Date().toISOString();
+  // #5575 I2/B3: the model read only this email page, so its commitment facts carry the page's tier
+  // (a connector page is external_untrusted) and pass the write gate at that tier.
+  const derivation = await deriveTrust(engine, [{ table: 'pages', id: page.id }], { channel: 'derive:loops' });
+  const gateCfg = await derivedGateConfig(engine);
 
   for (const c of extraction.commitments) {
     const loopType: LoopType =
@@ -235,19 +431,31 @@ export async function runLoopsExtract(
     // Projection 1 — facts row (fence-first, deduped/superseding).
     let factId: number | null = null;
     try {
-      const { writeSingleFact } = await import('../facts/write-single.ts');
-      const result = await writeSingleFact(engine, payload.sourceId, {
+      const fact = {
         fact: c.text,
         provenance: `email thread "${(page.title ?? '').slice(0, 80)}" (${payload.slug})`,
-        kind: 'commitment',
+        kind: 'commitment' as const,
         entity: counterpartyRef,
-        visibility: 'private',
+        visibility: 'private' as const,
         validUntil: c.due_iso ? new Date(`${c.due_iso}T23:59:59Z`) : null,
         confidence: 0.85,
-      });
-      factId = result.id;
-    } catch {
-      /* the loop row still lands; facts projection is best-effort */
+      };
+      const gate = decideFactWrite({ fact: fact.fact, source: fact.provenance },
+        { sourceId: payload.sourceId, slug: counterpartyRef, payload: fact, input: derivedGateInput(derivation.trust), cfg: gateCfg });
+      if (gate.action !== 'insert') {
+        // A held or rejected commitment writes no fact; the loop row below still records it for the owner.
+        await maintenanceTransaction(engine, tx => applyGateDecision(tx, gate, { table: 'facts', sourceId: payload.sourceId }, async () => null));
+      } else {
+        const { writeSingleFact } = await import('../facts/write-single.ts');
+        factId = (await writeSingleFact(engine, payload.sourceId, { ...fact, derivation, gate })).id;
+      }
+    } catch (err) {
+      // The loop row still lands; the facts projection is best-effort, but its
+      // failure is logged. Slug, source and a bounded error only: the
+      // commitment text and quote stay out of logs.
+      const code = (err as { code?: unknown })?.code;
+      console.warn(`[loops_extract] fact projection failed slug=${payload.slug} source=${payload.sourceId}` +
+        ` (${typeof code === 'string' ? code : err instanceof Error ? err.name : 'error'}): ${(err instanceof Error ? err.message : String(err)).slice(0, 200)}`);
     }
 
     // Counterparty slug: high-confidence resolutions only. The facts layer's

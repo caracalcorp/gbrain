@@ -114,7 +114,9 @@ export async function runEvalCommand(engine: BrainEngine, args: string[]): Promi
   // v0.32.3 search-lite — per-mode orchestrator + comparison report.
   if (sub === 'run-all') {
     const { runEvalRunAll } = await import('./eval-run-all.ts');
-    return runEvalRunAll(engine, args.slice(1));
+    const { setCliExitVerdict } = await import('../core/cli-force-exit.ts');
+    setCliExitVerdict(await runEvalRunAll(engine, args.slice(1)));
+    return;
   }
   if (sub === 'compare') {
     const { runEvalCompare } = await import('./eval-compare.ts');
@@ -422,7 +424,7 @@ SUBCOMMANDS (#3686 — each has its own flag surface)
   retrieval-quality          Retrieval-quality suite over the calibration corpus
   gate                       CI pass/fail gate over a saved baseline
   compare                    Compare two saved eval runs
-  run-all                    Orchestrate every suite (works with no brain configured)
+  run-all                    Run the wired suites (brainbench); names the per-suite commands for the rest
   brainbench                 Cross-harness memory conformance suite (hermetic)
   longmemeval                LongMemEval benchmark (brings its own in-memory brain)
   cross-modal                Cross-modal quality gate (pure API calls, no DB)
@@ -462,6 +464,13 @@ QRELS FORMAT
     ]
   }
   "grades" is optional — enables graded nDCG. Without it, binary relevance is used.
+  A bare array of entries (no wrapper) is also accepted, as are the
+  \`gbrain eval gate\` per-entry keys ("relevant_slugs" / "first_relevant_slug",
+  in a {"schema_version": 1, "queries": [...]} wrapper) — they map onto
+  "relevant". The gate's federated shape ("relevant" as {source_id, slug}
+  objects) is gate-only: this command compares unqualified slugs and rejects
+  it with a pointer to \`gbrain eval gate\`. Every entry is validated BEFORE
+  any search is billed.
 
 CONFIG FORMAT
   { "name": "rrf-k-30", "strategy": "hybrid", "rrf_k": 30, "expand": false }

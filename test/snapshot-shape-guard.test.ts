@@ -2,13 +2,13 @@
  * W0 ship-review coverage (GAP-2) — the snapshot loader's shape + hash guards.
  *
  * The fixture is default-on for every `bun run test`, so a wrong snapshot
- * poisons the whole suite (the 1280-vs-1536 incident: 115 failures from one
+ * poisons the whole suite (the 1024-vs-1536 incident: 115 failures from one
  * root cause). These tests pin the three refusal paths and the
  * handler-aware hash (D5.13).
  */
 
 import { test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import * as crypto from 'node:crypto';
@@ -20,6 +20,7 @@ import {
   __resetSnapshotMemoForTests,
 } from '../src/core/pglite-engine.ts';
 import { getEmbeddingDimensions, getEmbeddingModel } from '../src/core/ai/gateway.ts';
+import { snapshotSchemaInputs } from '../src/core/snapshot-schema-inputs.ts';
 
 let dir: string;
 
@@ -84,7 +85,7 @@ test('memo: shape refusal is per-call, never cached as terminal — and costs ze
   // Hash matches but dims mismatch: the version entry is memoized yet every
   // call re-runs the shape gate against the CURRENT gateway config — an
   // engine with a matching config later in the same process could still
-  // load this snapshot (the zembed/1280 poisoning guard staying hot behind
+  // load this snapshot (the voyage-4/1024 poisoning guard staying hot behind
   // the memo). The 42MB tar read is deferred until a shape-MATCHING caller,
   // so a process that only ever refuses never reads it at all.
   const tar = writeFixture(`${currentHash()}\ndims=99999\nmodel=${getEmbeddingModel()}\n`);
@@ -103,25 +104,56 @@ test('memo: stale hash is terminal — tar never read, repeat calls short-circui
   expect(__snapshotMemoStatsForTests().tarReads).toBe(0);
 });
 
-test('D5.13 (file-bytes form): the hash is the exact recipe over migrate.ts + pglite-schema.ts bytes', () => {
+// EO7: the inputs are the computed static import closure of the schema roots
+// (src/core/snapshot-schema-inputs.ts), independently checked against a TS-AST
+// closure and the CI cache keys by test/snapshot-inputs-closure.test.ts.
+// test-reads-source-ok[raw-bytes]: the closure walk reads module text to follow imports.
+const schemaInputs = snapshotSchemaInputs((f) => existsSync(`src/core/${f}`), (f) => readFileSync(`src/core/${f}`, 'utf8'));
+
+test('D5.13: the coverage-immune hash includes schema entry modules and imported migration dependencies', () => {
   // The D5.13 property (editing a migration HANDLER stales the snapshot) is
-  // structural now: handlers live in migrate.ts, and the hash is the raw file
-  // bytes — any edit changes it. The file-bytes form exists because the old
+  // structural now: inline handlers and imported helpers are hashed as raw
+  // file bytes — any edit changes it. The file-bytes form exists because the old
   // in-memory form folded Function.prototype.toString, which coverage
   // instrumentation rewrites: every `bun test --coverage` CI shard computed a
   // different hash than the plain-`bun run` builder and silently cold-initted.
   // Pin the recipe against an independent computation so a drift in either
   // side (recipe or file resolution) fails HERE, not as a silent slow path.
   const expected = crypto.createHash('sha256');
-  expected.update('files:v2\n');
-  // test-reads-source-ok: the hash under test is DEFINED over these files'
-  // raw bytes (coverage-immune by design) — an independent byte read is the
-  // only way to pin the recipe without reusing the implementation.
-  expected.update(readFileSync('src/core/migrate.ts'));
-  expected.update('\n--\n');
-  // test-reads-source-ok: same recipe pin — the hash is defined over these bytes.
-  expected.update(readFileSync('src/core/pglite-schema.ts'));
+  expected.update('files:v4\n');
+  for (const file of schemaInputs) {
+    expected.update(`${file}\n`);
+    // test-reads-source-ok[raw-bytes]: independent raw-byte hash contract, including imported SQL/handlers.
+    expected.update(readFileSync(`src/core/${file}`));
+    expected.update('\n--\n');
+  }
   expect(computeSnapshotSchemaHash(crypto, fsModule)).toBe(expected.digest('hex'));
   // Determinism: two computations agree.
   expect(computeSnapshotSchemaHash(crypto, fsModule)).toBe(computeSnapshotSchemaHash(crypto, fsModule));
+});
+
+test.each(schemaInputs)('editing imported snapshot input %s invalidates the cached schema', (file) => {
+  const original = currentHash();
+  const changedFs = {
+    ...fsModule,
+    readFileSync: (path: Parameters<typeof fsModule.readFileSync>[0]) => {
+      // test-reads-source-ok[raw-bytes]: emulate a changed source without mutating shared checkout files.
+      const bytes = fsModule.readFileSync(path);
+      return String(path).endsWith(`/src/core/${file}`)
+        ? Buffer.concat([bytes, Buffer.from('\n// schema dependency changed\n')]) : bytes;
+    },
+  } as typeof fsModule;
+  expect(computeSnapshotSchemaHash(crypto, changedFs)).not.toBe(original);
+});
+
+test('an unreadable imported schema dependency disables snapshot reuse', () => {
+  const missingFs = {
+    ...fsModule,
+    readFileSync: (path: Parameters<typeof fsModule.readFileSync>[0]) => {
+      if (String(path).endsWith('/grants/schema.ts')) throw new Error('ENOENT');
+      // test-reads-source-ok[raw-bytes]: raw-byte hash failure-path regression.
+      return fsModule.readFileSync(path);
+    },
+  } as typeof fsModule;
+  expect(computeSnapshotSchemaHash(crypto, missingFs)).toBeNull();
 });

@@ -58,6 +58,16 @@ export function validateSlug(slug: string): string {
 }
 
 /**
+ * The extract_atoms completion marker key. The phase stamps
+ * `substring(content_hash, 1, 16)` under this key when a page has been
+ * mined; eligibility is `frontmatter->>ATOMS_SCAN_HASH_KEY <> substring
+ * (content_hash, 1, 16)`. Owned by the phase (and the trusted local CLI);
+ * untrusted remote writers must not set it (import-file.ts strips it on
+ * `remote === true` so a remote put_page cannot suppress mining).
+ */
+export const ATOMS_SCAN_HASH_KEY = 'atoms_scan_hash';
+
+/**
  * Frontmatter keys excluded from the content hash. Timestamp-bearing keys
  * (`captured_at`/`ingested_at`, stamped per capture call) and gate-derived
  * sanity markers (quarantine / content_flag / embed_skip, re-derived
@@ -71,6 +81,21 @@ export const HASH_EPHEMERAL_FRONTMATTER_KEYS: readonly string[] = [
   QUARANTINE_KEY,
   CONTENT_FLAG_KEY,
   EMBED_SKIP_KEY,
+  // Same bug class as captured_at (CV8) and the gate markers (#1699):
+  // extract-atoms stamps `atoms_scan_hash` INTO the frontmatter as its
+  // completion marker, and eligibility compares that marker against
+  // substring(content_hash, 1, 16). Without this exclusion, writing the
+  // marker changes the very hash it is compared against, so every scanned
+  // page re-arms on the next export->sync and the LLM extraction re-mines
+  // the same sources into paraphrased near-duplicate atoms forever
+  // (paraphrases defeat content_hash_duplicates). The marker is re-derived
+  // deterministically from the body, so dropping it from the hash is safe.
+  ATOMS_SCAN_HASH_KEY,
+  // #5575 CEO-21: the lower-only `trust_tier` marker a below-owner write-through stamps. It labels the
+  // content, it is not content: page purge tombstones match (source_id, content_hash) with or without it,
+  // and an agent stamping it onto identical content is no content change. (The tier trigger still treats
+  // it as content: trust/schema.ts TRUST_EPHEMERAL_FRONTMATTER_KEYS excludes it.)
+  'trust_tier',
 ];
 
 /**
@@ -201,10 +226,15 @@ export function rowToPage(row: Record<string, unknown>): Page {
     timeline: row.timeline as string,
     frontmatter: (typeof row.frontmatter === 'string' ? JSON.parse(row.frontmatter) : row.frontmatter) as Record<string, unknown>,
     content_hash: row.content_hash as string | undefined,
+    ...(row.source_path !== undefined && { source_path: row.source_path as string | null }),
+    ...(row.knowledge_revision != null && { knowledge_revision: String(row.knowledge_revision) }),
+    ...(row.text_projection_revision !== undefined && { text_projection_revision: row.text_projection_revision as string | null }),
     // v0.29 (column added in migration v40). Old brains pre-migration return undefined.
     emotional_weight: row.emotional_weight == null ? undefined : Number(row.emotional_weight),
     created_at: new Date(row.created_at as string),
     updated_at: new Date(row.updated_at as string),
+    // Microsecond-exact ISO, projected by listPages for keyset resumption.
+    ...(row.updated_at_iso !== undefined && { updated_at_iso: String(row.updated_at_iso) }),
     ...(deletedAt !== undefined && { deleted_at: deletedAt }),
     // v0.29.1 (columns added in migration v41). Optional in SELECT projection.
     ...(effectiveDate !== undefined && { effective_date: effectiveDate }),
@@ -218,6 +248,9 @@ export function rowToPage(row: Record<string, unknown>): Page {
     ...(ingestedVia !== undefined && { ingested_via: ingestedVia }),
     ...(ingestedAt !== undefined && { ingested_at: ingestedAt }),
     ...(contextualRetrievalMode !== undefined && { contextual_retrieval_mode: contextualRetrievalMode }),
+    // Three-state like the provenance columns: getPage projects it so the import
+    // skip path can compare before issuing the #4588 source_path refresh.
+    ...(row.source_path !== undefined && { source_path: row.source_path as string | null }),
     // v0.31.12: propagate source_id so downstream callers (embed, reconcile-links)
     // can thread it through getChunks / upsertChunks without defaulting to 'default'.
     // v0.32.8: Page.source_id is required. Every SELECT feeding rowToPage now
@@ -348,6 +381,17 @@ export function isUndefinedTableError(error: unknown): boolean {
   return /relation .* does not exist|no such table|undefined table/i.test(message);
 }
 
+/**
+ * SQLSTATE 22007 / 22008: a date or timestamp the database could not parse.
+ * On a read path that is the caller's input, never a degraded result or a
+ * server fault: list_pages reports it as invalid_params and the hybrid
+ * lexical arms rethrow it instead of failing open.
+ */
+export function isDatetimeInputError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return code === '22007' || code === '22008';
+}
+
 const _warnedKeys = new Set<string>();
 
 /**
@@ -419,34 +463,17 @@ export function rowToChunk(row: Record<string, unknown>, includeEmbedding = fals
   };
 }
 
-export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
-  const result: SearchResult = {
-    slug: row.slug as string,
-    page_id: row.page_id as number,
-    title: row.title as string,
-    type: row.type as string,
-    chunk_text: row.chunk_text as string,
-    chunk_source: row.chunk_source as 'compiled_truth' | 'timeline',
-    chunk_id: row.chunk_id as number,
-    chunk_index: row.chunk_index as number,
-    score: Number(row.score),
-    stale: Boolean(row.stale),
-  };
-  // v0.17.0: source_id comes from the p.source_id column in search
-  // SELECTs. Keep the field optional so pre-v0.17 engines that didn't
-  // join sources don't crash on the absent column — rowToSearchResult
-  // is shared by both paths.
-  if (typeof row.source_id === 'string') {
-    result.source_id = row.source_id;
-  }
-  // v0.34: effective_date / effective_date_source carried through from the
-  // pages join. Same three-state read as readOptionalDate elsewhere: the
-  // field is left UNTOUCHED when the column isn't in the projection (so
-  // legacy callers see undefined), set to null when the column was selected
-  // but the page row has no date, and to YYYY-MM-DD when populated. Postgres
-  // returns Date objects via postgres.js; PGLite returns strings. Normalize
-  // to date-only ISO so downstream prompt-builders don't see noise from
-  // midnight-UTC timestamps.
+/**
+ * v0.34: effective_date / effective_date_source carried through from the
+ * pages join. Same three-state read as readOptionalDate elsewhere: the
+ * field is left UNTOUCHED when the column isn't in the projection (so
+ * legacy callers see undefined), set to null when the column was selected
+ * but the page row has no date, and to YYYY-MM-DD when populated. Postgres
+ * returns Date objects via postgres.js; PGLite returns strings. Normalize
+ * to date-only ISO so downstream prompt-builders don't see noise from
+ * midnight-UTC timestamps. Shared by search rows and frozen-hit rows.
+ */
+export function applyEffectiveDate(result: SearchResult, row: Record<string, unknown>): void {
   if ('effective_date' in row) {
     const raw = row.effective_date;
     if (raw === null) {
@@ -467,6 +494,29 @@ export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
       result.effective_date_source = raw;
     }
   }
+}
+
+export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
+  const result: SearchResult = {
+    slug: row.slug as string,
+    page_id: row.page_id as number,
+    title: row.title as string,
+    type: row.type as string,
+    chunk_text: row.chunk_text as string,
+    chunk_source: row.chunk_source as 'compiled_truth' | 'timeline',
+    chunk_id: row.chunk_id as number,
+    chunk_index: row.chunk_index as number,
+    score: Number(row.score),
+    stale: Boolean(row.stale),
+  };
+  // v0.17.0: source_id comes from the p.source_id column in search
+  // SELECTs. Keep the field optional so pre-v0.17 engines that didn't
+  // join sources don't crash on the absent column — rowToSearchResult
+  // is shared by both paths.
+  if (typeof row.source_id === 'string') {
+    result.source_id = row.source_id;
+  }
+  applyEffectiveDate(result, row);
   if (typeof row.message_id === 'string' && row.message_id.trim().length > 0) {
     result.message_id = row.message_id;
   }
@@ -561,4 +611,19 @@ export function staleTakeRowToRow(row: Record<string, unknown>): StaleTakeRow {
     row_num: Number(row.row_num),
     claim: String(row.claim),
   };
+}
+
+/**
+ * JSON replacer: `bigint` → string, matching the postgres.js wire shape (int8
+ * comes back as a string on the routed path). Lets any op-output serializer
+ * round-trip bigint columns (e.g. a `BIGSERIAL` `id`) instead of throwing
+ * `TypeError: Do not know how to serialize a BigInt`. Shared by cli.ts's
+ * local-result normalizer and the commands that stringify results themselves
+ * (`gbrain call`, the extract explain JSON view) — commands import it from
+ * here, never from the dispatcher. NOTE: no double-dash flag literals in this
+ * comment — the flag-registry generator harvests them from every module a
+ * command transitively imports, and utils.ts is imported by nearly all.
+ */
+export function bigintToStringReplacer(_key: string, value: unknown): unknown {
+  return typeof value === 'bigint' ? value.toString() : value;
 }

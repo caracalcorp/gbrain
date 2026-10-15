@@ -69,7 +69,14 @@ describe('get_job_stats op', () => {
     expect(res.isError).toBe(true);
     const body = parsed(res);
     expect(body.error).toBe('unavailable');
-    expect(body.suggestion).toContain('apply-migrations');
+    expect(body.reason).toBe('schema_missing');
+    expect(body.message).not.toContain('relation "minion_jobs"');
+    // The cause (pending migrations or a dropped table) is not knowable here: the fix is the diagnostic
+    // doctor read, and the suggestion quotes it instead of naming a different command.
+    expect(body.suggestion).toContain('pending schema migrations');
+    expect(body.fix.mcp).toEqual({ tool: 'run_doctor', arguments: {} });
+    expect(body.suggestion).toContain('Next: run_doctor {}');
+    expect(body.suggestion).not.toContain('apply-migrations');
   });
 });
 
@@ -81,12 +88,12 @@ describe('get_job_stats — private dream-inline queues', () => {
     // ONLY the private-queue classification keeps wedged false here — if it
     // regressed, this fixture would trip the wedge derivation.
     await engine.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at, updated_at)
-       VALUES ('subagent', '${PRIVATE_QUEUE}', 'waiting', now() - interval '2 hours', now() - interval '2 hours')`,
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, updated_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', '${PRIVATE_QUEUE}', 'waiting', now() - interval '2 hours', now() - interval '2 hours')`,
     );
     await engine.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, updated_at)
-       VALUES ('subagent', '${PRIVATE_QUEUE}', 'completed', now() - interval '90 minutes')`,
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, updated_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', '${PRIVATE_QUEUE}', 'completed', now() - interval '90 minutes')`,
     );
     await withEnv({ GBRAIN_WEDGED_QUEUE_WARN_MINUTES: undefined }, async () => {
       const res = await dispatchToolCall(engine, 'get_job_stats', { queue: PRIVATE_QUEUE }, { ...STDIO });

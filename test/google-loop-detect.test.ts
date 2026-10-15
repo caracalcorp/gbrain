@@ -13,7 +13,9 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  asksQuestion,
   detectThreadLoop,
+  isAcknowledgementOnly,
   INBOUND_GRACE_HOURS,
   OUTBOUND_GRACE_HOURS,
   type ThreadLoopVerdict,
@@ -40,6 +42,10 @@ interface MsgSpec {
   body?: string;
   subject?: string;
   listUnsub?: boolean;
+  /** iCalendar method — non-null marks Google Calendar system mail. */
+  calendarMethod?: string | null;
+  /** RFC 3834 Auto-Submitted other than "no". */
+  autoSubmitted?: boolean;
   /** Explicit internalDateMs override (0 = the all-zero-date case). */
   dateMs?: number;
 }
@@ -58,6 +64,8 @@ function msg(spec: MsgSpec): GmailMessageMeta {
     subject: spec.subject ?? 'Quarterly plan',
     dateIso: new Date(Math.max(internalDateMs, 0)).toISOString(),
     internalDateMs,
+    calendarMethod: spec.calendarMethod ?? null,
+    ...(spec.autoSubmitted !== undefined ? { autoSubmitted: spec.autoSubmitted } : {}),
     labelIds: spec.sent ? ['SENT'] : ['INBOX'],
     listUnsubscribe: spec.listUnsub ?? false,
     bodyText: spec.body ?? 'Can you review the plan?',
@@ -393,6 +401,58 @@ const CASES: CorpusCase[] = [
     ],
     expect: null,
   },
+  // ── Grace runs from the oldest unanswered message (gbrain-evals N7-1) ─────
+  // First sight of a thread (backfill, sync gap): a fresh nudge must not
+  // restart the clock on a request that has waited past the window.
+  {
+    name: 'request 40h + nudge 5h, first sight → unanswered_inbound (clock starts at the request)',
+    messages: [
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, body: 'Can you send the deck?' }),
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 5, body: 'Bumping this. Any news?' }),
+    ],
+    expect: { type: 'unanswered_inbound', counterparty: 'bob@example.com' },
+  },
+  {
+    name: 'my ask 100h + my follow-up 10h, first sight → unanswered_outbound (clock starts at the ask)',
+    messages: [
+      msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 100, sent: true, body: 'Could you confirm the date?' }),
+      msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 10, sent: true, body: 'Following up on this. Any update?' }),
+    ],
+    expect: { type: 'unanswered_outbound', counterparty: 'bob@example.com' },
+  },
+  {
+    name: 'fresh request 10h + nudge 2h → none (the whole run is inside grace)',
+    messages: [
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 10 }),
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 2 }),
+    ],
+    expect: null,
+  },
+  {
+    name: 'inbound 40h, my reply 30h, their nudge 5h → none (the run starts after my reply)',
+    messages: [
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40 }),
+      msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Will do.' }),
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 5 }),
+    ],
+    expect: null,
+  },
+  {
+    name: 'CC-only mail 40h + direct ask 5h → none (the reply is owed from the To: message)',
+    messages: [
+      msg({ from: 'bob@example.com', to: ['carol@example.com'], cc: ['me@example.com'], ageHours: 40 }),
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 5 }),
+    ],
+    expect: null,
+  },
+  {
+    name: 'my FYI 100h + my question 10h → none (the ask is fresh)',
+    messages: [
+      msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 100, sent: true, body: 'Notes attached.' }),
+      msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 10, sent: true, body: 'Can you review?' }),
+    ],
+    expect: null,
+  },
 ];
 
 describe('detectThreadLoop precision corpus', () => {
@@ -484,5 +544,323 @@ describe('detectThreadLoop precision corpus', () => {
       NOW,
     );
     expect(verdict.open[0].evidence[0].quote?.length).toBe(200);
+  });
+});
+
+// gbrain-evals N7 (2026-10-02 receipt, repros n7-2, n7-6, n7-7).
+describe('N7 open-loops wave regressions', () => {
+  test('N7-7: a question mark inside a link is not an ask', () => {
+    expect(asksQuestion('FYI, the doc: https://docs.example.com/view?id=42')).toBe(false);
+    expect(asksQuestion('See www.example.com/a?b=c for details.')).toBe(false);
+    expect(asksQuestion('Can you check https://docs.example.com/view?id=42 ?')).toBe(true);
+    const v = detectThreadLoop(
+      thread([msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 100, sent: true, body: 'FYI, the doc: https://docs.example.com/view?id=42' })]),
+      MY,
+      NOW,
+    );
+    expect(v.open).toEqual([]);
+  });
+
+  test('N7-2: "Thanks!" to a question neither closes nor restarts the reply-owed loop', () => {
+    const ask = msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, body: 'Can you send the deck?' });
+    const v = detectThreadLoop(
+      thread([ask, msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Thanks!' })]),
+      MY,
+      NOW,
+    );
+    expect(v.close).not.toContain('unanswered_inbound');
+    expect(v.open).toHaveLength(1);
+    expect(v.open[0].loopType).toBe('unanswered_inbound');
+    expect(v.open[0].openedMs).toBe(ask.internalDateMs);
+  });
+
+  test('N7-2: an acknowledgement of a message that asked nothing is still a reply', () => {
+    const v = detectThreadLoop(
+      thread([
+        msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, body: 'Here is the deck.' }),
+        msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Thanks!' }),
+      ]),
+      MY,
+      NOW,
+    );
+    expect(v.open).toEqual([]);
+    expect(v.close).toEqual(['unanswered_inbound']);
+  });
+
+  test('N7-2: a substantive reply still closes', () => {
+    const v = detectThreadLoop(
+      thread([
+        msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, body: 'Can you send the deck?' }),
+        msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Thanks! Attached is the deck.' }),
+      ]),
+      MY,
+      NOW,
+    );
+    expect(v.open).toEqual([]);
+    expect(v.close).toEqual(['unanswered_inbound']);
+  });
+
+  test('acknowledgement detection is narrow', () => {
+    for (const t of ['Thanks!', 'thank you', 'Got it, thanks.', 'Thanks, Bob!', 'ok']) expect(isAcknowledgementOnly(t)).toBe(true);
+    for (const t of ['Yes', 'No, not this week.', 'Thanks! Attached.', 'Thanks, sending it tomorrow.', 'Will do.', '']) expect(isAcknowledgementOnly(t)).toBe(false);
+  });
+
+  test('N7-6: the loop opens at the oldest message that carries the obligation', () => {
+    const first = msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 720, body: 'Can you review this?' });
+    const v = detectThreadLoop(
+      thread([first, msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 30, body: 'Bumping this.' })]),
+      MY,
+      NOW,
+    );
+    expect(v.open[0].openedMs).toBe(first.internalDateMs);
+    const ask = msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 200, sent: true, body: 'Can you review?' });
+    const out = detectThreadLoop(
+      thread([ask, msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 100, sent: true, body: 'Any news?' })]),
+      MY,
+      NOW,
+    );
+    expect(out.open[0].openedMs).toBe(ask.internalDateMs);
+  });
+});
+
+describe('#5586: RFC 3834 auto-submitted mail', () => {
+  const detect = (messages: GmailMessageMeta[]): ThreadLoopVerdict =>
+    detectThreadLoop(thread(messages), MY, NOW);
+
+  test('a tracker notice addressed to me opens no inbound loop', () => {
+    const v = detect([msg({ from: 'tracker@acme-example.test', to: ['me@example.com'], ageHours: 100, autoSubmitted: true })]);
+    expect(v.open).toEqual([]);
+  });
+
+  test('an auto-reply does NOT close my real outbound loop', () => {
+    const v = detect([
+      msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 200, sent: true, body: 'Can you confirm the budget?' }),
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 100, body: 'I am out of office until Monday.', autoSubmitted: true }),
+    ]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_outbound']);
+    expect(v.close).toEqual(['unanswered_inbound']);
+  });
+
+  test('the same sender writing by hand (Auto-Submitted: no) still opens a loop', () => {
+    const v = detect([msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 100, autoSubmitted: false })]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
+  });
+});
+
+describe('google calendar system mail', () => {
+  const detect = (messages: GmailMessageMeta[]): ThreadLoopVerdict =>
+    detectThreadLoop(thread(messages), MY, NOW);
+
+  // Structural: Calendar attaches a text/calendar part to every one of these.
+  // The address is the colleague's REAL address in each case — that is the
+  // whole point, and why a sender mute is not an available fix.
+  const CAL = [
+    { method: 'REQUEST', subject: 'Invitation: Team sync @ Fri Aug 21, 2026 1pm' },
+    { method: 'REQUEST', subject: 'Updated invitation: Team sync @ Fri Aug 21, 2026 1pm' },
+    { method: 'REPLY', subject: 'Accepted: 1:1 Alice / Bob' },
+    { method: 'REPLY', subject: 'Declined: 1:1 Alice / Bob' },
+    { method: 'REPLY', subject: 'Tentative: 1:1 Alice / Bob' },
+    { method: 'CANCEL', subject: 'Canceled event: Alice / Bob @ Fri Jun 26' },
+  ];
+
+  for (const c of CAL) {
+    test(`${c.subject.split(':')[0]} (method=${c.method}) opens no inbound loop`, () => {
+      const v = detect([
+        msg({
+          from: 'alice@example.com',
+          to: ['me@example.com'],
+          ageHours: 100,
+          subject: c.subject,
+          calendarMethod: c.method,
+        }),
+      ]);
+      expect(v.open).toEqual([]);
+    });
+  }
+
+  test('my own calendar response opens no outbound loop even with a question mark', () => {
+    const v = detect([
+      msg({
+        from: 'me@example.com',
+        to: ['alice@example.com'],
+        ageHours: 200,
+        sent: true,
+        subject: 'Accepted: Team sync',
+        body: 'Does this time still work?',
+        calendarMethod: 'REPLY',
+      }),
+    ]);
+    expect(v.open).toEqual([]);
+  });
+
+  test('a calendar invite does NOT close a real outbound loop', () => {
+    // A colleague sending an invite has not answered my question. If the
+    // invite were treated as their turn, it would silently close the loop.
+    const v = detect([
+      msg({
+        from: 'me@example.com',
+        to: ['alice@example.com'],
+        ageHours: 200,
+        sent: true,
+        body: 'Can you confirm the budget?',
+      }),
+      msg({
+        from: 'alice@example.com',
+        to: ['me@example.com'],
+        ageHours: 100,
+        subject: 'Invitation: Budget sync',
+        calendarMethod: 'REQUEST',
+      }),
+    ]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_outbound']);
+    expect(v.close).toEqual(['unanswered_inbound']);
+  });
+
+  test('a real human email from the SAME colleague still opens a loop', () => {
+    const v = detect([
+      msg({
+        from: 'alice@example.com',
+        to: ['me@example.com'],
+        ageHours: 100,
+        subject: 'Invitation: Team sync',
+        calendarMethod: 'REQUEST',
+      }),
+      msg({
+        from: 'alice@example.com',
+        to: ['me@example.com'],
+        ageHours: 50,
+        subject: 'Budget question',
+        body: 'Can you approve the Q3 number?',
+      }),
+    ]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
+    expect(v.open[0].counterpartyEmail).toBe('alice@example.com');
+  });
+
+  test('subject fallback applies when MIME was not captured', () => {
+    const v = detect([
+      msg({
+        from: 'alice@example.com',
+        to: ['me@example.com'],
+        ageHours: 100,
+        subject: 'Updated invitation: Team sync @ Fri Aug 21',
+        calendarMethod: null,
+      }),
+    ]);
+    expect(v.open).toEqual([]);
+  });
+
+  test('a localized calendar subject is covered by the fallback', () => {
+    const v = detect([
+      msg({
+        from: 'alice@example.com',
+        to: ['me@example.com'],
+        ageHours: 100,
+        subject: 'Приглашение: Team sync',
+        calendarMethod: null,
+      }),
+    ]);
+    expect(v.open).toEqual([]);
+  });
+
+  test('a human "Notification: ..." email with no calendar part still opens a loop', () => {
+    // 'Notification:' is a generic vendor/human prefix, not a Calendar header —
+    // classifying it as system mail dropped real inbound questions from BOTH
+    // detectors (ship-review fix).
+    const v = detect([
+      msg({
+        from: 'alice@example.com',
+        to: ['me@example.com'],
+        ageHours: 100,
+        subject: 'Notification: your invoice is ready',
+        body: 'Can you confirm receipt?',
+        calendarMethod: null,
+      }),
+    ]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
+  });
+
+  test('an unrecognised MIME method is not trusted as a Calendar stamp', () => {
+    const v = detect([
+      msg({
+        from: 'alice@example.com',
+        to: ['me@example.com'],
+        ageHours: 100,
+        subject: 'Quarterly plan',
+        body: 'Can you review the plan?',
+        calendarMethod: 'BOGUS',
+      }),
+    ]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
+  });
+
+  test('a forwarded human question is NOT lost just because it says Invitation', () => {
+    // The fallback refuses anything carrying a Re:/Fwd: prefix, so a human
+    // forward of an invite thread still owes a reply.
+    const v = detect([
+      msg({
+        from: 'alice@example.com',
+        to: ['me@example.com'],
+        ageHours: 100,
+        subject: 'Fwd: Invitation: Team sync',
+        body: 'Should I accept this on your behalf?',
+        calendarMethod: null,
+      }),
+    ]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
+  });
+
+  test("a human email attaching a bare .ics (calendarMethod '') still opens a loop", () => {
+    // calendarMethod '' means "an .ics-ish thing was present but NO iCalendar
+    // METHOD was found" — that is a human attaching an invite file, not
+    // Calendar system mail. Pre-fix, '' classified as system mail and the
+    // question below could neither open nor close a loop.
+    const v = detect([
+      msg({
+        from: 'alice@example.com',
+        to: ['me@example.com'],
+        ageHours: 100,
+        subject: 'Venue contract and invite file',
+        body: 'Attached the invite file — can you confirm the venue works?',
+        calendarMethod: '',
+      }),
+    ]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
+    expect(v.open[0].counterpartyEmail).toBe('alice@example.com');
+  });
+
+  test("a reply carrying a bare .ics (calendarMethod '') still CLOSES my outbound loop", () => {
+    const v = detect([
+      msg({
+        from: 'me@example.com',
+        to: ['alice@example.com'],
+        ageHours: 200,
+        sent: true,
+        body: 'Can you send over the invite file?',
+      }),
+      msg({
+        from: 'alice@example.com',
+        to: ['me@example.com'],
+        ageHours: 100,
+        subject: 'Re: invite file',
+        body: 'Here it is.',
+        calendarMethod: '',
+      }),
+    ]);
+    // Alice's human reply is her turn: nothing stays open on my side.
+    expect(v.open.map((o) => o.loopType)).not.toContain('unanswered_outbound');
+  });
+
+  test('a human subject merely containing the word invitation still opens a loop', () => {
+    const v = detect([
+      msg({
+        from: 'alice@example.com',
+        to: ['me@example.com'],
+        ageHours: 100,
+        subject: 'Your invitation: what should we do about the venue?',
+        calendarMethod: null,
+      }),
+    ]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
   });
 });

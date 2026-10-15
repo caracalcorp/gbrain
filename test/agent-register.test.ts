@@ -171,23 +171,24 @@ describe('resolvePreset', () => {
   const flags = (over: Record<string, unknown>) =>
     ({ showToken: false, json: false, name: 'aurora', harness: 'claude-code', ...over }) as any;
 
-  test('daily-driver: snapshot grant, default write source, starter surface', () => {
+  test('daily-driver: snapshot grant, default write source, full surface (S0/D4)', () => {
     const r = resolvePreset(flags({ preset: 'daily-driver' }));
     expect(r).toEqual({
       scopes: 'read write',
       writeSource: 'default',
       federatedRead: 'snapshot',
-      surface: 'starter',
+      surface: 'full',
       workspaceDerived: false,
     });
   });
 
-  test('coding-agent: derived workspace first in the read list, starter surface', () => {
+  test('coding-agent: derived workspace first in the read list, full surface (S0/D4)', () => {
     const r = resolvePreset(flags({ preset: 'coding-agent', federatedRead: ['proj-widget'] }));
     expect(r.writeSource).toBe('aurora-workspace');
     expect(r.workspaceDerived).toBe(true);
     expect(r.federatedRead).toEqual(['aurora-workspace', 'proj-widget']);
-    expect(r.surface).toBe('starter');
+    expect(r.surface).toBe('full');
+    expect(resolvePreset(flags({ preset: 'coding-agent', federatedRead: ['proj-widget'], surface: 'starter' })).surface).toBe('starter');
   });
 
   test('coding-agent without --federated-read fails loud', () => {
@@ -326,7 +327,7 @@ describe('PGLite integration (pre-flight → tx → audit → exchange)', () => 
 
     // Exchange on the OUTER engine (tx sql is dead after commit) — the
     // 3600s-default regression pin: expires_in must reflect the 30d column.
-    const provider = new GBrainOAuthProvider({ sql });
+    const provider = new GBrainOAuthProvider({ sql, transaction: fn => engine.transaction(tx => fn(sqlQueryForEngine(tx))) });
     const tokens = await provider.exchangeClientCredentials(registered.clientId, registered.clientSecret!);
     expect(tokens.expires_in).toBe(REGISTER_DEFAULT_TOKEN_TTL_SECONDS);
 
@@ -365,7 +366,7 @@ describe('PGLite integration (pre-flight → tx → audit → exchange)', () => 
       registered = await registerScopedClient(sqlQueryForEngine(tx), 'itest-rotate', baseRegisterArgs(), {});
     });
     const oldSecret = registered.clientSecret!;
-    const provider = new GBrainOAuthProvider({ sql });
+    const provider = new GBrainOAuthProvider({ sql, transaction: fn => engine.transaction(tx => fn(sqlQueryForEngine(tx))) });
     await provider.exchangeClientCredentials(registered.clientId, oldSecret); // sanity: works pre-rotation
 
     const newSecret = await rotateClientSecret(engine, registered.clientId, 'itest-rotate');

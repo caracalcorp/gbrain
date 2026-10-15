@@ -43,6 +43,7 @@
 #   .context/test-shards/        per-shard logs + exit codes (cleared at start)
 
 set -uo pipefail
+unset SHARD # This wrapper assigns its own children; ambient routing must not reach nested runners.
 
 # Fixture tests that `git commit` in temp repos must not inherit the developer's
 # global commit.gpgsign — a signing gpg-agent can OOM under full-suite memory
@@ -200,6 +201,15 @@ fi
 rm -f "$LOG_DIR"/shard-*.log "$LOG_DIR"/shard-*.exit "$LOG_DIR"/shard-*.wedged "$LOG_DIR"/shard-*.lastkb "$LOG_DIR"/shard-*.lastprogress "$LOG_DIR"/shard-*.start "$LOG_DIR"/shard-*.end "$LOG_DIR"/shard-*.watchdog "$LOG_DIR"/shard-*.assigned "$LOG_DIR"/shard-*.hbsum 2>/dev/null
 : > "$FAILURES_LOG"
 : > "$SUMMARY_FILE"
+# Executed-test receipts (X2): on by default for this loop, under
+# .context/test-receipts (cleared per run) unless GBRAIN_TEST_RECEIPT_DIR names
+# another directory. `bun scripts/ci-executed-counts.ts --head-dir <dir>`
+# reads them; the shard and serial runners each write their own.
+if [ "$DRY_RUN" = "0" ] && [ -z "${GBRAIN_TEST_RECEIPT_DIR:-}" ] && [ "$LOG_DIR" = ".context/test-shards" ]; then
+  rm -rf .context/test-receipts
+  GBRAIN_TEST_RECEIPT_DIR=.context/test-receipts
+fi
+receipts_init unit || exit 2
 
 # ──────────────────────────────────────────────────────────────────────────
 # Resolve `timeout` command. macOS without coreutils has neither; we degrade
@@ -227,18 +237,78 @@ fi
 # so $? is recoverable per-shard (we never trust `wait`'s aggregate value).
 # ──────────────────────────────────────────────────────────────────────────
 SHARD_PIDS=()
+HB_PID=""
+CLEANUP_STARTED=0
+
+# An operator interrupt must stop the work, not only this wrapper. The shard
+# subshells are async children of a non-interactive bash, so they (and their
+# gtimeout/bun descendants) inherit SIGINT ignored: without a trap, bash exits
+# while gtimeout/bun stay alive under launchd and can retain gigabytes until
+# the shard cap fires. Only armed while the shards are live (disarmed on the
+# normal path once they are reaped). TERM gives cooperative children a moment
+# to exit, then KILL guarantees a TERM-resistant test cannot outlive the
+# cancelled suite.
+cleanup_children() {
+  local exit_code="${1:-0}"
+  [ "$CLEANUP_STARTED" = "1" ] && return
+  CLEANUP_STARTED=1
+
+  if [ -n "$HB_PID" ]; then
+    pkill -P "$HB_PID" 2>/dev/null || true
+    kill "$HB_PID" 2>/dev/null || true
+  fi
+
+  local pid descendants=""
+  collect_descendants() {
+    local parent="$1" child
+    for child in $(pgrep -P "$parent" 2>/dev/null); do
+      collect_descendants "$child"
+      printf '%s\n' "$child"
+    done
+  }
+
+  # Snapshot descendants BEFORE the subshell is TERMed: once it dies its
+  # gtimeout/bun children reparent to launchd and pgrep -P can't find them.
+  # The subshells are not process-group leaders here, so signal by PID.
+  for pid in ${SHARD_PIDS[@]+"${SHARD_PIDS[@]}"}; do
+    descendants="$descendants $(collect_descendants "$pid")"
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $descendants; do kill -TERM "$pid" 2>/dev/null || true; done
+  [ "${#SHARD_PIDS[@]}" -gt 0 ] && sleep 1
+  for pid in $descendants; do kill -KILL "$pid" 2>/dev/null || true; done
+  for pid in ${SHARD_PIDS[@]+"${SHARD_PIDS[@]}"}; do
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  [ -n "$HB_PID" ] && wait "$HB_PID" 2>/dev/null || true
+
+  return "$exit_code"
+}
+
+handle_interrupt() {
+  local exit_code="$1"
+  trap - INT TERM EXIT
+  cleanup_children "$exit_code" || true
+  exit "$exit_code"
+}
+
+trap 'handle_interrupt 130' INT
+trap 'handle_interrupt 143' TERM
+trap 'cleanup_children $?' EXIT
+
 for i in $(seq 1 "$N"); do
   (
     SHARD_LOG="$LOG_DIR/shard-$i.log"
     date +%s > "$LOG_DIR/shard-$i.start"
     if [ -n "$TIMEOUT_BIN" ]; then
       "$TIMEOUT_BIN" --signal=TERM --kill-after="${SHARD_KILL_AFTER}s" "${SHARD_TIMEOUT}s" \
-        env SHARD="$i/$N" \
+        env SHARD="$i/$N" GBRAIN_TEST_RECEIPT_DIR="$TEST_RECEIPT_DIR" \
         bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
         > "$SHARD_LOG" 2>&1
       rc=$?
     else
-      env SHARD="$i/$N" \
+      env SHARD="$i/$N" GBRAIN_TEST_RECEIPT_DIR="$TEST_RECEIPT_DIR" \
         bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
         > "$SHARD_LOG" 2>&1 &
       pid=$!
@@ -307,7 +377,8 @@ strip_ansi() {
 }
 
 # bun_summary_count: parses Bun's summary lines (one per `bun test` invocation
-# inside a shard — there's only one when we pass an explicit file list).
+# inside a shard). Grouped unit shards emit an authoritative aggregate so child
+# Bun invocations inside tests cannot inflate the reported totals.
 # Looks for ` N pass` / ` N fail` / ` N skip` patterns and sums them across
 # all summary blocks the shard emitted. `bun test` prints these near the end
 # of its output. Format: leading whitespace + integer + space + label.
@@ -315,8 +386,14 @@ bun_summary_count() {
   local label="$1"; local file="$2"
   if [ ! -f "$file" ]; then echo 0; return; fi
   strip_ansi "$file" | awk -v label="$label" '
+    /^__gbrain_unit_shard__ / {
+      for (i = 2; i <= NF; i++) {
+        split($i, pair, "=")
+        if (pair[1] == label) { aggregate = pair[2]; have_aggregate = 1 }
+      }
+    }
     $1 ~ /^[0-9]+$/ && $2 == label { total += $1 }
-    END { print total + 0 }
+    END { print have_aggregate ? aggregate + 0 : total + 0 }
   '
 }
 
@@ -436,15 +513,16 @@ HB_PID=$!
 # process cleanup" at end-of-job reports them as (unnamed) test failures.
 # Seen on the garrytan/port-pr-1406 PR, 2 CI runs in a row, 6 orphans
 # matching the 6 invocations in test/scripts/run-unit-parallel.test.ts.
-trap 'pkill -P "$HB_PID" 2>/dev/null; kill "$HB_PID" 2>/dev/null; wait "$HB_PID" 2>/dev/null' EXIT
-
 # Wait for every shard. Don't care about wait's exit code.
 for pid in "${SHARD_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
 
 pkill -P "$HB_PID" 2>/dev/null
 kill "$HB_PID" 2>/dev/null
 wait "$HB_PID" 2>/dev/null
-trap - EXIT
+# Every shard is reaped: disarm the interrupt handlers too, so a later
+# Ctrl-C during the foreground serial/rescue phases can't run
+# cleanup_children against SHARD_PIDS that may have been reused.
+trap - INT TERM EXIT
 
 # ──────────────────────────────────────────────────────────────────────────
 # Aggregate failures (single writer; serial; never concurrent).
@@ -633,7 +711,11 @@ for i in $(seq 1 "$N"); do
     # Warn-pass gate: rescue-eligible kills (OOM signature / external kill)
     # are excluded so they reach the serial rescue queue below instead of
     # being absolved without a re-run.
-    if [ "$fail_count" = "0" ] && [ "$inline_fails" = "0" ] && [ "$idle_secs" -ge 300 ] \
+    grouped_incomplete=0
+    if grep -q '^__gbrain_unit_group_start__ ' "$SHARD_LOG" && ! grep -q '^__gbrain_unit_shard__ .* rc=0$' "$SHARD_LOG"; then
+      grouped_incomplete=1
+    fi
+    if [ "$grouped_incomplete" = "0" ] && [ "$fail_count" = "0" ] && [ "$inline_fails" = "0" ] && [ "$idle_secs" -ge 300 ] \
        && [ "$shard_oom" = "0" ] && [ "$shard_external_kill" = "0" ]; then
       # Completion evidence (fail-closed): warn-pass additionally requires
       # every assigned file to have STARTED (its file-header appears in the
@@ -747,7 +829,7 @@ SERIAL_FILES_COUNT=0
 SERIAL_FILES_COUNT=$(find test -name '*.serial.test.ts' -not -path 'test/e2e/*' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$SERIAL_FILES_COUNT" -gt 0 ]; then
   echo "════════════ serial pass ($SERIAL_FILES_COUNT files) ════════════"
-  bash scripts/run-serial-tests.sh > "$LOG_DIR/serial.log" 2>&1
+  GBRAIN_TEST_RECEIPT_DIR="$TEST_RECEIPT_DIR" bash scripts/run-serial-tests.sh > "$LOG_DIR/serial.log" 2>&1
   SERIAL_RC=$?
   cat "$LOG_DIR/serial.log"
   if [ "$SERIAL_RC" != "0" ]; then
@@ -822,23 +904,33 @@ if [ "$TOTAL_RC" != "0" ] && [ "${RESCUE_COUNT:-0}" -gt 0 ]; then
   grep '\.serial\.test\.ts$' "$OOM_RESCUE_LIST" > "$LOG_DIR/oom-rescue-serial.txt" || true
   RESCUE_RC=0
   : > "$RESCUE_LOG"
-  run_rescue() { # $1 = per-invocation timeout seconds; rest = test-file args
-    local t="$1"; shift
+  # Each rescue invocation writes its own receipt (kind=rescue), which
+  # supersedes the killed or failed attempt for the files it re-ran.
+  run_rescue() { # $1 = per-invocation timeout seconds; $2 = receipt lane; $3 = receipt tag; rest = test-file args
+    local t="$1" lane="$2" tag="$3" rc=0 primary_lane="$TEST_RECEIPT_LANE"
+    shift 3
+    TEST_RECEIPT_LANE="$lane"
+    receipt_begin rescue "$tag" "" "" "" "$@"
+    TEST_RECEIPT_LANE="$primary_lane"
     if [ -n "$TIMEOUT_BIN" ]; then
       "$TIMEOUT_BIN" --signal=TERM --kill-after="${SHARD_KILL_AFTER}s" "${t}s" \
-        bun test --max-concurrency 1 --timeout=60000 "$@" >> "$RESCUE_LOG" 2>&1
+        bun test --max-concurrency 1 --timeout=60000 ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "$@" >> "$RESCUE_LOG" 2>&1 || rc=$?
     else
-      bun test --max-concurrency 1 --timeout=60000 "$@" >> "$RESCUE_LOG" 2>&1
+      bun test --max-concurrency 1 --timeout=60000 ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "$@" >> "$RESCUE_LOG" 2>&1 || rc=$?
     fi
+    receipt_end "$rc"
+    return "$rc"
   }
   if [ -s "$LOG_DIR/oom-rescue-batch.txt" ]; then
     # shellcheck disable=SC2046
-    run_rescue "$RESCUE_TIMEOUT" $(cat "$LOG_DIR/oom-rescue-batch.txt") || RESCUE_RC=1
+    run_rescue "$RESCUE_TIMEOUT" unit batch $(cat "$LOG_DIR/oom-rescue-batch.txt") || RESCUE_RC=1
   fi
   if [ -s "$LOG_DIR/oom-rescue-serial.txt" ]; then
+    rescue_idx=0
     while IFS= read -r serial_file; do
       [ -n "$serial_file" ] || continue
-      run_rescue 300 "$serial_file" || RESCUE_RC=1
+      rescue_idx=$((rescue_idx + 1))
+      run_rescue 300 serial "file$rescue_idx" "$serial_file" || RESCUE_RC=1
     done < "$LOG_DIR/oom-rescue-serial.txt"
   fi
   cat "$RESCUE_LOG"

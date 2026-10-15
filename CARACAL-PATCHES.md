@@ -1,6 +1,6 @@
 # Caracal patches
 
-**Three, as of `0.47.9.0+caracal.3`.** Everything else below is either a version
+**Three, as of `0.60.147.0+caracal.1`** (patch #3 retired and patch #4 added at this repin; see *Patches*). Everything else below is either a version
 string or a file GENERATED from one — see *Patches* for the hand-written changes.
 
 Source-identical to upstream v0.47.9.0 (commit
@@ -8,16 +8,26 @@ Source-identical to upstream v0.47.9.0 (commit
 published tag on 2026-09-01 — peeled through the tag object, not read off the ref)
 through release `+caracal.1`.
 
-Repinned from v0.46.32.0 the same day, once release #1 had proven the build and
+**Repinned to upstream v0.60.147.0** (commit
+3f960312a22b6b3169a086939b0e1c8bc503d76f, verified against `garrytan/gbrain`'s
+published tag on 2026-10-13, peeled, and published 2026-10-10: the newest tag at
+least 3 days old) at `+caracal.1` of that line. This is the X1 repin: the first
+one across the 0.47 → 0.60 gap, done by hand, after which `bin/gbrain-sync` in
+`~/rs/config` carries repins (it reads the machine-readable block in *Ledger*
+below, and refuses forks below v0.60.0.0).
+
+Earlier: repinned from v0.46.32.0 the same day, once release #1 had proven the build and
 attestation chain end to end. A repin takes upstream's TREE onto a commit whose
 parent is our `master` (`git read-tree -u --reset <tag>`), never a rebase and
 never a branch based on the tag: a rebase conflicts on every stamped file by
 construction, and a tag-based branch is not a descendant of master, so GitHub
 marks the PR CONFLICTING and runs no checks at all.
 
-This repo is a **fork of `garrytan/gbrain` at full workflow parity**: all seven
-upstream workflows are present and unmodified, and `master` is upstream's own
-branch name so `release.yml` triggers without an edit. We pin `master` to a tag
+This repo is a **fork of `garrytan/gbrain` at full workflow parity, less runner
+labels**: all upstream workflows (16 at v0.60.147.0) are present, and the only
+change to them is patch #4, which routes upstream's Ubicloud runner labels to
+GitHub-hosted runners. `master` is upstream's own branch name, so `release.yml`
+triggers without an edit. We pin `master` to a tag
 rather than tracking upstream's HEAD.
 
 ## Version scheme
@@ -30,9 +40,10 @@ against VERSION, so bumping one alone fails the build job and publishes nothing.
 
 | # | what | why | upstream status | files |
 |---|---|---|---|---|
-| 1 | `probeProcessLiveness(version)` + `GET /livez` — a DB-free liveness route, additive, `/health` untouched | ACA's `tcpSocket` liveness probe cannot see a wedged event loop (W18); the DB-aware `/health` cannot be the liveness target without dying on every Postgres blip (W17). Splitting the two questions needs an endpoint upstream doesn't have | **not yet opened** — opening the PR against `garrytan/gbrain` is an operator call (`caracalcorp/it` TODOS.md W18 step 1), not automated by this release | `src/commands/serve-http.ts`, `test/serve-http-health.test.ts` |
-| 2 | Widen the `+build` metadata rejection at FOUR independent sites (TODOS.md W9 named two; the other two were found by actually running CI on this release and reading the failures, not by assuming a fix worked): `semver.ts`'s `VERSION_RE`/`parseSemver`, `check-bootstrap-tag.sh`'s stamp-extraction class, `thin-client-upgrade-prompt.ts`'s `isValidSemverLike` (feeds `doctor-remote.ts`'s `runUpgradeDriftCheck`), and `skillpack/manifest-v1.ts`'s `SEMVER_RE` (gates `gbrain_min_version` in every skillpack/brain-resident-pack manifest) all now strip-and-validate or otherwise accept a `+identifier[.identifier]*` suffix per the semver spec (build metadata never affects precedence) before parsing/matching the numeric core | **The plausible-upstream case, unlike patch #1.** `+build` is valid semver and upstream's own regexes/validators are simply too narrow — a spec-compliance fix with no ACA/Caracal-specific shape. Confirmed each site by reading its own call chain rather than trusting a job-name match: `pendingUpgradeVersion(VERSION, now)` → `isNewerVersion` → `parseSemver(VERSION)` returned null, silently killing the self-upgrade marker; `runUpgradeDriftCheck` → `safeCompare`/`driftLevel` → `isValidSemverLike(VERSION)` returned false via a SECOND independent digit-only validator, failing 4 tests in `test/doctor-remote.serial.test.ts` and keeping `serial-tests` red after the first two sites were already widened; `loadSkillpackManifest`/`lintBrainPackTools`/`getResidentSkillDetail` all throw `SkillpackManifestError: gbrain_min_version must be semver shape... got "0.47.9.0+caracal.3"` via a THIRD independent validator, failing `test/skillpack-init-brain-pack.test.ts` and `test/skillpack-brain-resident-locate.test.ts` (shards `test (4)`/`test (9)`) — this one was documented as "still open, verify at first boot" through two prior releases before CI proved it live-breaking, not hypothetical | **not yet opened** — same operator-call reasoning as patch #1 | `src/core/semver.ts`, `scripts/check-bootstrap-tag.sh`, `src/core/thin-client-upgrade-prompt.ts`, `src/core/skillpack/manifest-v1.ts` |
-| 3 | `scripts/module-size-limits.tsv`: raise `src/commands/serve-http.ts`'s ratchet ceiling 3343 → 3379 | The guard is doing its job, not a bug: patch #1's `/livez` route added exactly 36 lines, and the ratchet freezes each oversized file at a committed ceiling specifically so growth needs a reviewer-visible TSV edit (`scripts/check-module-size.sh`'s own header). This was ALREADY the state at `+caracal.2` — `verify` was red there too, for this AND the `check:bootstrap-tag` cause, but the `+caracal.2` release only checked the E2E job's actual assertions and trusted `verify`'s job-name match without diffing its own failure list, so this cause went unrecorded for one release | N/A — a repo-dev-tooling ceiling, not application behavior; nothing to upstream | `scripts/module-size-limits.tsv` |
+| 1 | `probeProcessLiveness(version)` + `GET /livez` — a DB-free liveness route, additive, `/health` untouched | ACA's `tcpSocket` liveness probe cannot see a wedged event loop (W18); the DB-aware `/health` cannot be the liveness target without dying on every Postgres blip (W17). Splitting the two questions needs an endpoint upstream doesn't have | **not yet opened** — opening the PR against `garrytan/gbrain` is an operator call (`caracalcorp/it` TODOS.md W18 step 1), not automated by this release | `src/commands/serve-http-metrics.ts`, `src/commands/serve-http.ts`, `test/serve-http-health.test.ts`. Ported by hand at `0.60.147.0`: upstream split `serve-http.ts` into `serve-http-<area>.ts` modules, so `probeProcessLiveness` and the `/livez` route now sit beside `probeLiveness`/`mountHealth` in `serve-http-metrics.ts`, and `serve-http.ts` carries one changed line (the re-export). 0.60 also pins the router in two goldens, `test/fixtures/goldens/serve-http/routes.json` and `routes-runtime.json`; both were regenerated (`GBRAIN_TEST_UPDATE_GOLDENS=1`) and gain only the `/livez` entry beside `/health` |
+| 2 | Widen the `+build` metadata rejection at FOUR independent sites (TODOS.md W9 named two; the other two were found by actually running CI on this release and reading the failures, not by assuming a fix worked): `semver.ts`'s `VERSION_RE`/`parseSemver`, `check-bootstrap-tag.sh`'s stamp-extraction class, `thin-client-upgrade-prompt.ts`'s `isValidSemverLike` (feeds `doctor-remote.ts`'s `runUpgradeDriftCheck`), and `skillpack/manifest-v1.ts`'s `SEMVER_RE` (gates `gbrain_min_version` in every skillpack/brain-resident-pack manifest) all now strip-and-validate or otherwise accept a `+identifier[.identifier]*` suffix per the semver spec (build metadata never affects precedence) before parsing/matching the numeric core | **The plausible-upstream case, unlike patch #1.** `+build` is valid semver and upstream's own regexes/validators are simply too narrow — a spec-compliance fix with no ACA/Caracal-specific shape. Confirmed each site by reading its own call chain rather than trusting a job-name match: `pendingUpgradeVersion(VERSION, now)` → `isNewerVersion` → `parseSemver(VERSION)` returned null, silently killing the self-upgrade marker; `runUpgradeDriftCheck` → `safeCompare`/`driftLevel` → `isValidSemverLike(VERSION)` returned false via a SECOND independent digit-only validator, failing 4 tests in `test/doctor-remote.serial.test.ts` and keeping `serial-tests` red after the first two sites were already widened; `loadSkillpackManifest`/`lintBrainPackTools`/`getResidentSkillDetail` all throw `SkillpackManifestError: gbrain_min_version must be semver shape... got "0.47.9.0+caracal.3"` via a THIRD independent validator, failing `test/skillpack-init-brain-pack.test.ts` and `test/skillpack-brain-resident-locate.test.ts` (shards `test (4)`/`test (9)`) — this one was documented as "still open, verify at first boot" through two prior releases before CI proved it live-breaking, not hypothetical | **not yet opened** — same operator-call reasoning as patch #1 | `src/core/semver.ts`, `scripts/check-bootstrap-tag.sh`, `src/core/thin-client-upgrade-prompt.ts`, `src/core/skillpack/manifest-v1.ts`, and from `0.60.147.0` a FIFTH site, `scripts/release-gate.ts` (new upstream in 0.60: `release.yml`'s `ci-gate` validates `--version` as digits-only, so without it no fork release publishes; regression test in `test/scripts/release-gate.test.ts`). CI on #7 found four more 0.60 sites: `src/core/behavior-change-notice.ts` (its `RELEASE` check dropped our baseline, so every brain would show the whole behavior-change notice; `compareReleases` now ignores build metadata as well), `src/core/minions/child-readiness.ts` (refused every job child as `child_protocol_incompatible`, so no minion job could run), `src/commands/upgrade.ts`'s exact-tag-pin check (missed a `#v…+caracal.N` pin), and the test helper `test/helpers/graduation-e2e.ts` (read our VERSION as NaN and picked this release as its own "older release") |
+| 3 | ~~`scripts/module-size-limits.tsv`: raise `src/commands/serve-http.ts`'s ratchet ceiling~~ **RETIRED at `0.60.147.0`** | upstream's module split moved the health code into `serve-http-metrics.ts` (271 lines with patch #1, under the unlisted-file limit), and `serve-http.ts` stays exactly at its 931 ceiling with patch #1's one-line re-export. Dropped, per *carry cost trends to zero* | N/A | none |
+| 4 | Route every `ubicloud-standard-N-ubuntu-2404` runner label to `ubuntu-24.04`, and the `-arm-` label to `ubuntu-24.04-arm`, in `.github/workflows/*.yml`. Two upstream tests that pin the labels follow: `ci-runner-routing.test.ts` maps its constants through the same rule, and `run-verify-parallel.test.ts` expects the routed label. `test.yml`'s verify step also sets `GBRAIN_VERIFY_TIMEOUT: '240'`: on 4 vCPUs, typecheck crossed upstream's 120 s per-check cap on PR #7 | Upstream moved CI to Ubicloud between 0.47 and 0.60, and this org has no Ubicloud runners. On PR #7 every Ubicloud job queued for about 17 hours, and some were cancelled, without ever starting. Under 0.60's `ci-gate`, a fork that cannot run Test and E2E cannot publish. The fork is public, so GitHub-hosted runners are free. GitHub's 4-vCPU, 16 GB runner matches `ubicloud-standard-4`, which carries about 85% of Test's minutes; only the 8-, 16- and 30-vCPU jobs (about 30 minutes per CI pass) lose cores. Chosen over installing Ubicloud (a paid vendor; its runners would hold the E2E API keys) on 2026-10-14. `.github/actionlint.yaml` keeps upstream's label list, which is unused but harmless | **fork-only**; there is no upstream story, since upstream runs Ubicloud on purpose | `.github/workflows/{actionlint,ci-health,e2e,fix-wave-closeout,fix-wave-gate,heavy-tests,native-locks,nightly-watch,persistence-validation,scale-tier,semgrep,stress,test}.yml`, `test/scripts/ci-runner-routing.test.ts`, `test/scripts/run-verify-parallel.test.ts`. **Gap:** a repin replays this diff, so a workflow that upstream ADDS with an Ubicloud label is not covered. Before merging a repin, check `grep -rn ubicloud-standard .github/workflows` |
 
 Patch 1 cherry-picked from `feat/livez` (`f497a50e5`, cut off the `v0.47.9.0` tag
 per *Upstreaming* below) onto this release branch; `bun test
@@ -69,6 +80,27 @@ what upstream does too. Re-run both generators and the restamp on every release
 and every rebase — never hand-edit them.
 
 ## Known-red checks, and why we accept them (and why this section changed shape)
+
+**At `0.60.147.0+caracal.1` (X1 repin), measured on PR #7.** First push: no Ubicloud
+job ever started (patch #4). Second push (`4e049f74a`), 242 checks passed and 10
+jobs failed. Every failure was traced to its assertions and fixed: the two route goldens (patch #1) and
+four more `+build` sites (patch #2), listed in *Patches*. The one exception is the
+PR-only **stress gate** (`stress-changed-tests`), which also failed 1 of 10
+iterations on four Postgres E2E files: `reconcile-pgbouncer`,
+`postgres-driver-install`, `pgbouncer-teardown` and `persistence-runtime-matrix`.
+A repin "touches" every file upstream changed, so the gate stresses hundreds of
+them on runners smaller than upstream's. The gate succeeds on push ("not a PR
+event"), so it does not reach `ci-gate`. Recorded here, and to be re-measured on
+the next push rather than assumed. Two things changed underneath this section. First, 0.60's
+`release.yml` gates publication: `ci-gate` (`scripts/release-gate.ts`)
+publishes only a master commit whose push runs of **Test** and **E2E Tests**
+both succeeded. So a red Test or E2E no longer just colours a badge: it stops
+the release from publishing. Decision taken at this repin: **no CI exception**.
+The gate runs as upstream wrote it (patch #2 only widens its version check), and
+any red on those two workflows is fixed or recorded here before merge. Second,
+the one out-of-scope red of `+caracal.3`, `test/ai/sunset-warn.test.ts`, no longer
+exists upstream. The history below is kept as the record of how this list is
+checked.
 
 Measured on the first release, 2026-09-01: 26 failing assertions, all reducing to
 ONE cause. Upstream's tooling does not accept a `+` build-metadata suffix, which
@@ -152,7 +184,41 @@ assert it:
 
     git diff --stat <upstream-tag>..master
 
+Checked for `0.60.147.0+caracal.1`: see *Ledger* (the `git diff --stat` there).
+
 Checked for `+caracal.3` — the ten release paths, `CARACAL-PATCHES.md`, and exactly
 the seven files across the three rows in the *Patches* table above; nothing else moved.
 
 Runbook: `infra/brain/FORK.md` in `caracalcorp/it`.
+
+## Ledger (machine-readable, read by `bin/gbrain-sync`)
+
+The block below is the tool's only input about our patches; the prose above is
+for people. One row per patch unit, TAB-separated: `id`, `kind` (`code` or
+`ceiling`), `paths` (comma-separated, each in at most one row), `tests` (run in
+the sandbox at every repin; `-` for none), `ceiling_for` (`ceiling` rows only).
+Every fork change outside the release paths must be owned by a row, or a repin
+refuses.
+
+Delta check at `0.60.147.0+caracal.1`, measured: `git diff --stat
+v0.60.147.0..` shows the ten release paths (`VERSION`, `package.json`,
+`BOOTSTRAP_FOR_AGENTS.md`, the three root plugin manifests, `plugin/README.md`,
+the six `plugin-variants/**` files and the template README), this file, and
+exactly the 30 files the three rows below own; nothing else moved. Verified in
+the sandbox before commit: `bun run typecheck`; `test/serve-http-health.test.ts`,
+`test/scripts/release-gate.test.ts`, `test/skillpack-init-brain-pack.test.ts`,
+`test/skillpack-brain-resident-locate.test.ts`, `test/doctor-remote.serial.test.ts`,
+`test/thin-client-upgrade-prompt.test.ts`, `test/self-upgrade.test.ts`,
+`test/check-update.test.ts`, `test/e2e/self-upgrade-marker.test.ts`, and the 29
+non-E2E test files that read `.github/workflows` (after patch #4: all pass, apart
+from 5-second timeouts under host load that move to a different test on each
+run);
+`scripts/check-module-size.sh`; `scripts/check-bootstrap-tag.sh`. CI on the PR is
+the authority (see *Known-red checks*).
+
+```gbrain-sync:patches v1
+# id	kind	paths	tests	ceiling_for
+livez	code	src/commands/serve-http-metrics.ts,src/commands/serve-http.ts,test/serve-http-health.test.ts,test/fixtures/goldens/serve-http/routes.json,test/fixtures/goldens/serve-http/routes-runtime.json	test/serve-http-health.test.ts,test/serve-http-route-golden.test.ts,test/serve-http-route-runtime-golden.test.ts	-
+semver-build	code	src/core/semver.ts,scripts/check-bootstrap-tag.sh,src/core/thin-client-upgrade-prompt.ts,src/core/skillpack/manifest-v1.ts,scripts/release-gate.ts,test/scripts/release-gate.test.ts,src/core/behavior-change-notice.ts,src/core/minions/child-readiness.ts,src/commands/upgrade.ts,test/helpers/graduation-e2e.ts	test/scripts/release-gate.test.ts,test/skillpack-init-brain-pack.test.ts,test/skillpack-brain-resident-locate.test.ts,test/behavior-change-notice.test.ts,test/child-readiness.test.ts,test/upgrade-exact-tag-pin.test.ts	-
+runners	code	.github/workflows/actionlint.yml,.github/workflows/ci-health.yml,.github/workflows/e2e.yml,.github/workflows/fix-wave-closeout.yml,.github/workflows/fix-wave-gate.yml,.github/workflows/heavy-tests.yml,.github/workflows/native-locks.yml,.github/workflows/nightly-watch.yml,.github/workflows/persistence-validation.yml,.github/workflows/scale-tier.yml,.github/workflows/semgrep.yml,.github/workflows/stress.yml,.github/workflows/test.yml,test/scripts/ci-runner-routing.test.ts,test/scripts/run-verify-parallel.test.ts	test/scripts/ci-runner-routing.test.ts	-
+```

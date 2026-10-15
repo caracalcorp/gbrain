@@ -9,7 +9,7 @@
  */
 
 import { afterEach, describe, expect, test } from 'bun:test';
-import { formatResult, captureRetrievalMeta, resetRetrievalMetaForTests } from '../src/cli.ts';
+import { formatResult, captureRetrievalMeta, resetRetrievalMetaForTests } from '../src/cli/main.ts';
 import { unpackToolResult, extractResponseMeta } from '../src/core/mcp-client.ts';
 
 afterEach(() => resetRetrievalMetaForTests());
@@ -34,6 +34,11 @@ describe('formatResult empty-result rendering (T15)', () => {
 
   test('clean-miss meta → clean miss named', () => {
     captureRetrievalMeta('retrieval', { returned_count: 0, retrieved_count: 0, degraded: [] });
+    expect(formatResult('search', [], {})).toContain('clean miss — no retrieval degradation');
+  });
+
+  test('a ranking-only stage (reranker_skipped) is not a retrieval degradation on the empty-result line', () => {
+    captureRetrievalMeta('retrieval', { returned_count: 0, retrieved_count: 0, degraded: [{ stage: 'reranker_skipped', reason: 'no_key' }] });
     expect(formatResult('search', [], {})).toContain('clean miss — no retrieval degradation');
   });
 

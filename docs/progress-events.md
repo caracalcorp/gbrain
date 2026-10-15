@@ -1,8 +1,7 @@
 # Progress events
 
 Canonical reference for the JSONL progress stream that `gbrain` writes to
-`stderr` when a bulk command runs with `--progress-json`. Stable from
-v0.15.2. Additive changes only; no renames or removals without a major
+`stderr` when a bulk command runs with `--progress-json`. Additive changes only; no renames or removals without a major
 version bump.
 
 Most humans won't read this page. Agents parsing progress will.
@@ -20,7 +19,8 @@ Any of these commands stream events when `--progress-json` is set:
 - `gbrain extract [links|timeline|all]` (fs or db source)
 - `gbrain import`
 - `gbrain sync`
-- `gbrain migrate --to …`
+- `gbrain migrate --to …` (graduation reports one phase per step and ticks per
+  table and batch; the legacy copier reports the `migrate.copy_*` phases below)
 - `gbrain repair-jsonb`
 - `gbrain check-backlinks`
 - `gbrain lint`
@@ -87,12 +87,17 @@ won't emit more often than `minIntervalMs` (default 1000) and
 `minItems` (default `max(10, ceil(total/100))`).
 
 ```json
-{"event":"tick","phase":"orphans.scan","done":15000,"total":52000,"pct":28.8,"elapsed_ms":4200,"eta_ms":10300,"ts":"..."}
+{"event":"tick","phase":"orphans.scan","done":15000,"total":52000,"pct":28.8,"elapsed_ms":4200,"cpu_ms":3900,"eta_ms":10300,"ts":"..."}
 ```
 
 Fields:
 
 - `done` — items completed in this phase.
+- `cpu_ms` — CPU time (user + system) the emitting process's main thread has
+  used since the phase started. Unlike `elapsed_ms` it excludes time the host
+  gave the CPU to other work, and it excludes work on runtime helper threads
+  (garbage collection, JIT) and in other processes (a Postgres server, a
+  provider). The scale tier's import-rate gate times PGLite imports with it.
 - `total` — total items, if known. Omitted when the scan doesn't have a
   total up front (e.g. a streaming iterator).
 - `pct` — `done/total * 100`, one decimal. Omitted when `total` is unknown.
@@ -133,10 +138,10 @@ Phases use `snake_case.dot.path` naming. A fresh reporter starts at the
 root; `child()` composition appends to the parent's current phase, so a
 sync that calls import emits `sync.import.<file>`, not `import.<file>`.
 
-Stable phase names shipped in v0.15.2:
+Stable phase names:
 
 - `doctor.db_checks` (umbrella for all DB-side doctor checks)
-- `doctor.pglite_probe` (the #2674 scratch-store probe; only when PGLite init
+- `doctor.pglite_probe` (the scratch-store probe; only when PGLite init
   failed with an unexplained/damage-class disk state or `--probe-pglite` was
   passed — a cold start can take 5–20s, so the heartbeat is the only sign of
   life)

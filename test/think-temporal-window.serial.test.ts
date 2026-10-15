@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { importFromContent } from '../src/core/import-file.ts';
 import { runGather } from '../src/core/think/gather.ts';
 import {
   filterPagesToWindow,
@@ -8,24 +9,24 @@ import {
   TemporalWindowError,
 } from '../src/core/think/temporal-window.ts';
 import { __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
-import type { ChunkInput, SearchResult } from '../src/core/types.ts';
+import type { SearchResult } from '../src/core/types.ts';
 
 let engine: PGLiteEngine;
 
 async function seed(slug: string, body: string, effective?: string, type = 'note') {
-  await engine.putPage(slug, {
-    title: slug,
-    type,
-    compiled_truth: body,
-    ...(effective ? { effective_date: new Date(effective), effective_date_source: 'date' as const } : {}),
-  });
-  const chunks: ChunkInput[] = [{
-    chunk_index: 0,
-    chunk_text: body,
-    chunk_source: 'compiled_truth',
-    token_count: 10,
-  }];
-  await engine.upsertChunks(slug, chunks);
+  const imported = await importFromContent(
+    engine, slug,
+    `---\ntitle: ${slug}\ntype: ${type}\n${effective ? `date: "${effective}"\n` : ''}---\n\n${body}`,
+    { noEmbed: true, sourceId: 'default' },
+  );
+  expect(imported.status).toBe('imported');
+  if (!effective) {
+    // Import normally supplies a fallback date; retain the NULL-date fixture.
+    await engine.executeRaw(
+      'UPDATE pages SET effective_date = NULL, effective_date_source = NULL WHERE source_id = $1 AND slug = $2',
+      ['default', slug],
+    );
+  }
 }
 
 beforeAll(async () => {
@@ -69,6 +70,16 @@ describe('temporal-window parsing', () => {
 });
 
 describe('effective-date policy', () => {
+  test('effective date strings must be real calendar days', () => {
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '2026-02-31' })).toBeNull();
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '2026-02-28' })).toBe(Date.UTC(2026, 1, 28, 12));
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '2024-02-29' })).toBe(Date.UTC(2024, 1, 29, 12));
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '2023-02-29' })).toBeNull();
+    const year50 = new Date(12 * 3600_000);
+    year50.setUTCFullYear(50, 0, 1);
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '0050-01-01' })).toBe(year50.getTime());
+  });
+
   const result = (slug: string, effective_date: string | null): SearchResult => ({
     slug, effective_date, page_id: 1, title: slug, type: 'note', chunk_text: '',
     chunk_source: 'compiled_truth', chunk_id: 1, chunk_index: 0, score: 1, stale: false,

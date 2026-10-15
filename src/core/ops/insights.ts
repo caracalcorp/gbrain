@@ -9,24 +9,26 @@
  * it). Never import from '../operations.ts' here (cycle).
  */
 
+import { MIN_TRUST_PARAM } from '../eligibility/policy.ts';
+import { proactiveEligibility } from '../eligibility/registry.ts';
+import { activationSuppressionNotice, suppressionSummary } from '../eligibility/activation.ts';
 import type { Operation } from './contract.ts';
-import { OperationError } from './contract.ts';
-import { sourceScopeOpts } from './context.ts';
+import { opError } from './contract.ts';
+import { invalidParam, paramUse } from './op-fix.ts';
+import { sourceScopeOpts, readPolicyOpts } from './context.ts';
 import {
   FIND_EXPERTS_DESCRIPTION,
   FIND_CONTRADICTIONS_DESCRIPTION,
   FIND_TRAJECTORY_DESCRIPTION,
 } from '../operations-descriptions.ts';
-import {
-  dropPrivateOnlyRows,
-  findWorldVisibleSlugs,
-  resolveExcludePrivatePages,
-} from '../search/private-visibility.ts';
 
 // --- v0.43 (#2095): push-based context — the brain volunteers pages ---
 
 const volunteer_context: Operation = {
   name: 'volunteer_context',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'retrieval',
   description:
     'Push-based context: volunteer brain pages relevant to a rolling conversation window ' +
     'WITHOUT being asked. Zero-LLM, confidence-gated (alias 0.9 / exact-title 0.8 / ' +
@@ -50,6 +52,7 @@ const volunteer_context: Operation = {
         'appears here are not re-volunteered.',
     },
     max_pages: { type: 'number', description: 'Max pages to volunteer (default 3, hard cap 5).' },
+    min_trust: MIN_TRUST_PARAM,
     min_confidence: {
       type: 'number',
       description:
@@ -75,15 +78,17 @@ const volunteer_context: Operation = {
     }
 
     if (typeof p.window !== 'string' || !p.window.trim()) {
-      throw new OperationError(
+      throw opError(
         'invalid_params',
-        'window is required unless stats: true',
-        'Pass the recent turns as a string (CLI: pipe them on stdin), or use --stats.',
+        `window is required unless ${paramUse(ctx, 'stats')}`,
+        `${ctx.remote === false ? 'Pipe the recent turns on stdin' : 'Pass `window` with the recent turns as a string'}, or pass ${paramUse(ctx, 'stats')} for the volunteered-vs-used summary.`,
       );
     }
     const turns = parseWindow(p.window);
     const { loadConfig: loadCfgForArms } = await import('../config.ts');
     const { lexicalArmsEnabled } = await import('../context/reflex.ts');
+    const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+    const withheldKeys = new Set<string>();
     const pages = await volunteerContext(ctx.engine, turns, {
       sourceIds,
       priorContext: typeof p.prior_context === 'string' ? p.prior_context : undefined,
@@ -92,7 +97,15 @@ const volunteer_context: Operation = {
       // v0.46.15+ kill switch for the lexical recall arms (weak-alias +
       // surname) — file-plane gate, threaded per ResolvePointersOpts.
       lexicalArms: lexicalArmsEnabled(loadCfgForArms()),
+      // N8-1: the same private-page gate remote search applies.
+      excludePrivate: await resolveExcludePrivatePages(ctx.engine, ctx.remote),
+      // #5575: token floor + min_trust + activation control (CEO-20, DX-10).
+      eligibility: await proactiveEligibility(ctx, 'volunteer', { minTrust: p.min_trust }),
+      onWithheld: keys => { for (const k of keys) withheldKeys.add(k); },
     });
+    const withheld = withheldKeys.size;
+    const notice = activationSuppressionNotice(withheld, 'volunteered context');
+    if (notice) ctx.emitNotice?.(notice);
 
     // Feedback-loop logging: fire-and-forget batched INSERT through the
     // volunteer-events sink (drained at exit). Never fails the op.
@@ -116,7 +129,8 @@ const volunteer_context: Operation = {
         /* telemetry only */
       }
     }
-    return { pages, count: pages.length, window_turns: turns.length };
+    const suppressed = suppressionSummary(withheld);
+    return { pages, count: pages.length, window_turns: turns.length, ...(suppressed ? { suppressed } : {}) };
   },
   cliHints: { name: 'volunteer-context', stdin: 'window' },
 };
@@ -124,6 +138,9 @@ const volunteer_context: Operation = {
 // v0.33: expertise + relationship-proximity routing. CLI: gbrain whoknows.
 const find_experts: Operation = {
   name: 'find_experts',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'retrieval',
   description: FIND_EXPERTS_DESCRIPTION,
   scope: 'read',
   params: {
@@ -144,7 +161,8 @@ const find_experts: Operation = {
     const { findExperts } = await import('../../commands/whoknows.ts');
     const topic = typeof p.topic === 'string' ? p.topic : '';
     if (!topic.trim()) {
-      throw new OperationError('invalid_params', '`topic` is required and must be a non-empty string.');
+      throw invalidParam(ctx, 'find_experts', 'topic', '`topic` is required and must be a non-empty string.',
+        { def: find_experts.params.topic, example: 'vector search' });
     }
     // v0.34.1 (#861, D3 — 5th leak surface): find_experts (whoknows) was
     // authored against v0.33 after PR #861 was drafted, so the source-scope
@@ -157,7 +175,7 @@ const find_experts: Operation = {
     const { loadActivePackBestEffort, expertTypesFromPack } = await import('../schema-pack/index.ts');
     const pack = await loadActivePackBestEffort(ctx);
     const types = pack ? expertTypesFromPack(pack.manifest) : [];
-    const scope = sourceScopeOpts(ctx);
+    const scope = await readPolicyOpts(ctx);
     const experts = await findExperts(ctx.engine, {
       topic,
       limit: typeof p.limit === 'number' ? p.limit : undefined,
@@ -165,10 +183,7 @@ const find_experts: Operation = {
       types: types as never,
       ...scope,
     });
-    // A `visibility: private` page's slug/title/scores must not reach remote
-    // readers through the expertise rankings (same read-leak class as the
-    // delta page arm / find_orphans / get_recent_salience).
-    return dropPrivateOnlyRows(ctx.engine, ctx.remote, experts, e => e.slug, scope);
+    return experts;
   },
   // hidden: 'whoknows' is in CLI_ONLY (src/cli.ts) — runWhoknows owns the CLI
   // surface (ranked table + per-factor explain + thin-client routing) and was
@@ -181,6 +196,9 @@ const find_experts: Operation = {
 // v0.32.6: contradiction probe MCP surface (M3)
 const find_contradictions: Operation = {
   name: 'find_contradictions',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'retrieval',
   description: FIND_CONTRADICTIONS_DESCRIPTION,
   scope: 'read',
   // Reads eval_contradictions_runs.report_json for the latest run, then
@@ -202,6 +220,15 @@ const find_contradictions: Operation = {
     },
   },
   handler: async (ctx, p) => {
+    const scope = sourceScopeOpts(ctx);
+    // N2-2: the local CLI always carries a sourceId; one the operator did not
+    // select is not a filter, so the bare command reads the latest run.
+    const sourceFiltered = scope.sourceIds !== undefined
+      || (scope.sourceId !== undefined && ctx.localSourceImplicit !== true);
+    if (ctx.remote !== false || sourceFiltered) {
+      return { contradictions: [], note: 'Stored contradiction reports are temporarily available only to trusted local callers without a source filter.' };
+    }
+
     const limit = typeof p.limit === 'number' && p.limit > 0 ? Math.min(p.limit, 100) : 20;
     const slugFilter = typeof p.slug === 'string' ? p.slug.toLowerCase() : null;
     const sevFilter = (p.severity === 'low' || p.severity === 'medium' || p.severity === 'high')
@@ -226,11 +253,8 @@ const find_contradictions: Operation = {
       }>;
     }> | undefined) ?? [];
     const allFindings = perQuery.flatMap((q) => q.contradictions);
-    // Cheap in-memory filters (severity/slug) run FIRST, so the scoped
-    // existence probes below only pay for findings that could actually be
-    // returned. Pre-fix, every finding in the report paid a sequential
-    // scoped getPage probe BEFORE the filters/slice — the deprecated
-    // getPage-per-row N+1 class.
+    // This branch is trusted and unscoped. Apply the requested display
+    // filters before the limit; source-scoped reports are unavailable above.
     const matching = allFindings.filter((f) => {
       if (sevFilter && f.severity !== sevFilter) return false;
       if (slugFilter) {
@@ -240,74 +264,13 @@ const find_contradictions: Operation = {
       }
       return true;
     });
-    // Source isolation (fail-closed): the probe report is brain-wide, so a
-    // scoped caller sees a finding only when BOTH endpoints resolve inside
-    // their source scope. Existence is checked with a SCOPED getPage
-    // (per-call slug cache), early-exiting once `limit` findings are kept.
-    // An unscoped trusted local caller ({} scope) keeps the brain-wide view.
-    // KNOWN CAVEAT (slug collision): the scope check is slug-EXISTENCE within
-    // scope — findings carry no source attribution, so a finding about
-    // source B's page stays visible to a source-A caller whenever source A
-    // holds a page with the SAME slug. Recording source_id on the probe side
-    // is the follow-up that closes this.
-    const scope = sourceScopeOpts(ctx);
-    const scoped = scope.sourceId !== undefined || scope.sourceIds !== undefined;
-    // #4352 posture, same keep-list idiom as get_recent_salience
-    // (ops/salience.ts): a `visibility: private` endpoint must not leak to a
-    // remote caller through the contradictions surface. Fail-closed: a
-    // finding survives only when BOTH endpoint slugs have a world-visible
-    // page row inside the caller's scope. Trusted local + the operator
-    // opt-outs resolve to "expose" inside resolveExcludePrivatePages.
-    const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
-    let kept: typeof allFindings;
-    if (!scoped && !excludePrivate) {
-      kept = matching.slice(0, limit);
-    } else {
-      // Both fences run BEFORE a finding counts toward `limit` — filtering
-      // after the cutoff would silently under-fill the response (findings
-      // past the break point were never examined) while total_in_run claims
-      // completeness. Batched so the world-visibility keep-list probe stays
-      // one query per batch rather than per finding.
-      const cache = new Map<string, boolean>();
-      const inScope = async (slug: string): Promise<boolean> => {
-        const hit = cache.get(slug);
-        if (hit !== undefined) return hit;
-        const ok = (await ctx.engine.getPage(slug, scope)) !== null;
-        cache.set(slug, ok);
-        return ok;
-      };
-      kept = [];
-      const BATCH = 25;
-      for (let i = 0; i < matching.length && kept.length < limit; i += BATCH) {
-        const batch = matching.slice(i, i + BATCH);
-        const scopeOk: typeof allFindings = [];
-        for (const f of batch) {
-          if (kept.length + scopeOk.length >= limit + BATCH) break;
-          if (!scoped || ((await inScope(f.a.slug)) && (await inScope(f.b.slug)))) scopeOk.push(f);
-        }
-        let visibleOk = scopeOk;
-        if (excludePrivate && scopeOk.length > 0) {
-          const endpointSlugs = [...new Set(scopeOk.flatMap((f) => [f.a.slug, f.b.slug]))];
-          const worldVisible = await findWorldVisibleSlugs(ctx.engine, endpointSlugs, scope);
-          visibleOk = scopeOk.filter((f) => worldVisible.has(f.a.slug) && worldVisible.has(f.b.slug));
-        }
-        for (const f of visibleOk) {
-          if (kept.length >= limit) break;
-          kept.push(f);
-        }
-      }
-    }
+    const kept = matching.slice(0, limit);
     return {
       run_id: latest.run_id,
       ran_at: latest.ran_at,
       contradictions: kept,
-      // Trusted local unscoped callers keep the exact pre-fix semantics
-      // (every finding in the run). Scoped/remote callers get the count of
-      // findings actually verified visible to them — the full scoped count
-      // would require paying the per-slug probe for every finding (the N+1
-      // this handler no longer does), and a larger-than-returned count is a
-      // hidden-finding oracle for privacy-filtered callers.
-      total_in_run: scoped || ctx.remote !== false ? kept.length : allFindings.length,
+      // Trusted unscoped callers retain the complete local run count.
+      total_in_run: allFindings.length,
     };
   },
   cliHints: { name: 'find-contradictions' },
@@ -315,6 +278,9 @@ const find_contradictions: Operation = {
 
 const find_trajectory: Operation = {
   name: 'find_trajectory',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'retrieval',
   description: FIND_TRAJECTORY_DESCRIPTION,
   scope: 'read',
   // localOnly intentionally NOT set — federated OAuth clients should be
@@ -350,7 +316,7 @@ const find_trajectory: Operation = {
   },
   handler: async (ctx, p) => {
     if (typeof p.entity_slug !== 'string' || !p.entity_slug.trim()) {
-      throw new Error('find_trajectory requires entity_slug (string)');
+      throw invalidParam(ctx, 'find_trajectory', 'entity_slug', 'find_trajectory requires entity_slug (string)', { example: 'people/alice-example' });
     }
     const metric = typeof p.metric === 'string' ? p.metric : undefined;
     const kind = (p.kind === 'metric' || p.kind === 'event' || p.kind === 'all')

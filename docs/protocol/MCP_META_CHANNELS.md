@@ -1,7 +1,7 @@
 # MCP `_meta` channels
 
-Normative conventions for `ToolResult._meta` on gbrain's MCP surfaces
-(WP2 amendment 9 / decision D3). `_meta` is the structured, out-of-band
+Normative conventions for `ToolResult._meta` on gbrain's MCP surfaces.
+`_meta` is the structured, out-of-band
 channel for tool-call responses; the response BODY contract never changes
 shape for it.
 
@@ -22,7 +22,7 @@ shape for it.
    (`metaHook`) attach after and may add keys but shadow nothing that
    matters — key ownership (rule 1) makes ordering a non-event.
 5. **Model visibility caveat.** Mainstream harnesses do NOT feed `_meta` to
-   the model. Anything the model must SEE rides a content block (see the D8
+   the model. Anything the model must SEE rides a content block (see the
    second text block on empty retrievals); `_meta` serves structured
    programmatic consumers (thin clients, harness plumbing, tests).
 
@@ -30,13 +30,14 @@ shape for it.
 
 | Key | Producer | Contents |
 |-----|----------|----------|
-| `brain_hot_memory` | serve-http `metaHook` (`getBrainHotMemoryMeta`) | Hot-memory facts relevant to the call (v0.31 eD3) |
-| `retrieval` | `search`/`query` op handlers | `returned_count`, `retrieved_count`, `vector_enabled`, `expansion_applied`, `cache`, `token_budget`, `degraded[]` (closed stage vocabulary, D6), `hint` (non-contractual prose, E1) |
-| `warnings` | dispatch strict-params warn mode (WP3) | `[{code: 'unknown_param', param, suggestion?}]` |
+| `brain_hot_memory` | serve-http `metaHook` (`getBrainHotMemoryMeta`) | Hot-memory facts relevant to the call; each fact carries `trust_tier` and `origin`, and `suppressed` (`{withheld, review}`, present only when non-zero) counts unconfirmed agent-written facts activation control withheld, never their content |
+| `retrieval` | `search`/`query` op handlers | `returned_count`, `retrieved_count`, `vector_enabled`, `expansion_applied`, `cache`, `token_budget`, `degraded[]` (closed stage vocabulary), `hint` (non-contractual prose), `rows` (`"lean"` or `"full"`: the row shape of content[0]; reported for remote callers and whenever `fields` is passed) |
+| `warnings` | dispatch strict-params warn mode | `[{code: 'unknown_param', param, suggestion?}]` |
+| `pagination` | `list_pages` op handler | `truncated` (more rows match), `limit` (effective), `clamped_from?` (the caller's limit when capped), `next?` (params for the following page: `{sort, updated_after, updated_after_slug}` under `updated_asc`, else `{offset}`). The model-visible counterpart is the `listing_truncated` notice block (kind `info`, never deduped), whose `fix.mcp` is the next-page call. |
 
-Inbound `_meta` (e.g. `_meta.session_id` inside tool ARGUMENTS, CX2-11) is a
+Inbound `_meta` (e.g. `_meta.session_id` inside tool ARGUMENTS) is a
 separate, client-to-server plane. The eval-report `_meta.metric_glossary`
 lives in JSON BODIES of eval commands — a third, unrelated plane. Ambient
-recall (#4028) rides content/hooks, not `_meta`.
+recall rides content/hooks, not `_meta`.
 
 Adding a key: register it in the table above, one producer, additive-forever.

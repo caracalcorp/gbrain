@@ -35,6 +35,7 @@ upstream: company-brainify@fc834ee
 # skill edits IN PLACE — it does not create new pages there, except the
 # deletion-log entry under daily/ required by data-loss-gate Step 4.
 brain_first: true
+when_to_use: "Use when the user asks: \"company brain\", \"team brain\", \"brainify\", \"sanitize the brain\", \"share my brain with the team\"."
 ---
 
 # company-brainify — Personal → Team-Brain Sanitization
@@ -70,6 +71,14 @@ outside the page prose. This skill handles all three surfaces — pages,
 takes/facts, and history.
 
 ## When to Use
+
+Connecting or indexing an existing company repository without editing it is not
+sanitization. For “connect our company brain” or “import an existing company
+brain,” use the migrate (host-side) company workflow. On the trusted brain host,
+start with `gbrain sources inspect <path> --profile company-brain`; follow
+`docs/guides/company-brain-ingestion.md` for destination preview and approval.
+Do not strip metadata or purge history merely to make an existing repository
+searchable.
 
 - Standing up a shared company brain from a founder/exec's personal brain
 - Auditing an existing shared brain for sensitive content that shouldn't be there
@@ -519,6 +528,19 @@ recovery line.
 - If the repo carries push hooks or auto-hardening wiring, re-verify remotes
   and hooks survived the rewrite before handing the repo to the team
 
+**Hand the repo to the team — stamp it shared first.** Whichever path
+produced the team repo (fresh-history export in Step 0 or the post-purge
+force-push), stamp the published brain's audience before handoff:
+`gbrain config set brain.audience shared` — run against the TEAM brain,
+never the personal one. The stamp declares this a company/team brain, so
+the ambient memory writeback consent nudge (a personal-brain ask) never
+fires on it. If team members will run `gbrain init` for the shared brain
+BEFORE this stamp exists (e.g. a fresh clone initializing its own engine),
+have them prefix that one command with `GBRAIN_NO_ONBOARD_NUDGE=1` — a
+fresh un-stamped brain classifies personal, and the init-time nudge is
+fire-once, so letting it fire there would both ask the wrong question and
+burn the sentinel.
+
 ### Phase 6: Ongoing hygiene — periodic re-audit
 
 Sensitive data re-accumulates through meeting-transcript ingestion (candid
@@ -618,6 +640,9 @@ This skill guarantees:
   commit is pushed to the shared repo.
 - Confirmed purges are logged to `daily/notes/YYYY-MM-DD.md` under
   `## Data Deletions` with the backup path as the recovery line.
+- A brainified brain is stamped `brain.audience=shared` at handoff and never
+  receives the ambient-writeback enablement nudge — that consent ask is
+  reserved for personal brains.
 - Routing matches the canonical triggers in the frontmatter.
 - Output written under the directories listed in `writes_to:` (edits in
   place, plus the daily/ deletion log).
@@ -650,6 +675,14 @@ Three artifacts:
 3. **The deletion log entry** (post-purge only) — appended to the PERSONAL
    brain's `daily/notes/YYYY-MM-DD.md` (never the shared repo) per
    data-loss-gate Step 4.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- A bulk redaction or delete needs the data-loss-gate card; if the CLI exits 3 or asks for confirmation, stop and show the user the recoverability card first.
+- The retrieval-first scope scan is empty with a degraded notice: keyword-only search under-counts sensitive pages. Keep the structural pass and tell the user the scan was keyword-only.
+- `forget` / `put_page` returns `write_pending` (exit 10): poll `gbrain write-request <request_id>`; do not report a page sanitized until its receipt commits.
 
 ## Anti-Patterns
 

@@ -41,11 +41,25 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { askHarnessConsent } from './harness-consent.ts';
+import { CONFIRMATION_REQUIRED_EXIT_CODE } from '../exit-codes.ts';
 import { dirname, join, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 import { VERSION } from '../../version.ts';
-import { loadConfig, toEngineConfig } from '../config.ts';
+import { loadConfig, loadConfigFileOnly, toEngineConfig, type GBrainConfig } from '../config.ts';
+import { PRIVATE_DEFAULT_REMOTE_CONSEQUENCE, resolveWritebackConfigFromFile } from '../facts/writeback-config.ts';
+import {
+  AMBIENT_WRITEBACK_BLOCK_BEGIN,
+  ambientBlockPresent,
+  installAmbientWritebackBlockAt,
+  probeAmbientBlock,
+  renderAmbientInstructionBlock,
+  stripAmbientWritebackBlockAt,
+} from './instructions-block.ts';
 import { createEngine } from '../engine-factory.ts';
+import { isValidSourceId } from '../source-id.ts';
+import { ALL_SOURCES, isResolverUserError, localFederatedSourceIds, resolveSourceWithTier } from '../source-resolver.ts';
 import { probeBrainIdentity, type ConnectProbeResult } from '../connect-probe.ts';
 import {
   buildClaudeMcpAddArgv,
@@ -55,8 +69,12 @@ import {
   redactToken,
   validateToken,
 } from '../mcp-registration.ts';
-import { mintLegacyToken, revokeLegacyTokenById, type MintedLegacyToken } from '../token-mint.ts';
+import { carryLegacyGrant, mintLegacyToken, readActiveTokenPermissions, revokeLegacyTokenById, type MintedLegacyToken } from '../token-mint.ts';
 import { generateToken } from '../utils.ts';
+import { readCredentials, writeCredentials, type HarnessCredentials } from '../harness/credentials.ts';
+import { installSharedSkillsConnection, type SharedSkillsConnectionOptions } from '../harness/shared-skills.ts';
+import { localEnrollment, SKILLS_REFRESH_COMMAND } from './harness-skills.ts';
+import { nativeSharedSkillsDirectory } from '../harness/native-router.ts';
 import { sqlQueryForEngine } from '../sql-query.ts';
 import { BootstrapError, acquireBootstrapLock } from './lock.ts';
 import { probeLivePgliteHolder } from './uninstall.ts';
@@ -80,18 +98,25 @@ import {
   addPermissionsAllowEntry,
   claudeSettingsPath,
   committedHookEvents,
+  harnessHookIdentity,
+  parseSeatFlags,
   removeClaudeHooksAt,
   removePermissionsAllowEntry,
   writeClaudeHooksAt,
   type ClaudeHookEnv,
 } from './hooks.ts';
+import { codexPluginProvidesName } from './plugin-lanes.ts';
+import { harnessHookCarrierStatus, harnessHooksPresent, previewHarnessRemoval, removeHarnessHooksTarget } from './harness-hooks.ts';
 import {
   CLAUDE_HOOK_EVENTS,
   CODEX_TOML_BLOCK_BEGIN,
   CODEX_TOML_BLOCK_END,
   GBRAIN_HARNESS_MARKER_VALUE,
+  claudeUserMemoryPath,
   claudeUserSettingsPath,
+  codexAgentsOverridePath,
   codexConfigPath,
+  codexGlobalAgentsPath,
   mcpPermissionEntry,
   opencodeConfigDir,
   opencodeGlobalConfigPath,
@@ -135,10 +160,18 @@ export interface HarnessFlags {
   noCapture: boolean;
   force: boolean;
   remove: boolean;
+  /** `--remove --dry-run`: list what removal would do, write nothing. */
+  dryRun?: boolean;
   status: boolean;
+  refreshSkills: boolean;
   yes: boolean;
   json: boolean;
   gbrainBin?: string;
+  skills?: 'follow' | 'memory-only';
+  /** #4618 `--seat <label>` ('' = `--no-seat`); undefined keeps the installed seat. */
+  seat?: string;
+  /** The raw argv, for the approved command in a consent refusal (the token value is never repeated). */
+  raw: string[];
   error?: string;
 }
 
@@ -154,8 +187,10 @@ export function parseHarnessArgs(rest: string[]): HarnessFlags {
     force: false,
     remove: false,
     status: false,
+    refreshSkills: false,
     yes: false,
     json: false,
+    raw: [...rest],
   };
   // [X14] Fail closed: an unattended setup command must never resolve a
   // malformed invocation by silent precedence. Missing values error.
@@ -177,6 +212,14 @@ export function parseHarnessArgs(rest: string[]): HarnessFlags {
     }
     out.harness = h;
   }
+  const skills = value('--skills');
+  if (skills !== undefined) {
+    if (skills !== 'follow' && skills !== 'memory-only') {
+      out.error = '--skills must be follow or memory-only';
+      return out;
+    }
+    out.skills = skills;
+  }
   const url = value('--url');
   if (url !== undefined) out.url = url;
   const port = value('--port');
@@ -189,7 +232,15 @@ export function parseHarnessArgs(rest: string[]): HarnessFlags {
     out.port = n;
   }
   const source = value('--source');
-  if (source !== undefined) out.source = source;
+  if (source !== undefined) {
+    // Every other flag is validated here; a typo'd id would otherwise mint a
+    // token and wire hooks to a phantom scope (reads return nothing).
+    if (!isValidSourceId(source)) {
+      out.error = `invalid --source '${source}' (a source id matches [a-z0-9-]{1,32}; '${ALL_SOURCES}' is not a hook scope)`;
+      return out;
+    }
+    out.source = source;
+  }
   out.tokenName = value('--token-name') ?? out.tokenName;
   const token = value('--token');
   if (token !== undefined) out.token = token;
@@ -215,11 +266,16 @@ export function parseHarnessArgs(rest: string[]): HarnessFlags {
   out.noCapture = rest.includes('--no-capture');
   out.force = rest.includes('--force');
   out.remove = rest.includes('--remove');
+  out.dryRun = rest.includes('--dry-run');
   out.status = rest.includes('--status');
+  out.refreshSkills = rest.includes('--refresh-skills');
   out.yes = rest.includes('--yes');
   out.json = rest.includes('--json');
   const bin = value('--gbrain-bin');
   if (bin !== undefined) out.gbrainBin = bin;
+  const seat = parseSeatFlags(rest);
+  if (seat.error) out.error = out.error ?? seat.error;
+  if (seat.seat !== undefined) out.seat = seat.seat;
   // [X14] Conflicting invocations error instead of resolving by precedence.
   if (out.url !== undefined && out.port !== undefined) {
     out.error = out.error ?? 'pass --url OR --port, not both (the url wins would be a silent guess)';
@@ -227,6 +283,8 @@ export function parseHarnessArgs(rest: string[]): HarnessFlags {
   if (out.status && out.remove) {
     out.error = out.error ?? 'pass --status OR --remove, not both';
   }
+  if (out.refreshSkills && (out.status || out.remove)) out.error = out.error ?? 'pass --refresh-skills alone, not with --status or --remove';
+  if (out.dryRun && !out.remove) out.error = out.error ?? '--dry-run previews --remove only: pass `--remove --dry-run`';
   // --user-hooks and --local are accepted, documented no-ops (script clarity).
   // Unknown/typo'd flags never reach this parser through the CLI: cli.ts
   // validates argv against CLI_FLAG_REGISTRY pre-dispatch and rejects them
@@ -253,13 +311,40 @@ export interface HarnessDeps {
   codexConfig?: string;
   /** Resolved opencode config path (tests point at a temp XDG_CONFIG_HOME). */
   opencodeConfig?: string;
+  /** Resolved Claude user memory file (~/.claude/CLAUDE.md) — the
+   * ambient-writeback block target. Defaults to the sibling of an injected
+   * userSettingsPath so a sandboxed test can never touch the real file. */
+  claudeMemoryPath?: string;
+  /** Resolved codex user-global AGENTS.md (same sandboxing rule, keyed off
+   * an injected codexConfig). */
+  codexAgentsPath?: string;
+  /** Resolved codex AGENTS.override.md — the [OV-A4] exclusivity probe. */
+  codexAgentsOverride?: string;
+  /** Engine-free file-plane config loader (ambient-writeback gate); tests
+   * inject a fake. */
+  loadFileConfig?: () => GBrainConfig | null;
   /** Engine-backed mint; tests inject a fake. */
   mint?: (opts: {
     name: string;
     scopes: string[];
     sourceGrant?: string[];
+    allowedOperations?: string[];
+    /** #5893: rotate from this token id, carrying its grants (carryLegacyGrant). */
+    carry?: { fromId: string; explicitSource: boolean; policyAdded: string[] };
   }) => Promise<MintedLegacyToken>;
+  installSharedSkills?: (credentials: HarnessCredentials, options: SharedSkillsConnectionOptions) => Promise<{
+    status: string; reason?: string; retained_files?: string[]; next_action?: string; remote_membership_pending?: boolean;
+  }>;
+  nativeSkillsDir?: (host: HarnessTarget['host']) => string | undefined;
   revokeById?: (id: string) => Promise<boolean>;
+  /** Resolve the source the hooks + token bind to, through the SAME resolver
+   * the serve's resolve-IPC binding uses (resolveSourceWithTier: env →
+   * dotfile → local_path → sources.default → sole non-default → seed
+   * default), plus that source's local federated read set, so the hook lane
+   * reads what search/think read (#4897). `explicit` = --source (validated +
+   * asserted to exist). Throws on an unknown id or an unopenable engine — the
+   * caller decides fail-open vs fail-closed. Tests inject a fake. */
+  resolveHookSource?: (explicit: string | null) => Promise<HookSourceBinding>;
   /** Live-PGLite-serve pre-probe for the revoke lane [C9]. */
   pgliteLiveServe?: () => boolean;
   detectClaude?: () => boolean;
@@ -270,7 +355,7 @@ export interface HarnessDeps {
   logError?: (line: string) => void;
 }
 
-function resolveDeps(deps: HarnessDeps): Required<Omit<HarnessDeps, 'gbrainBin'>> & { gbrainBin: string | null } {
+export function resolveHarnessDeps(deps: HarnessDeps): Required<Omit<HarnessDeps, 'gbrainBin'>> & { gbrainBin: string | null } {
   return {
     runner: deps.runner,
     gbrainHome: deps.gbrainHome,
@@ -281,8 +366,29 @@ function resolveDeps(deps: HarnessDeps): Required<Omit<HarnessDeps, 'gbrainBin'>
     userSettingsPath: deps.userSettingsPath ?? claudeUserSettingsPath(),
     codexConfig: deps.codexConfig ?? codexConfigPath(),
     opencodeConfig: deps.opencodeConfig ?? opencodeGlobalConfigPath(),
-    mint: deps.mint ?? defaultMint,
+    // Instruction-file targets derive from an INJECTED settings/config path's
+    // directory when one is given: in production the derivation equals the
+    // host-specs defaults (CLAUDE.md and AGENTS.md live beside settings.json
+    // and config.toml), and in tests it keeps every write inside the temp
+    // sandbox even when the test predates these fields.
+    claudeMemoryPath:
+      deps.claudeMemoryPath ??
+      (deps.userSettingsPath ? join(dirname(deps.userSettingsPath), 'CLAUDE.md') : claudeUserMemoryPath()),
+    codexAgentsPath:
+      deps.codexAgentsPath ??
+      (deps.codexConfig ? join(dirname(deps.codexConfig), 'AGENTS.md') : codexGlobalAgentsPath()),
+    codexAgentsOverride:
+      deps.codexAgentsOverride ??
+      (deps.codexConfig ? join(dirname(deps.codexConfig), 'AGENTS.override.md') : codexAgentsOverridePath()),
+    loadFileConfig: deps.loadFileConfig ?? loadConfigFileOnly,
+    mint: deps.mint ?? mintHarnessToken,
+    installSharedSkills: deps.installSharedSkills ?? installSharedSkillsConnection,
+    nativeSkillsDir: deps.nativeSkillsDir ?? ((host) => {
+      const config = host === 'claude-code' ? deps.userSettingsPath : host === 'codex' ? deps.codexConfig : deps.opencodeConfig;
+      return config ? join(dirname(config), 'skills') : nativeSharedSkillsDirectory(host) ?? undefined;
+    }),
     revokeById: deps.revokeById ?? defaultRevokeById,
+    resolveHookSource: deps.resolveHookSource ?? defaultResolveHookSource,
     pgliteLiveServe: deps.pgliteLiveServe ?? defaultPgliteLiveServe,
     // #4325: config-dir fallback mirrors detectCodex/detectOpencode below —
     // CI runners and alias-only shells don't expose a `claude` binary on the
@@ -341,7 +447,7 @@ export function harnessDetectDeps(o?: HarnessDetectOverrides): Partial<HarnessDe
 }
 
 /** Production mint: open the configured engine just long enough to insert. */
-async function defaultMint(opts: { name: string; scopes: string[]; sourceGrant?: string[] }): Promise<MintedLegacyToken> {
+export async function mintHarnessToken(opts: Parameters<NonNullable<HarnessDeps['mint']>>[0]): Promise<MintedLegacyToken> {
   const cfg = loadConfig();
   if (!cfg) {
     throw new Error('no brain configured — run `gbrain init` first (the harness wires an EXISTING brain).');
@@ -361,12 +467,49 @@ async function defaultMint(opts: { name: string; scopes: string[]; sourceGrant?:
         sourceGrant = undefined; // historical default floor
       }
     }
+    const prior = opts.carry && await readActiveTokenPermissions(engine, opts.carry.fromId);
+    if (prior !== undefined && opts.carry && opts.allowedOperations) {
+      const carried = carryLegacyGrant(prior, { ...opts.carry, allowedOperations: opts.allowedOperations,
+        ...(sourceGrant && sourceGrant.length > 0 ? { sourceGrant } : {}) });
+      const minted = await mintLegacyToken(engine, { name: opts.name, scopes: opts.scopes, ...carried });
+      return { ...minted, withheldOperations: carried.withheldOperations };
+    }
     return await mintLegacyToken(engine, {
       name: opts.name,
       takesHolders: ['world'],
       scopes: opts.scopes,
+      ...(opts.allowedOperations !== undefined ? { allowedOperations: opts.allowedOperations } : {}),
       ...(sourceGrant && sourceGrant.length > 0 ? { sourceGrant } : {}),
     });
+  } finally {
+    await engine.disconnect();
+  }
+}
+
+/** The source the hooks + token bind to, and the read grant the token carries. */
+export interface HookSourceBinding {
+  source_id: string;
+  /** The federated read set for an ambient tier (what search/think read);
+   * `[source_id]` for an explicit --source or a non-federated source. */
+  grant: string[];
+}
+
+/** Production hook-source lookup: the SAME resolver the serve's resolve-IPC
+ * binding runs (`resolveSourceWithTier(engine, null)`), so the hooks claim
+ * exactly the source the serve resolves; an explicit --source goes through
+ * tier 1 (shape + existence). NOT fail-open: on a PGLite brain under a live
+ * serve the engine cannot open, and applyHarness decides what that means
+ * (refuse without --source; bind an explicit --source unverified). */
+async function defaultResolveHookSource(explicit: string | null): Promise<HookSourceBinding> {
+  const cfg = loadConfig();
+  if (!cfg) throw new Error('no brain configured (run `gbrain init` first)');
+  const engineConfig = toEngineConfig(cfg);
+  const engine = await createEngine(engineConfig);
+  await engine.connect(engineConfig);
+  try {
+    const resolved = await resolveSourceWithTier(engine, explicit);
+    const grant = (await localFederatedSourceIds(engine, resolved.source_id, resolved.tier)) ?? [resolved.source_id];
+    return { source_id: resolved.source_id, grant };
   } finally {
     await engine.disconnect();
   }
@@ -409,6 +552,11 @@ export function buildConsentBlock(p: {
   userSettingsPath: string;
   codexConfig: string;
   opencodeConfig: string;
+  /** Instruction files receiving the ambient-writeback managed block (only
+   * when memory.auto_writeback is enabled) — consent names every file the
+   * apply will write [X7 parity]. */
+  instructionsPaths?: string[];
+  skills?: 'follow' | 'memory-only';
 }): string {
   const lines: string[] = [
     'gbrain bootstrap harness — wire framework-spawned coding sessions to this brain',
@@ -418,12 +566,16 @@ export function buildConsentBlock(p: {
   let n = 1;
   lines.push(
     p.tokenSupplied
-      ? `  ${n++}. Use the supplied bearer token — written ONLY into the host registrations below ` +
-          `(gbrain keeps no copy) and NOT revoked by the remove flow (it is not ours to revoke).`
-      : `  ${n++}. Mint bearer token '${p.tokenName}' (scopes: ${p.scopes.join('+')}; sees takes marked 'world'; ` +
+      ? `  ${n++}. Use the supplied bearer token — written ${p.skills === 'follow' ? 'into' : 'ONLY into'} the host registrations below ` +
+          `${p.skills === 'follow' ? 'and a private 0600 enrollment cleanup credential' : '(gbrain keeps no copy)'}. ` +
+          `The remove flow does NOT revoke supplied tokens (they are not ours to revoke).`
+      : `  ${n++}. Mint an independent bearer token per harness under '${p.tokenName}' (scopes: ${p.scopes.join('+')}; sees takes marked 'world'; ` +
           `reads span this brain's federated sources). Any prior harness token is revoked ` +
           `only after the new one is wired and verified.`,
   );
+  if (p.skills) lines.push(p.skills === 'follow'
+    ? `  ${n++}. Follow this brain's authorized shared-skills catalog using an owned native router and private installation receipts. No editor authority, automatic execution, extra capture, or identity changes. Restart sessions after updates; native activation remains unverified. Opt out with --skills memory-only.`
+    : `  ${n++}. Shared skills: memory-only. Do not enroll or install a router; stop any prior owned enrollment without deleting edited files.`);
   if (p.wireClaude) {
     lines.push(
       `  ${n++}. Claude Code (user scope): register MCP server '${p.name}' -> ${p.url}, and ` +
@@ -453,6 +605,13 @@ export function buildConsentBlock(p: {
       `  ${n++}. opencode (user-global): write the mcp.${p.name} remote entry with the bearer token INLINE into ` +
         `${p.opencodeConfig} (0600) — framework-spawned opencode inherits no shell env, so the {env:…} ` +
         `interpolation would resolve empty.`,
+    );
+  }
+  if (p.instructionsPaths && p.instructionsPaths.length > 0) {
+    lines.push(
+      `  ${n++}. Ambient memory writeback is ENABLED (memory.auto_writeback): install the managed ` +
+        `instruction block (marker-delimited, credential-free) into ${p.instructionsPaths.join(' and ')} ` +
+        `so every session saves durable user facts to this brain.`,
     );
   }
   // [X7] The reach statement matches what is ACTUALLY being wired — it must
@@ -511,7 +670,7 @@ export function parseClaudeMcpGetUrl(out: string): ClaudeMcpGetInfo {
 async function cleanupStalePriorTargets(
   prior: HarnessReceipt,
   receipt: HarnessReceipt,
-  d: ReturnType<typeof resolveDeps>,
+  d: ReturnType<typeof resolveHarnessDeps>,
   save: () => void,
 ): Promise<void> {
   const planned = receipt.targets;
@@ -520,13 +679,33 @@ async function cleanupStalePriorTargets(
       if (nt.host !== pt.host || nt.kind !== pt.kind) return false;
       if (pt.kind === 'hooks') return nt.path === pt.path && nt.marker === pt.marker;
       if (pt.kind === 'permission') return nt.path === pt.path && nt.entry === pt.entry;
+      if (pt.kind === 'instructions') return nt.path === pt.path;
       return (nt.name ?? 'gbrain') === (pt.name ?? 'gbrain');
     });
   for (const pt of prior.targets) {
     if (matches(pt)) continue;
     try {
-      if (pt.host === 'claude-code' && pt.kind === 'hooks') {
-        const r = removeClaudeHooksAt(pt.path ?? d.userSettingsPath, pt.marker ?? GBRAIN_HARNESS_MARKER_VALUE);
+      if (pt.kind === 'instructions') {
+        // Ambient-writeback block no longer planned (host dropped or
+        // writeback turned off) — strip it. Same [X11] nested-lock
+        // discipline as the codex branch below (the caller holds the
+        // claude/config dir lock).
+        if (pt.path && existsSync(pt.path)) {
+          const blockDir = dirname(pt.path);
+          const heldDir = resolve(dirname(d.userSettingsPath));
+          const lk = resolve(blockDir) === heldDir ? null : await acquireBootstrapLock(blockDir);
+          let r: { removed: boolean };
+          try {
+            r = stripAmbientWritebackBlockAt(pt.path);
+          } finally {
+            lk?.release();
+          }
+          if (r.removed) d.log(`stale ambient-writeback block removed from ${pt.path} (no longer planned).`);
+        }
+      } else if (pt.host === 'claude-code' && pt.kind === 'hooks') {
+        const r = removeClaudeHooksAt(pt.path ?? d.userSettingsPath, pt.marker ?? GBRAIN_HARNESS_MARKER_VALUE, {
+          identity: harnessHookIdentity(prior, pt, { launcher: d.gbrainBin }),
+        });
         if (r.notes.some((n) => n.startsWith('WARNING'))) throw new Error(r.notes.join('; '));
         if (r.removed > 0) d.log(`stale harness hooks unwired from ${r.settingsPath} (no longer planned).`);
       } else if (pt.host === 'claude-code' && pt.kind === 'permission') {
@@ -600,8 +779,103 @@ async function cleanupStalePriorTargets(
   }
 }
 
+/** A live `gbrain serve` holds this PGLite brain: the two documented escape hatches. */
+function liveServeRefusal(): BootstrapError {
+  return new BootstrapError(
+    'LIVE_SERVE',
+    'a live `gbrain serve` holds this PGLite brain, so the harness cannot mint a token — either ' +
+      'pre-mint one while the serve is stopped (`gbrain auth create bootstrap-harness --scopes read,write`) ' +
+      'and re-run with --token <value>, or stop the serve, re-run this command, and restart it. ' +
+      '(Postgres brains mint fine while the serve runs.)',
+  );
+}
+
+/** The engine could not open because a live serve holds the PGLite brain (vs any other failure). */
+function isLiveServeFailure(msg: string, d: Pick<Required<HarnessDeps>, 'pgliteLiveServe'>): boolean {
+  return /already open through `gbrain serve`|LiveServeLockError/i.test(msg) || d.pgliteLiveServe();
+}
+
+/** #5893: the token a host's rotation carries grants from, with the operations a skills-policy change adds. */
+async function rotationCarry(prior: HarnessReceipt | null | undefined, host: HarnessTarget['host'], explicitSource: boolean, allowedOperations: string[]) {
+  const fromId = prior?.harness_tokens?.[host]?.minted ? prior.harness_tokens[host]!.id : prior?.token.minted ? prior.token.id : undefined;
+  if (!prior || !fromId) return undefined;
+  const priorSnapshot = await harnessOperationSnapshot(prior.skills_policy === 'follow');
+  return { fromId, explicitSource, policyAdded: allowedOperations.filter(op => !priorSnapshot.includes(op)) };
+}
+
+function withheldOperationsNote(name: string, count: number): string {
+  return `token ${name}: carried the previous grants; ${count} newer operation(s) withheld — preview with \`gbrain auth rescope-token ${name} --refresh-operations\`.`;
+}
+
+async function harnessOperationSnapshot(follow: boolean): Promise<string[]> {
+  const { operations } = await import('../operations.ts');
+  return operations.filter(op => !op.localOnly && (op.scope === 'read' || op.scope === 'write') &&
+    (op.requiredScopes ?? []).every(scope => follow && scope === 'skills_member_self')).map(op => op.name).sort();
+}
+
+async function leaveHarnessSkills(
+  entry: NonNullable<HarnessReceipt['shared_skills']>[number],
+  d: ReturnType<typeof resolveHarnessDeps>,
+): Promise<boolean> {
+  try {
+    if (entry.status === 'left' || entry.status === 'left_with_retained_files') return true;
+    if (!existsSync(join(entry.root, 'shared-skills', 'receipt.json'))) {
+      entry.status = 'left';
+      rmSync(join(entry.root, 'credentials.json'), { force: true });
+      return true;
+    }
+    const credentials = readCredentials(join(entry.root, 'credentials.json'));
+    if (credentials.mcp_url !== entry.url) throw new Error('credential endpoint mismatch');
+    const result = await d.installSharedSkills(credentials, { harness: entry.host, root: entry.root, name: entry.name, remove: true });
+    entry.status = result.status;
+    entry.reason = result.reason;
+    entry.retained_files = result.retained_files;
+    if (result.remote_membership_pending) {
+      entry.status = 'pending';
+      entry.reason = 'remote_membership_pending';
+      d.logError(`shared skills (${entry.host}): local cleanup completed; remote enrollment cleanup remains pending. Retaining the cleanup credential for retry.`);
+      return false;
+    }
+    if (result.status !== 'left' && result.status !== 'left_with_retained_files') {
+      d.logError(`shared skills (${entry.host}): removal pending; keep the cleanup credential and retry.`);
+      return false;
+    }
+    if (result.retained_files?.length) d.log(`shared skills (${entry.host}): edited files retained: ${result.retained_files.join(', ')}`);
+    rmSync(join(entry.root, 'credentials.json'), { force: true });
+    return true;
+  } catch {
+    entry.status = 'pending';
+    entry.reason = 'cleanup_unavailable';
+    d.logError(`shared skills (${entry.host}): enrollment cleanup pending; restore its private credential and retry before revoking access.`);
+    return false;
+  }
+}
+
+/** Pre-consent notes about the ambient-writeback posture. Registrar mode never
+ * installs blocks for the remote brain; #5671: an explicit private default is
+ * write-only memory for the HTTP sessions this harness wires (remote reads are
+ * world-only), so say so before the operator consents. */
+function logAmbientPostureNotes(
+  d: { log: (line: string) => void; logError: (line: string) => void },
+  wb: { enabled: boolean; visibility_posture: 'world' | 'private' },
+  registrarMode: boolean,
+): void {
+  if (wb.enabled && registrarMode) {
+    d.log(
+      'registrar mode: ambient-writeback instruction blocks are NOT installed for a remote brain — ' +
+        'its own MCP instructions carry the contract when the remote operator enables memory.auto_writeback.',
+    );
+  }
+  if (!registrarMode && wb.visibility_posture === 'private') {
+    d.logError(
+      'WARNING: facts.default_visibility is private, but this harness reads the brain over HTTP MCP — ' +
+        `${PRIVATE_DEFAULT_REMOTE_CONSEQUENCE} (then run gbrain bootstrap harness again; it asks the user first).`,
+    );
+  }
+}
+
 export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): Promise<number> {
-  const d = resolveDeps(rawDeps);
+  const d = resolveHarnessDeps(rawDeps);
   // stdout-for-data discipline: under --json, stdout carries ONLY the final
   // JSON document; every prose/progress line flows to stderr (matching the
   // statusHarness --json contract, so machine callers never scrape).
@@ -680,13 +954,41 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
     return 1;
   }
 
+  // 2b. Ambient-writeback gate (WP3): resolved from the FILE plane only —
+  // this lane is engine-free by design (the DB plane stays authoritative for
+  // extraction; doctor's drift check catches plane divergence). Default OFF.
+  // REGISTRAR MODE never installs instruction blocks (adversarial review,
+  // this wave): the local file mirror speaks for the LOCAL brain, but the
+  // block would order agents to save into the REMOTE brain — whose operator
+  // may never have opted in. That brain's own serve advertises the ambient
+  // section over MCP `instructions` when ITS config enables it.
+  const wb = resolveWritebackConfigFromFile(d.loadFileConfig());
+  const wbInstall = wb.enabled && !registrarMode;
+  logAmbientPostureNotes(d, wb, registrarMode);
+  const ambientBody =
+    !wbInstall
+      ? null
+      : renderAmbientInstructionBlock({
+          mode: wb.mode as 'salient' | 'all',
+          transientTtl: wb.transient_ttl,
+          visibility: wb.visibility_posture,
+          serveUrl: url,
+        });
+  const instructionsPaths = wbInstall
+    ? [...(wireClaude ? [d.claudeMemoryPath] : []), ...(wireCodex ? [d.codexAgentsPath] : [])]
+    : [];
+
   // 3. Consent (connect --install shape; never the interview/A8 ledger).
   const wireHooks = wireClaude && !flags.noHooks && !registrarMode;
+  const priorState = readHarnessReceiptState(d.gbrainHome);
+  const prior = priorState.state === 'ok' ? priorState.receipt : null;
+  const skillsPolicy = flags.skills ?? prior?.skills_policy ?? (priorState.state === 'absent' ? 'follow' : 'memory-only');
   const hookScope = flags.projects.length > 0 ? `${flags.projects.length} project dir(s)` : 'user scope';
   const consent = buildConsentBlock({
     tokenName: flags.tokenName,
     tokenSupplied: flags.token !== undefined,
-    scopes: ['read', 'write'],
+    scopes: skillsPolicy === 'follow' ? ['read', 'write', 'skills_member_self'] : ['read', 'write'],
+    skills: skillsPolicy,
     url,
     wireClaude,
     wireCodex,
@@ -698,25 +1000,15 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
     userSettingsPath: d.userSettingsPath,
     codexConfig: d.codexConfig,
     opencodeConfig: d.opencodeConfig,
+    ...(instructionsPaths.length > 0 ? { instructionsPaths } : {}),
   });
   d.log(consent);
-  if (!flags.yes) {
-    if (!d.isTTY) {
-      d.logError('\nnon-interactive shell: pass --yes to confirm the wiring above.');
-      return 2;
-    }
-    const answer = (await d.prompt('\nProceed? (y/N) ')).trim().toLowerCase();
-    if (answer !== 'y' && answer !== 'yes') {
-      d.log('aborted — nothing written.');
-      return 1;
-    }
-  }
+  const harnesses = [wireClaude ? 'Claude Code' : null, wireCodex ? 'Codex' : null, wireOpencode ? 'opencode' : null].filter(Boolean).join(', ');
+  if (!(await askHarnessConsent({ flags, url, harnesses, skillsPolicy, wireHooks, hookScope }, d))) return CONFIRMATION_REQUIRED_EXIT_CODE;
 
   // Prior receipt: carries the previous minted token for post-wire rotation
   // [C7], and the prior hook-scope for the user-XOR-project exclusivity check
   // [C6].
-  const priorState = readHarnessReceiptState(d.gbrainHome);
-  const prior = priorState.state === 'ok' ? priorState.receipt : null;
   if (prior) {
     const priorProjectHooks = prior.targets.some(
       (t) => t.kind === 'hooks' && t.scope !== 'user' && t.state !== 'failed',
@@ -745,25 +1037,83 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
   // knowable, so scan it. (The reverse — user-scope wiring vs some other
   // home's --project dirs — is not enumerable; the receipt check plus the
   // same-file writer refusal are the guards there.)
-  if (flags.projects.length > 0 && !flags.noHooks && existsSync(d.userSettingsPath)) {
-    try {
-      const raw = readFileSync(d.userSettingsPath, 'utf8');
-      if (raw.includes(`"${GBRAIN_HARNESS_MARKER_VALUE}"`)) {
-        d.logError(
-          `user-scope harness hooks already exist in ${d.userSettingsPath} (possibly from another GBRAIN_HOME's ` +
-            'install); --project wiring would double-fire every event. Remove that install first ' +
-            '(`gbrain bootstrap harness --remove` under its home).',
-        );
-        return 2;
-      }
-    } catch {
-      /* unreadable → the writers' own fail-closed paths handle it */
-    }
+  // Marked or not (the host may drop the marker): an unreadable file falls
+  // through to the writers' own fail-closed paths.
+  if (flags.projects.length > 0 && !flags.noHooks && harnessHooksPresent(d.userSettingsPath)) {
+    d.logError(
+      `user-scope harness hooks already exist in ${d.userSettingsPath} (edited entries included; possibly from another GBRAIN_HOME's ` +
+        'install); --project wiring would double-fire every event. Remove that install first ' +
+        '(`gbrain bootstrap harness --remove` under its home).',
+    );
+    return 2;
   }
 
   // 4. Plan targets + WRITE-AHEAD receipt [F1/X6] — BEFORE the mint, so a
   // crash (or a newer-format receipt refusal) can never leave a live token
   // no receipt records.
+  // #4897: without --source the hooks must claim the source the serve's
+  // resolve-IPC listener is bound to — resolved through the SAME chain the
+  // serve runs (env → dotfile → local_path → sources.default → sole
+  // non-default → seed default), or every turn_context is `source_mismatch`.
+  // The token floors on that source's federated read set (what search/think
+  // read): the federated-default mint cannot read a sole non-federated
+  // source (page_count 0). A resolution that lands on the seeded 'default'
+  // (or a `__all__` env) is the federated floor, not a scalar grant (same
+  // guard as dream.ts).
+  let bound: HookSourceBinding;
+  // Live PGLite serve + --token, no --source: the hooks carry NO source pin
+  // (a claim-free request resolves through the serve's own binding).
+  let unpinnedHooks = false;
+  try {
+    if (registrarMode) {
+      bound = { source_id: flags.source ?? 'default', grant: flags.source ? [flags.source] : [] };
+      unpinnedHooks = !flags.source;
+    } else bound = await d.resolveHookSource(flags.source ?? null);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (isResolverUserError(e)) {
+      // A typo'd --source / stale GBRAIN_SOURCE or dotfile: minting a token
+      // to a phantom scope would "succeed" and then read nothing.
+      throw new BootstrapError('SOURCE_UNRESOLVED', msg);
+    }
+    if (flags.source) {
+      // The engine could not open (a live PGLite serve + --token is the
+      // documented path here); the explicit id is the operator's word.
+      d.logError(`WARNING: could not verify --source '${flags.source}' against the brain (${msg}); binding to it unverified.`);
+      bound = { source_id: flags.source, grant: [flags.source] };
+    } else if (isLiveServeFailure(msg, d)) {
+      // A live PGLite serve holds the brain. Without a token the mint below
+      // would refuse anyway — refuse HERE with the same two escape hatches, so
+      // the operator never sees a source-resolution error for a lock problem.
+      if (flags.token === undefined) throw liveServeRefusal();
+      // --token lane (the documented PGLite path): nothing is minted, so the
+      // grant is the operator's own token. Leave the hooks UNPINNED — a hook
+      // request that names no source resolves through the live serve's own
+      // binding, which is exactly the source the serve resolves (#4897). Say
+      // so, and name the override.
+      d.logError(
+        'WARNING: a live `gbrain serve` holds this PGLite brain, so the harness could not read which source it ' +
+          "serves; wiring the hooks unpinned (they resolve through the live serve). If `gbrain sources list` " +
+          "shows a default other than 'default', re-run with --source <id>.",
+      );
+      bound = { source_id: 'default', grant: ['default'] };
+      unpinnedHooks = true;
+    } else {
+      // Silently binding 'default' here is the #4897 bug reopened: the serve
+      // may resolve a different source and every hook turn would mismatch.
+      throw new BootstrapError(
+        'SOURCE_UNRESOLVED',
+        `could not resolve the source the serve binds its hooks to (${msg}) — pass --source <id> ` +
+          '(`gbrain sources list` shows the registered ids) and re-run.',
+      );
+    }
+  }
+  const implicitSource =
+    flags.source || bound.source_id === 'default' || bound.source_id === ALL_SOURCES ? null : bound.source_id;
+  const hookSource: string | null = unpinnedHooks ? null : (flags.source ?? implicitSource ?? 'default');
+  if (implicitSource) {
+    d.log(`binding hooks + token to source '${implicitSource}' (the serve's resolved default; pass --source to override).`);
+  }
   const guard = guardHarnessReceiptOverwrite(d.gbrainHome);
   if (guard.brokenBackupPath) {
     d.logError(`WARNING: the harness receipt was unreadable; backed it up to ${guard.brokenBackupPath}.`);
@@ -771,6 +1121,10 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
   const targets: HarnessTarget[] = [];
   if (wireClaude) {
     targets.push({ host: 'claude-code', kind: 'mcp', state: 'pending', scope: 'user', name: flags.name, mechanism: 'claude-cli' });
+    // A re-run finds its own earlier entry already allowed: ownership carries
+    // from the prior receipt (a legacy confirmed target without a mechanism
+    // is ours) so it is never relabeled pre-existing.
+    const priorPerm = prior?.targets.find((t) => t.kind === 'permission' && t.path === d.userSettingsPath && t.entry === mcpPermissionEntry(flags.name));
     targets.push({
       host: 'claude-code',
       kind: 'permission',
@@ -778,6 +1132,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
       scope: 'user',
       path: d.userSettingsPath,
       entry: mcpPermissionEntry(flags.name),
+      ...(priorPerm?.state === 'confirmed' && priorPerm.mechanism !== 'pre-existing' ? { mechanism: 'added' } : {}),
     });
     if (wireHooks) {
       if (flags.projects.length > 0) {
@@ -802,6 +1157,16 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
         });
       }
     }
+    if (wbInstall) {
+      targets.push({
+        host: 'claude-code',
+        kind: 'instructions',
+        state: 'pending',
+        scope: 'user',
+        path: d.claudeMemoryPath,
+        mechanism: 'managed-block',
+      });
+    }
   }
   if (wireCodex) {
     targets.push({
@@ -813,6 +1178,16 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
       name: flags.name,
       mechanism: 'toml-block',
     });
+    if (wbInstall) {
+      targets.push({
+        host: 'codex',
+        kind: 'instructions',
+        state: 'pending',
+        scope: 'user',
+        path: d.codexAgentsPath,
+        mechanism: 'managed-block',
+      });
+    }
   }
   if (wireOpencode) {
     targets.push({
@@ -827,10 +1202,11 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
   }
   // [X4] EVERY unrevoked prior minted id is carried — on the --token lane
   // too. A failed rotation must never forget the token before last.
-  const carriedPreviousIds = [
+  const carriedPreviousIds = [...new Set([
     ...(prior?.token.previous_ids ?? []),
     ...(prior?.token.minted && prior.token.id ? [prior.token.id] : []),
-  ];
+    ...Object.values(prior?.harness_tokens ?? {}).flatMap(t => t.minted && t.id ? [t.id] : []),
+  ])];
   const receipt: HarnessReceipt = {
     harness_receipt_version: 1,
     created_at: new Date().toISOString(),
@@ -838,12 +1214,16 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
     url,
     ...(health.engine ? { engine: health.engine } : {}),
     ...(health.version ? { serve_version: health.version } : {}),
-    source_id: flags.source ?? 'default',
+    source_id: hookSource ?? 'default',
+    ...(unpinnedHooks ? { source_pinned: false as const } : {}),
     token: {
       name: flags.tokenName,
       minted: flags.token === undefined,
       ...(carriedPreviousIds.length > 0 ? { previous_ids: carriedPreviousIds } : {}),
     },
+    skills_policy: skillsPolicy,
+    harness_tokens: {},
+    shared_skills: [...(prior?.shared_skills ?? [])],
     targets,
   };
   writeHarnessReceipt(d.gbrainHome, receipt);
@@ -856,35 +1236,47 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
 
   // 5. Token — mint-first [C7]; the receipt already exists [X6].
   let token: string;
+  const tokens = new Map<HarnessTarget['host'], string>();
+  const hosts = targets.filter(t => t.kind === 'mcp').map(t => t.host);
   if (flags.token !== undefined) {
     token = flags.token;
-  } else {
-    let minted: MintedLegacyToken;
-    try {
-      minted = await d.mint({
-        name: flags.tokenName,
-        scopes: ['read', 'write'],
-        // [X2] --source is the write floor — a scalar grant, the stdio
-        // env-tier mirror. Without it the default mint federates.
-        ...(flags.source ? { sourceGrant: [flags.source] } : {}),
-      });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (/already open through `gbrain serve`|LiveServeLockError/i.test(msg) || d.pgliteLiveServe()) {
-        throw new BootstrapError(
-          'LIVE_SERVE',
-          'a live `gbrain serve` holds this PGLite brain, so the harness cannot mint a token — either ' +
-            'pre-mint one while the serve is stopped (`gbrain auth create bootstrap-harness --scopes read,write`) ' +
-            'and re-run with --token <value>, or stop the serve, re-run this command, and restart it. ' +
-            '(Postgres brains mint fine while the serve runs.)',
-        );
-      }
-      throw e;
+    for (const host of hosts) {
+      tokens.set(host, token);
+      receipt.harness_tokens![host] = { minted: false, name: flags.tokenName };
     }
-    token = minted.token;
-    receipt.token.id = minted.id;
-    receipt.token.name = minted.name;
-    save();
+  } else {
+    const allowedOperations = await harnessOperationSnapshot(skillsPolicy === 'follow');
+    for (const host of hosts) {
+      let minted: MintedLegacyToken;
+      const carry = await rotationCarry(prior, host, !!flags.source, allowedOperations);
+      try {
+        minted = await d.mint({
+          name: hosts.length === 1 ? flags.tokenName : `${flags.tokenName}-${host}`,
+          scopes: skillsPolicy === 'follow' ? ['read', 'write', 'skills_member_self'] : ['read', 'write'],
+          allowedOperations,
+          ...(carry ? { carry } : {}),
+          // [X2] --source is the write floor — a scalar grant, the stdio
+          // env-tier mirror. An implicit non-default source carries its
+          // federated read set (#4897 — the same set search/think read, not a
+          // scalar that would hide every federated sibling). Neither → the
+          // default mint federates.
+          ...(flags.source || implicitSource ? { sourceGrant: bound.grant } : {}),
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (isLiveServeFailure(msg, d)) throw liveServeRefusal();
+        throw e;
+      }
+      tokens.set(host, minted.token);
+      if (minted.withheldOperations?.length) d.log(withheldOperationsNote(minted.name, minted.withheldOperations.length));
+      receipt.harness_tokens![host] = { id: minted.id, name: minted.name, minted: true };
+      if (host === hosts[0]) {
+        receipt.token.id = minted.id;
+        receipt.token.name = minted.name;
+      }
+      save();
+    }
+    token = tokens.get(hosts[0])!;
   }
 
   const confirm = (t: HarnessTarget) => {
@@ -909,6 +1301,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
   // the codex .bak from THIS run — a failed apply restores a working state
   // (the old token is still valid; mint-first means nothing was revoked yet).
   let oldClaudeReg: { url: string; token: string } | null = null;
+  let permissionAddedThisRun = false;
   let claudeReplaced = false;
   let codexRollback: { path: string; backupPath: string | null; replacedPrior: boolean } | null = null;
   let opencodeRollback: {
@@ -929,6 +1322,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
   try {
   for (const t of targets) {
     if (t.host !== 'claude-code') continue;
+    const token = tokens.get(t.host)!;
     try {
       if (t.kind === 'mcp') {
         // [C8] Ownership: an existing registration at a DIFFERENT url is
@@ -993,21 +1387,51 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
         }
         const r = addPermissionsAllowEntry(t.path!, t.entry!);
         for (const note of r.notes) d.logError(note);
-        if (r.added === false) {
+        permissionAddedThisRun = r.added === true;
+        if (r.added === false && t.mechanism === 'added') {
+          confirm(t);
+          d.log(`headless pre-approval: '${t.entry}' already in permissions.allow from the previous harness install.`);
+        } else if (r.added === false) {
           // [X8] Already allowed before us — record it as pre-existing so
           // removal never deletes what we didn't add.
           t.mechanism = 'pre-existing';
           confirm(t);
           d.log(`headless pre-approval: '${t.entry}' was already allowed (pre-existing — remove will leave it).`);
         } else {
+          t.mechanism = 'added';
           confirm(t);
           d.log(`headless pre-approval: '${t.entry}' in permissions.allow (${t.path})`);
         }
+      } else if (t.kind === 'instructions') {
+        // Under the cfgLock already held for this loop — CLAUDE.md lives in
+        // the same config dir the lock serializes. The null-guard replaces a
+        // pair of `!` assertions whose invariant (targets planned ⟺ body
+        // rendered) lived 350 lines away: if a future edit decouples them,
+        // this fails the TARGET, not the whole install loop.
+        if (!t.path || ambientBody === null) {
+          failTarget(t, 'internal: instructions target planned without a rendered block body');
+          continue;
+        }
+        // Same precedent as the permission pre-approval above: the block
+        // orders agents to save through THIS host's gbrain registration —
+        // if that registration didn't land (foreign-url refusal, write
+        // failure), installing the block would direct ambient saves at
+        // whatever server already owns the name, a consent the operator
+        // never gave (codex re-review, this wave).
+        const hostMcp = targets.find((x) => x.host === t.host && x.kind === 'mcp');
+        if (hostMcp && hostMcp.state !== 'confirmed') {
+          failTarget(t, `skipped: the ${t.host} MCP registration itself did not land — an instruction block without it would direct saves at a foreign server`);
+          continue;
+        }
+        installAmbientWritebackBlockAt(t.path, ambientBody);
+        confirm(t);
+        d.log(`ambient-writeback instruction block installed in ${t.path} (mode: ${wb.mode}).`);
       } else {
         const settingsPath = t.scope === 'user' ? d.userSettingsPath : t.path!;
         const env: ClaudeHookEnv = {
-          GBRAIN_SOURCE: flags.source ?? 'default',
+          ...(hookSource !== null ? { GBRAIN_SOURCE: hookSource } : {}),
           GBRAIN_HOOK_LANE: 'harness',
+          GBRAIN_SEAT: flags.seat,
         };
         const bin = flags.gbrainBin ?? d.gbrainBin;
         if (!bin) {
@@ -1021,6 +1445,8 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
           marker: GBRAIN_HARNESS_MARKER_VALUE,
           backupStrategy: 'timestamped',
           refuseOnForeignGbrainMarker: true,
+          identity: harnessHookIdentity(prior, prior?.targets.find((p) => p.kind === 'hooks' && p.path === t.path),
+            { launcher: bin, source: hookSource, seat: flags.seat }),
           ...(t.scope === 'user'
             ? { freshMode: 0o600 }
             : // [D12] a --project dir whose COMMITTED settings carry workspace
@@ -1029,6 +1455,8 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
               { carriedEvents: committedHookEvents(dirname(dirname(t.path!))) }),
         });
         for (const note of r.notes) d.logError(note);
+        t.launcher = bin;
+        t.seat = r.seat;
         confirm(t);
         d.log(
           `hooks wired (${r.installed.length} event(s)${flags.noCapture ? ', capture off' : ''}) in ${r.settingsPath}`,
@@ -1047,6 +1475,51 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
   // gbrain writers with different GBRAIN_HOMEs serialize on ITS directory.
   for (const t of targets) {
     if (t.host !== 'codex') continue;
+    const token = tokens.get(t.host)!;
+    if (t.kind === 'instructions') {
+      try {
+        // [OV-A4] Exclusivity pre-check: when AGENTS.override.md exists,
+        // codex loads IT and IGNORES AGENTS.md — a block written there is a
+        // dead integration and must never be reported as installed.
+        if (existsSync(d.codexAgentsOverride)) {
+          failTarget(
+            t,
+            `codex ignores ${t.path} while ${d.codexAgentsOverride} exists (AGENTS.override.md loads ` +
+              `exclusively, per developers.openai.com/codex/guides/agents-md) — fold the ambient-writeback ` +
+              `block into that file yourself, or remove it and re-run \`gbrain bootstrap harness\`.`,
+          );
+        } else if (!t.path || ambientBody === null) {
+          // Same decoupling guard as the claude lane: fail the TARGET.
+          failTarget(t, 'internal: instructions target planned without a rendered block body');
+        } else if ((() => {
+          // Same registration guard as the claude lane (codex re-review):
+          // the codex MCP target is applied EARLIER in this loop (planned
+          // first), so its state is final here — a foreign-toml refusal or
+          // failed write must not leave a block directing ambient saves at
+          // a server this run never registered.
+          const codexMcp = targets.find((x) => x.host === 'codex' && x.kind === 'mcp');
+          return codexMcp !== undefined && codexMcp.state !== 'confirmed';
+        })()) {
+          failTarget(t, 'skipped: the codex MCP registration itself did not land — an instruction block without it would direct saves at a foreign server');
+        } else {
+          // Same [X11] lock discipline as the managed TOML block: AGENTS.md
+          // is a user-global shared file.
+          const agentsDir = dirname(t.path);
+          mkdirSync(agentsDir, { recursive: true });
+          const agentsLock = await acquireBootstrapLock(agentsDir);
+          try {
+            installAmbientWritebackBlockAt(t.path, ambientBody);
+          } finally {
+            agentsLock.release();
+          }
+          confirm(t);
+          d.log(`ambient-writeback instruction block installed in ${t.path} (mode: ${wb.mode}).`);
+        }
+      } catch (e) {
+        failTarget(t, e instanceof Error ? e.message : String(e));
+      }
+      continue;
+    }
     try {
       // Plugin-lane collision WARN (not a refusal — the harness lane serves
       // framework-spawned sessions over HTTP and may legitimately coexist
@@ -1107,6 +1580,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
   // Same [X11] lock discipline; same forced-wire posture as codex.
   for (const t of targets) {
     if (t.host !== 'opencode') continue;
+    const token = tokens.get(t.host)!;
     try {
       const ocDir = dirname(t.path!);
       mkdirSync(ocDir, { recursive: true });
@@ -1189,6 +1663,11 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
     };
   } else {
     smoke = await d.probeIdentity(url, token);
+    for (const other of new Set(tokens.values())) {
+      if (other === token || (!smoke.ok && smoke.reason !== 'tool_error')) continue;
+      const result = await d.probeIdentity(url, other);
+      if (!result.ok && result.reason !== 'tool_error') smoke = { ...result, message: redactToken(result.message, other) };
+    }
   }
   const smokeOk = smoke.ok || (!smoke.ok && smoke.reason === 'tool_error');
   if (smoke.ok) {
@@ -1300,7 +1779,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
     // registration (red-team CRITICAL): remove the entry we added this run.
     // Pre-existing entries [X8] are never touched.
     const pt = targets.find((t) => t.host === 'claude-code' && t.kind === 'permission');
-    if (pt?.state === 'confirmed' && pt.mechanism !== 'pre-existing') {
+    if (pt?.state === 'confirmed' && permissionAddedThisRun) {
       try {
         removePermissionsAllowEntry(pt.path!, pt.entry!);
         failTarget(pt, 'pre-approval removed after the failed smoke (its registration was rolled back)');
@@ -1308,18 +1787,34 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
         d.logError(`could not remove the pre-approval after rollback: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
+    // Ambient instruction blocks installed THIS run must not outlive their
+    // rolled-back registrations either (codex re-review): a confirmed block
+    // would keep ordering every new session to save through an endpoint that
+    // failed verification — or through a foreign registration a forced
+    // replacement just restored. Strip removes only OUR marker block; the
+    // file itself always stays.
+    for (const it of targets) {
+      if (it.kind !== 'instructions' || it.state !== 'confirmed' || !it.path) continue;
+      try {
+        stripAmbientWritebackBlockAt(it.path);
+        failTarget(it, 'instruction block removed after the failed smoke (its registration was rolled back)');
+      } catch (e) {
+        d.logError(`could not remove the ambient-writeback block from ${it.path} after the failed smoke: ${e instanceof Error ? e.message : String(e)}`);
+        failTarget(it, 'smoke failed and the instruction block could not be removed — run `gbrain bootstrap harness --remove` to converge');
+      }
+    }
     // The fresh mint was sent to an endpoint that failed verification — a
     // possible impostor now holds a live credential. Retire it immediately
     // (we minted it, so the engine is reachable); the receipt keeps the id,
     // and a later revoke of an already-revoked id is a no-op.
-    if (flags.token === undefined && receipt.token.id) {
+    for (const id of new Set(Object.values(receipt.harness_tokens ?? {}).flatMap(t => t.minted && t.id ? [t.id] : []))) {
       try {
-        await d.revokeById(receipt.token.id);
-        d.log(`fresh-minted token revoked (id ${receipt.token.id}) — nothing live leaked to the unverified endpoint.`);
+        await d.revokeById(id);
+        d.log(`fresh-minted token revoked (id ${id}) — nothing live leaked to the unverified endpoint.`);
       } catch (e) {
         d.logError(
           `could not revoke the fresh-minted token (${e instanceof Error ? e.message : String(e)}) — ` +
-            `revoke it manually: gbrain auth revoke with the id flag (${receipt.token.id}).`,
+            `revoke it manually: gbrain auth revoke with the id flag (${id}).`,
         );
       }
     }
@@ -1353,11 +1848,136 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
     }
   }
 
+  // 9b. Converge-on-off [OV-A2/OV2-2]: writeback disabled means a
+  // previously-installed ambient block is a stale contract — strip it from
+  // the receipt-recorded paths AND the candidate paths (an out-of-band or
+  // crashed-receipt install still converges). The FILE always stays in
+  // place, even when left empty of our content. Removing a stale
+  // instruction block never disconnects anything, so this is not gated on
+  // the smoke (unlike step 9's wiring cleanup).
+  if (!wb.enabled) {
+    const candidatePaths = new Set<string>([d.claudeMemoryPath, d.codexAgentsPath]);
+    for (const pt of prior?.targets ?? []) {
+      if (pt.kind === 'instructions' && pt.path) candidatePaths.add(pt.path);
+    }
+    for (const path of candidatePaths) {
+      try {
+        if (!existsSync(path) || !ambientBlockPresent(readFileSync(path, 'utf8'))) continue;
+        const blockDir = dirname(path);
+        const blockLock = await acquireBootstrapLock(blockDir);
+        let r: { removed: boolean };
+        try {
+          r = stripAmbientWritebackBlockAt(path);
+        } finally {
+          blockLock.release();
+        }
+        if (r.removed) {
+          d.log(`ambient-writeback instruction block removed from ${path} (memory.auto_writeback is off — converged).`);
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        d.logError(
+          `could not remove the ambient-writeback block from ${path}: ${msg}`,
+        );
+        // Track the orphan (adversarial review, this wave): a damaged block
+        // that failed to strip would otherwise vanish from the rewritten
+        // receipt while STILL instructing every new session — record a
+        // failed `instructions` target so --status shows it, --remove and
+        // the next converge retry it, and doctor's off-branch probe warns.
+        receipt.targets.push({
+          host: path === d.codexAgentsPath ? 'codex' : 'claude-code',
+          kind: 'instructions',
+          state: 'failed',
+          scope: 'user',
+          path,
+          mechanism: 'managed-block',
+          error: `converge-off: ${msg}`,
+        });
+        save();
+      }
+    }
+    // WP8 audience gate (engine-free lane, so the DECLARED file-plane
+    // audience is the signal — `config set brain.audience` dual-writes it):
+    // a shared-declared brain never gets the enable nudge; undeclared reads
+    // as the single-operator harness default (the consent ask itself only
+    // ever fires on engine-classified personal brains).
+    const declaredAudience = (d.loadFileConfig()?.brain?.audience ?? '').trim().toLowerCase();
+    if (declaredAudience !== 'shared') {
+      d.log('ambient writeback off — enable with `gbrain config set memory.auto_writeback salient` and re-run.');
+    }
+  }
+
   // 10. Rotation completion [C7/X4]: only after all targets confirmed + the
   // token verified. EVERY carried prior id is revoked; failures stay on the
   // receipt for the next converge.
   const allConfirmed = targets.every((t) => t.state === 'confirmed');
-  if (allConfirmed && smokeOk && receipt.token.previous_ids?.length) {
+  let skillsReady = true;
+  const currentSkills = new Set<NonNullable<HarnessReceipt['shared_skills']>[number]>();
+  if (smokeOk && skillsPolicy === 'follow') {
+    for (const host of hosts) {
+      const mcp = targets.find(t => t.host === host && t.kind === 'mcp');
+      if (mcp?.state !== 'confirmed') { skillsReady = false; continue; }
+      const hostToken = tokens.get(host)!;
+      const owned = receipt.harness_tokens![host]!;
+      let entry = flags.token === undefined ? undefined : receipt.shared_skills!.find(candidate => {
+        if (candidate.host !== host || candidate.url !== url || candidate.name !== flags.name || candidate.status.startsWith('left')) return false;
+        try { return readCredentials(join(candidate.root, 'credentials.json')).access_token === hostToken; } catch { return false; }
+      });
+      entry ??= {
+        host, root: join(d.gbrainHome, 'bootstrap', 'shared-skills', host, randomUUID()),
+        name: flags.name, url, ...(owned.id ? { token_id: owned.id } : {}), status: 'pending',
+      };
+      if (!receipt.shared_skills!.includes(entry)) receipt.shared_skills!.push(entry);
+      currentSkills.add(entry);
+      save();
+      if (flags.token !== undefined && hosts.length > 1) {
+        entry.reason = 'independent_credentials_required';
+        skillsReady = false;
+        d.logError('shared skills pending: a supplied token cannot enroll multiple harness identities. Connect each harness with its own explicit grant.');
+        save();
+        continue;
+      }
+      if (registrarMode && new URL(url).protocol !== 'https:') {
+        entry.reason = 'secure_endpoint_required';
+        skillsReady = false;
+        d.logError(`shared skills (${host}): pending; use HTTPS for the remote credential handoff. Existing memory registration is unchanged.`);
+        save();
+        continue;
+      }
+      const credentials: HarnessCredentials = {
+        version: 1, mcp_url: url, issuer_url: url.replace(/\/mcp$/, ''), client_id: owned.id ?? `supplied-${host}`,
+        access_token: hostToken, shared_skills: { follow: true, ...(flags.source ? { source_ids: [flags.source] } : {}) },
+      };
+      try {
+        writeCredentials(join(entry.root, 'credentials.json'), credentials);
+        const result = await d.installSharedSkills(credentials, {
+          harness: host, root: entry.root, name: flags.name, nativeSkillsDir: d.nativeSkillsDir(host),
+        });
+        entry.status = result.status;
+        entry.reason = result.reason ? redactToken(result.reason, hostToken) : undefined;
+        skillsReady = skillsReady && ['restart_required', 'advisory_refresh'].includes(result.status);
+        d.log(redactToken(`shared skills (${host}): ${result.status}; native activation unverified. ${result.next_action ?? 'Keep using memory; verify the follow grant and server support if enrollment is pending.'}`, hostToken));
+      } catch {
+        entry.status = 'pending';
+        entry.reason = 'shared_skills_unavailable';
+        skillsReady = false;
+        d.logError(`shared skills (${host}): pending; memory remains independent. Verify the explicit follow grant and private installation storage, then retry.`);
+      }
+      save();
+    }
+  }
+  const priorEnrollment = (prior?.shared_skills ?? []).some(entry => !entry.status.startsWith('left') &&
+    existsSync(join(entry.root, 'shared-skills', 'receipt.json')));
+  let skillsCleanupComplete = skillsReady || !priorEnrollment;
+  if ((allConfirmed && smokeOk && skillsCleanupComplete) || skillsPolicy === 'memory-only') {
+    for (const entry of receipt.shared_skills ?? []) {
+      if (!currentSkills.has(entry) && !(await leaveHarnessSkills(entry, d))) skillsCleanupComplete = false;
+      save();
+    }
+    receipt.shared_skills = receipt.shared_skills?.filter(entry => entry.status !== 'left');
+    save();
+  }
+  if (allConfirmed && smokeOk && skillsCleanupComplete && receipt.token.previous_ids?.length) {
     const remaining: string[] = [];
     for (const id of receipt.token.previous_ids) {
       try {
@@ -1408,6 +2028,8 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
           token_name: receipt.token.name,
           token_redacted: true,
           targets: receipt.targets,
+          skills_policy: receipt.skills_policy,
+          shared_skills: receipt.shared_skills,
           degraded_per_turn: health.engine === 'postgres',
           smoke_ok: smokeOk,
           receipt_path: harnessReceiptPath(d.gbrainHome),
@@ -1423,7 +2045,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
 // ── Remove [C9/F2/C8] ───────────────────────────────────────────────────────
 
 export async function removeHarness(flags: HarnessFlags, rawDeps: HarnessDeps): Promise<number> {
-  const d = resolveDeps(rawDeps);
+  const d = resolveHarnessDeps(rawDeps);
   const state = readHarnessReceiptState(d.gbrainHome);
   if (state.state === 'absent') {
     d.log('nothing harness-installed on this machine (no harness receipt).');
@@ -1441,8 +2063,14 @@ export async function removeHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
     return 1;
   }
   const receipt = state.receipt;
+  if (flags.dryRun) return previewHarnessRemoval(receipt, { ...d, gbrainBin: flags.gbrainBin ?? d.gbrainBin });
   const save = () => writeHarnessReceipt(d.gbrainHome, receipt);
   let anyFailed = false;
+  let skillsDone = true;
+  for (const entry of receipt.shared_skills ?? []) {
+    if (!(await leaveHarnessSkills(entry, d))) skillsDone = false;
+    save();
+  }
 
   // Phase 1 — host removals (engine-free). Under the SAME config-dir lock the
   // apply loop takes [X11]: a remove racing an apply from another GBRAIN_HOME
@@ -1455,7 +2083,28 @@ export async function removeHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
   try {
   for (const t of receipt.targets) {
     try {
-      if (t.host === 'claude-code' && t.kind === 'mcp') {
+      if (t.kind === 'instructions') {
+        // Ambient-writeback managed block: strip it wherever the receipt
+        // recorded it (any host). Damaged markers throw → the target stays
+        // failed on the receipt for a hand-fix + retry.
+        if (!t.path || !existsSync(t.path)) {
+          d.log(`no ambient-writeback block file at ${t.path ?? '(no path recorded)'} — counted as removed.`);
+        } else {
+          const blockDir = dirname(t.path);
+          const blockLock = resolve(blockDir) === resolve(rmCfgDir) ? null : await acquireBootstrapLock(blockDir);
+          let r: { removed: boolean };
+          try {
+            r = stripAmbientWritebackBlockAt(t.path);
+          } finally {
+            blockLock?.release();
+          }
+          d.log(
+            r.removed
+              ? `ambient-writeback instruction block removed from ${t.path}.`
+              : `no ambient-writeback block in ${t.path} — counted as removed.`,
+          );
+        }
+      } else if (t.host === 'claude-code' && t.kind === 'mcp') {
         // [C8] Only remove what points at OUR url.
         const get = await d.runner(['claude', 'mcp', 'get', t.name ?? 'gbrain']);
         if (get.code !== 0 || !parseClaudeMcpGetUrl(`${get.stdout}\n${get.stderr}`).found) {
@@ -1500,14 +2149,7 @@ export async function removeHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
             : `permissions.allow entry '${t.entry}' already gone — counted as removed.`,
         );
       } else if (t.host === 'claude-code' && t.kind === 'hooks') {
-        const settingsPath = t.scope === 'user' ? (t.path ?? d.userSettingsPath) : t.path!;
-        const r = removeClaudeHooksAt(settingsPath, t.marker ?? GBRAIN_HARNESS_MARKER_VALUE);
-        if (r.notes.some((n) => n.startsWith('WARNING'))) throw new Error(r.notes.join('; '));
-        d.log(
-          r.removed > 0
-            ? `${r.removed} harness hook entr${r.removed === 1 ? 'y' : 'ies'} removed from ${settingsPath}.`
-            : `no harness hook entries in ${settingsPath} — counted as removed.`,
-        );
+        removeHarnessHooksTarget(t, receipt, { ...d, gbrainBin: flags.gbrainBin ?? d.gbrainBin });
       } else if (t.host === 'codex') {
         const codexPath = t.path ?? d.codexConfig;
         const codexDir = dirname(codexPath);
@@ -1588,10 +2230,12 @@ export async function removeHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
   // Phase 2 — revoke EVERY minted id we own [C7/X4]: the current token (when
   // minted) plus any carried previous_ids from unconverged rotations.
   // Deferred under a live PGLite serve [C9].
-  const idsToRevoke = [
+  const skillsPendingIds = new Set((receipt.shared_skills ?? []).filter(e => !e.status.startsWith('left')).map(e => e.token_id));
+  const idsToRevoke = [...new Set([
     ...(receipt.token.minted && receipt.token.id ? [receipt.token.id] : []),
     ...(receipt.token.previous_ids ?? []),
-  ];
+    ...Object.values(receipt.harness_tokens ?? {}).flatMap(t => t.minted && t.id ? [t.id] : []),
+  ])];
   let tokenDone = idsToRevoke.length === 0;
   if (!tokenDone) {
     if (d.pgliteLiveServe()) {
@@ -1603,8 +2247,10 @@ export async function removeHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
     } else {
       const unrevoked: string[] = [];
       for (const id of idsToRevoke) {
+        if (skillsPendingIds.has(id)) { unrevoked.push(id); continue; }
         try {
           await d.revokeById(id);
+          for (const t of Object.values(receipt.harness_tokens ?? {})) if (t.id === id) delete t.id;
           d.log(`harness token revoked (id ${id}).`);
         } catch (e) {
           unrevoked.push(id);
@@ -1628,7 +2274,7 @@ export async function removeHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
     d.log('current token was supplied via --token — not revoked (not ours to revoke).');
   }
 
-  if (remaining.length === 0 && tokenDone) {
+  if (remaining.length === 0 && tokenDone && skillsDone) {
     deleteHarnessReceipt(d.gbrainHome);
     d.log('harness wiring fully removed; receipt consumed.');
     return 0;
@@ -1681,7 +2327,7 @@ export function parseCodexBlockBearer(configText: string, expectedUrl?: string):
 
 /** `bootstrap harness --status [--json]` — one screen of live health. */
 export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): Promise<number> {
-  const d = resolveDeps(rawDeps);
+  const d = resolveHarnessDeps(rawDeps);
   const state = readHarnessReceiptState(d.gbrainHome);
   if (state.state === 'absent') {
     if (flags.json) {
@@ -1706,6 +2352,12 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
   // from the host registration or degrade honestly.
   let token: string | null = null;
   let tokenSource = '';
+  // #4586: the [C8] ownership probe doubles as the LIVE verdict for the
+  // claude-code mcp target. Positive evidence only — a URL that is not ours,
+  // or a non-HTTP transport at OUR (user) scope — flips the displayed state
+  // to 'failed'; not-found / unparseable stays the receipt's honest degrade.
+  // Status is read-only: the receipt itself is never rewritten here.
+  let claudeLiveError: string | null = null;
   const claudeMcp = receipt.targets.find((t) => t.host === 'claude-code' && t.kind === 'mcp');
   if (claudeMcp) {
     try {
@@ -1720,12 +2372,29 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
         if (info.found && info.url === receipt.url) {
           token = parseClaudeMcpGetBearer(out);
           if (token) tokenSource = 'claude registration';
+        } else if (info.found && info.url) {
+          claudeLiveError =
+            `registration now points at ${info.url}, not ${receipt.url} — owned by another install; ` +
+            're-run `gbrain bootstrap harness --force` to reclaim, or --remove';
+        } else if (info.found) {
+          // No URL line: a stdio (or other non-HTTP) launch. Only a same-scope
+          // entry is a replacement; a project-scope one merely shadows ours
+          // from that cwd, which re-running the harness cannot undo.
+          const type = out.match(/^\s*Type:\s*(\S+)/m)?.[1];
+          if (type && type.toLowerCase() !== 'http' && /^\s*Scope:\s*User\b/im.test(out)) {
+            claudeLiveError =
+              `registration at user scope is now a ${type} serve (a \`claude mcp add\` or ` +
+              '`bootstrap hooks --scope user` replaced the HTTP wiring) — re-run `gbrain bootstrap harness` to reclaim';
+          }
         }
       }
     } catch {
       /* degrade */
     }
   }
+  const liveTargets = receipt.targets.map((t) =>
+    t === claudeMcp && claudeLiveError ? { ...t, state: 'failed' as const, error: claudeLiveError } : t,
+  );
   if (!token) {
     const codexMcp = receipt.targets.find((t) => t.host === 'codex' && t.kind === 'mcp');
     if (codexMcp?.path && existsSync(codexMcp.path)) {
@@ -1766,6 +2435,29 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
   } else {
     tokenLine = `token: verify unavailable (no registration to recover the bearer from) — honest degrade, not a failure.`;
   }
+  const harnessTokenStatus: Array<{ host: HarnessTarget['host']; verified: boolean }> = [];
+  if (health.ok && Object.keys(receipt.harness_tokens ?? {}).length > 1) {
+    for (const target of receipt.targets.filter(t => t.kind === 'mcp')) {
+      let bearer: string | null = null;
+      try {
+        if (target.host === 'claude-code') {
+          const result = await d.runner(['claude', 'mcp', 'get', target.name ?? 'gbrain']);
+          const text = `${result.stdout}\n${result.stderr}`;
+          if (result.code === 0 && parseClaudeMcpGetUrl(text).url === receipt.url) bearer = parseClaudeMcpGetBearer(text);
+        } else if (target.host === 'codex' && target.path && codexBlockOwnsName(target.path, target.name ?? 'gbrain')) {
+          bearer = parseCodexBlockBearer(readFileSync(target.path, 'utf8'), receipt.url);
+        } else if (target.host === 'opencode' && target.path) {
+          bearer = parseOpencodeEntryBearer(target.path, target.name ?? 'gbrain', receipt.url);
+        }
+        const result = bearer ? await d.probeIdentity(receipt.url, bearer) : null;
+        harnessTokenStatus.push({ host: target.host, verified: !!result && (result.ok || result.reason === 'tool_error') });
+      } catch { harnessTokenStatus.push({ host: target.host, verified: false }); }
+    }
+    if (harnessTokenStatus.some(status => !status.verified)) {
+      if (tokenVerified !== false) tokenLine = 'token: FAILED — at least one independent harness credential is missing or could not authenticate; re-run to converge.';
+      tokenVerified = false;
+    }
+  }
 
   const skew =
     health.ok && health.version && isServeOlderThanScopes(health.version)
@@ -1773,6 +2465,33 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
       : null;
 
   const degraded = (health.engine ?? receipt.engine) === 'postgres';
+
+  // Ambient-writeback block probes (kind === 'instructions'): live sentinel
+  // presence, plus the [OV-A4] codex exclusivity file — an install shadowed
+  // by AGENTS.override.md must never read as healthy.
+  const instructionsProbes = receipt.targets
+    .filter((t) => t.kind === 'instructions')
+    .map((t) => {
+      let probe: 'installed' | 'missing' | 'override-blocked' | 'unreadable' = 'missing';
+      try {
+        if (t.host === 'codex' && existsSync(d.codexAgentsOverride)) {
+          probe = 'override-blocked';
+        } else if (
+          t.path &&
+          existsSync(t.path) &&
+          // The ONE probe vocabulary (instructions-block.ts) so status,
+          // converge, and doctor classify a damaged-marker file identically.
+          probeAmbientBlock(readFileSync(t.path, 'utf8')).state === 'present'
+        ) {
+          probe = 'installed';
+        }
+      } catch {
+        probe = 'unreadable';
+      }
+      return { host: t.host, path: t.path ?? null, probe };
+    });
+  const instructionsOk = instructionsProbes.every((p) => p.probe === 'installed');
+  const hookCarriers = harnessHookCarrierStatus(receipt, d);
 
   if (flags.json) {
     d.log(
@@ -1787,8 +2506,13 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
           version_skew: skew !== null,
           token_name: receipt.token.name,
           token_verified: tokenVerified,
+          harness_tokens: harnessTokenStatus,
+          skills_policy: receipt.skills_policy ?? 'memory-only',
+          shared_skills: receipt.shared_skills ?? [],
           degraded_per_turn: degraded,
-          targets: receipt.targets,
+          targets: liveTargets,
+          ...(instructionsProbes.length > 0 ? { instructions_blocks: instructionsProbes } : {}),
+          ...(hookCarriers.length > 0 ? { hook_carriers: hookCarriers } : {}),
           pending_previous_tokens: receipt.token.previous_ids ?? [],
           receipt_path: harnessReceiptPath(d.gbrainHome),
         },
@@ -1799,8 +2523,25 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
   } else {
     d.log(serveLine);
     d.log(tokenLine);
-    for (const t of receipt.targets) {
+    for (const entry of receipt.shared_skills ?? []) {
+      const epoch = localEnrollment(entry.root)?.enrollment_epoch;
+      d.log(`  shared skills (${entry.host}): ${entry.status}${entry.reason ? ` — ${entry.reason}` : ''}${epoch === undefined ? '' : `; enrollment epoch ${epoch}`}; receipt evidence only, native activation unverified (stale epoch: ${SKILLS_REFRESH_COMMAND}).`);
+      if (entry.retained_files?.length) d.log(`    edited files retained: ${entry.retained_files.join(', ')}`);
+    }
+    for (const t of liveTargets) {
       d.log(`  ${t.host}/${t.kind} (${t.scope}): ${t.state}${t.error ? ` — ${t.error}` : ''}`);
+    }
+    for (const p of instructionsProbes) {
+      d.log(
+        `  ambient-writeback block (${p.host}): ${p.probe}${p.path ? ` — ${p.path}` : ''}` +
+          (p.probe === 'override-blocked'
+            ? ` (codex ignores AGENTS.md while ${d.codexAgentsOverride} exists — fold the block in there or remove the override and re-run)`
+            : ''),
+      );
+    }
+    for (const c of hookCarriers) {
+      d.log(`  hook entries in ${c.path}: ${c.state === 'ok' ? `${c.ours} gbrain (${c.unmarked} without the _gbrain marker)` : c.state}` +
+        `${c.duplicates.length ? `; duplicated: ${c.duplicates.join(', ')}` : ''}${c.unowned.length ? `; not this install's (left in place): ${c.unowned.join(', ')}` : ''}`);
     }
     if (receipt.token.previous_ids?.length) {
       d.log(`  pending: ${receipt.token.previous_ids.length} previous token(s) await revocation (re-run to converge): ${receipt.token.previous_ids.join(', ')}`);
@@ -1814,20 +2555,24 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
   // crashed apply's pending/failed targets and an unconverged rotation are
   // NOT success just because /health answers (ship-review P2). The
   // token-unrecoverable honest degrade stays 0 per the documented contract.
-  const allTargetsConfirmed = receipt.targets.every((t) => t.state === 'confirmed');
+  const allTargetsConfirmed = liveTargets.every((t) => t.state === 'confirmed');
   const rotationConverged = (receipt.token.previous_ids?.length ?? 0) === 0;
   // Half-removed state (red-team CRITICAL): --remove under a live PGLite
   // serve strips every host target but defers the revoke, leaving a
   // zero-target receipt whose minted token is STILL ACTIVE. Vacuous
   // every() would read that as green forever.
-  const removalPending = receipt.targets.length === 0 && receipt.token.minted && receipt.token.id !== undefined;
+  const removalPending = receipt.targets.length === 0 && ((receipt.token.minted && receipt.token.id !== undefined) ||
+    Object.values(receipt.harness_tokens ?? {}).some(t => t.minted && t.id) ||
+    (receipt.shared_skills ?? []).some(entry => !entry.status.startsWith('left')));
   if (removalPending) {
     d.logError(
-      `removal pending: host wiring is gone but the minted token (id ${receipt.token.id}) is not yet revoked — ` +
+      `removal pending: host wiring is gone but token revocation or shared-skills cleanup is unfinished — ` +
         'stop the serve and re-run `gbrain bootstrap harness --remove`, or revoke it with `gbrain auth revoke` and the id flag.',
     );
   }
-  return health.ok && tokenVerified !== false && allTargetsConfirmed && rotationConverged && !removalPending ? 0 : 1;
+  return health.ok && tokenVerified !== false && allTargetsConfirmed && rotationConverged && !removalPending && instructionsOk
+    ? 0
+    : 1;
 }
 
 // ── Home preflight ──────────────────────────────────────────────────────────
@@ -1857,125 +2602,9 @@ export function codexBlockOwnsName(configPath: string, name: string): boolean {
   }
 }
 
-// ── Plugin-lane detection (codex/claude plugins provide an MCP server) ─────
-//
-// Plugin-provided MCP servers never appear in `codex mcp list` or in
-// `[mcp_servers.*]` — the only cheap CONFIG signal is the plugin-enable
-// entry in the harness's own config. Config is not health (an enabled
-// plugin whose launcher can't find the gbrain binary still matches), so
-// every consumer pairs the detection with an override path
-// (`--mcp-even-if-plugin`) and copy that says "enabled, not necessarily
-// healthy". All three detectors below share the read/normalize posture of
-// codexBlockOwnsName: fail-open (null/false) on any read or parse error.
-
-/**
- * Marketplace-qualified id (`<name>@<marketplace>`) when an ENABLED codex
- * plugin named `name` exists in the codex config, else null. Line-anchored
- * table-header scan — a commented-out lookalike or an inline mention never
- * matches — followed by `enabled = true` before the next table header.
- */
-export function codexPluginProvidesName(configPath: string, name: string): string | null {
-  if (!existsSync(configPath)) return null;
-  try {
-    const lines = readFileSync(configPath, 'utf8').replace(/\r\n/g, '\n').split('\n');
-    const header = new RegExp(`^\\[plugins\\."${name}@([^"]+)"\\]\\s*$`);
-    for (let i = 0; i < lines.length; i++) {
-      const m = lines[i].match(header);
-      if (!m) continue;
-      for (let j = i + 1; j < lines.length; j++) {
-        const line = lines[j].trim();
-        if (line.startsWith('[')) break;
-        if (/^enabled\s*=\s*true\b/.test(line)) return `${name}@${m[1]}`;
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Marketplace-qualified id when an ENABLED Claude Code plugin named `name`
- * exists in `~/.claude/settings.json` (`enabledPlugins`: `"<name>@<mkt>":
- * true` — the shape verified on a live install), else null. User-level file
- * only; project-scope enablement is out of best-effort scope.
- */
-export function claudePluginProvidesName(settingsPath: string, name: string): string | null {
-  if (!existsSync(settingsPath)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(settingsPath, 'utf8')) as {
-      enabledPlugins?: Record<string, unknown>;
-    };
-    const enabled = parsed.enabledPlugins;
-    if (!enabled || typeof enabled !== 'object') return null;
-    const prefix = `${name}@`;
-    for (const [key, value] of Object.entries(enabled)) {
-      if (key.startsWith(prefix) && value === true) return key;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Doctor-side coexistence scan: does ANY registration for `name` exist in
- * the harness config, regardless of owner? Unlike codexBlockOwnsName this
- * deliberately counts foreign/manual entries — a hand-wired
- * `[mcp_servers.<name>]` next to an enabled plugin is exactly the
- * double-registration the doctor advisory reports. Claude side scans BOTH
- * the user config (`~/.claude.json` mcpServers) and, when a project dir is
- * given, the project-scope `.mcp.json`.
- */
-export function codexAnyRegistrationExists(configPath: string, name: string): boolean {
-  if (!existsSync(configPath)) return false;
-  try {
-    const lines = readFileSync(configPath, 'utf8').replace(/\r\n/g, '\n').split('\n');
-    const header = new RegExp(`^\\[mcp_servers\\.(?:${name}|"${name}")\\]\\s*$`);
-    return lines.some(l => header.test(l));
-  } catch {
-    return false;
-  }
-}
-
-export function claudeAnyRegistrationExists(
-  userConfigPath: string,
-  name: string,
-  projectDir?: string,
-): boolean {
-  const hasInMcpServers = (servers: unknown): boolean =>
-    !!servers && typeof servers === 'object' && Object.prototype.hasOwnProperty.call(servers, name);
-  const readJson = (path: string): Record<string, unknown> | null => {
-    if (!existsSync(path)) return null;
-    try {
-      return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
-    } catch {
-      return null;
-    }
-  };
-  const userCfg = readJson(userConfigPath) as {
-    mcpServers?: unknown;
-    projects?: Record<string, { mcpServers?: unknown }>;
-  } | null;
-  if (userCfg) {
-    // User scope: top-level mcpServers.
-    if (hasInMcpServers(userCfg.mcpServers)) return true;
-    // LOCAL scope: `claude mcp add` (README Option 1) defaults here —
-    // projects.<cwd>.mcpServers in ~/.claude.json, keyed by the resolved
-    // project path. Scan the projectDir entry (and, defensively, any entry —
-    // a duplicate under ANY project path is still a real coexistence).
-    const projects = userCfg.projects;
-    if (projects && typeof projects === 'object') {
-      if (projectDir && hasInMcpServers(projects[projectDir]?.mcpServers)) return true;
-      for (const entry of Object.values(projects)) {
-        if (hasInMcpServers(entry?.mcpServers)) return true;
-      }
-    }
-  }
-  // Project-committed .mcp.json.
-  if (projectDir) {
-    const projCfg = readJson(join(projectDir, '.mcp.json')) as { mcpServers?: unknown } | null;
-    if (projCfg && hasInMcpServers(projCfg.mcpServers)) return true;
-  }
-  return false;
-}
+export {
+  claudeAnyRegistrationExists,
+  claudePluginProvidesName,
+  codexAnyRegistrationExists,
+  codexPluginProvidesName,
+} from './plugin-lanes.ts';

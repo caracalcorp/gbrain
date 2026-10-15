@@ -20,7 +20,7 @@ import {
   __hotMemoryCacheForTests,
   HOT_MEMORY_CACHE_MAX_ENTRIES,
 } from '../src/core/facts/meta-hook.ts';
-import type { BrainEngine } from '../src/core/engine.ts';
+import type { BrainEngine, FactRow } from '../src/core/engine.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 
@@ -189,9 +189,19 @@ describe('meta-hook cache', () => {
 });
 
 describe('meta-hook cache hygiene (bounded, expired-entry eviction)', () => {
+  /**
+   * Raw SQL for engine stubs: hot memory reads the withdrawal watermark, the
+   * trust policy generation and each fact's activation verdict (#5575 ENG-11).
+   */
+  const stubRaw = async (sql: string, params?: unknown[]) =>
+    sql.includes('trust_policy_state') ? [{ generation: '0' }]
+      : sql.includes('fact_withdrawals') ? [{ n: 0, at: null }]
+        : sql.includes('AS flagged') ? ((params?.[0] as number[]) ?? []).map(id => ({ id, trust_tier: 'unknown', flagged: false }))
+          : [];
   /** Engine stub with no facts — every call takes the payload:undefined cache path. */
   function emptyEngine(): BrainEngine {
     return {
+      executeRaw: stubRaw,
       listFactsBySession: async () => [],
       listFactsSince: async () => [],
     } as unknown as BrainEngine;
@@ -243,6 +253,64 @@ describe('meta-hook cache hygiene (bounded, expired-entry eviction)', () => {
     const engineB = emptyEngine();
     const b = await getBrainHotMemoryMeta('get_stats', ctx({ engine: engineB }));
     expect(JSON.stringify(b ?? {})).not.toContain('engine-A hot fact');
+  });
+
+  test('cache expiry clamps to the earliest retained valid_until (read-time TTL honesty)', async () => {
+    const factRow = (validUntil: Date): FactRow => ({
+      id: 1,
+      source_id: 'default',
+      entity_slug: 'ttl-clamp',
+      fact: 'ttl-clamp fact',
+      kind: 'fact',
+      visibility: 'world',
+      notability: 'medium',
+      context: null,
+      valid_from: new Date(),
+      valid_until: validUntil,
+      expired_at: null,
+      superseded_by: null,
+      consolidated_at: null,
+      consolidated_into: null,
+      source: 'test',
+      source_session: null,
+      confidence: 0.9,
+      embedding: null,
+      embedded_at: null,
+      created_at: new Date(),
+    });
+    /** Engine stub returning one row; counts listFactsSince queries. */
+    function countingEngine(validUntil: Date): { engine: BrainEngine; calls: () => number } {
+      let n = 0;
+      const engine = {
+        executeRaw: stubRaw,
+        listFactsBySession: async () => [],
+        listFactsSince: async () => { n++; return [factRow(validUntil)]; },
+      } as unknown as BrainEngine;
+      return { engine, calls: () => n };
+    }
+
+    // A fact expiring ~50ms out clamps the entry's expiry to valid_until —
+    // NOT now+ttl — so the payload can't ride the ambient channel for up to
+    // 30s past the row's own expiry.
+    const soon = countingEngine(new Date(Date.now() + 50));
+    await getBrainHotMemoryMeta('get_stats', ctx({ engine: soon.engine }), { ttlMs: 30_000 });
+    expect(soon.calls()).toBe(1);
+    await getBrainHotMemoryMeta('get_stats', ctx({ engine: soon.engine }), { ttlMs: 30_000 });
+    expect(soon.calls()).toBe(1); // inside the clamped window: cache hit
+    await new Promise((r) => setTimeout(r, 80));
+    await getBrainHotMemoryMeta('get_stats', ctx({ engine: soon.engine }), { ttlMs: 30_000 });
+    expect(soon.calls()).toBe(2); // clamp expired the entry at valid_until, not +30s
+
+    // Control: a far-future valid_until (+1h) never tightens the window —
+    // the third call after the same 80ms wait is still a cache hit.
+    const far = countingEngine(new Date(Date.now() + 60 * 60 * 1000));
+    await getBrainHotMemoryMeta('get_stats', ctx({ engine: far.engine }), { ttlMs: 30_000 });
+    expect(far.calls()).toBe(1);
+    await getBrainHotMemoryMeta('get_stats', ctx({ engine: far.engine }), { ttlMs: 30_000 });
+    expect(far.calls()).toBe(1);
+    await new Promise((r) => setTimeout(r, 80));
+    await getBrainHotMemoryMeta('get_stats', ctx({ engine: far.engine }), { ttlMs: 30_000 });
+    expect(far.calls()).toBe(1); // ttl still governs: 80ms << 30s
   });
 
   test('max-entries bound holds under many distinct (caller-controlled) session ids', async () => {

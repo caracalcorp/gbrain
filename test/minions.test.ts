@@ -403,6 +403,17 @@ describe('MinionQueue: #1737 per-handler default timeout', () => {
     expect(job.timeout_ms).toBe(10 * 60 * 1000);
   });
 
+  // #5761 — a brain-wide `extract --stale` pass (the remediation plan submits
+  // it without --timeout-ms) was dead-lettered by the null-default wall-clock.
+  test('extract gets its 30-min default from the handler map (#5761)', async () => {
+    const job = await queue.add('extract', { stale: true });
+    expect(job.timeout_ms).toBe(30 * 60 * 1000);
+    await engine.executeRaw(`UPDATE minion_jobs SET timeout_ms = NULL, timeout_at = NULL WHERE id = $1`, [job.id]);
+    const claimed = await queue.claim('tok-extract', 30_000, 'default', ['extract']);
+    expect(claimed!.id).toBe(job.id);
+    expect(claimed!.timeout_ms).toBe(30 * 60 * 1000);
+  });
+
   test('contextual per-chunk reindex gets the 60-min default', async () => {
     const job = await queue.add('contextual_reindex_per_chunk', { page_slug: 'large-transcript' }, undefined, {
       allowProtectedSubmit: true,
@@ -718,8 +729,9 @@ describe('MinionWorker', () => {
 
 describe('MinionQueue: Lock Management', () => {
   test('lock renewed during execution', async () => {
-    await queue.add('sync', {});
-    const claimed = await queue.claim('tok1', 30000, 'default', ['sync']);
+    // An unmapped name, so the claim takes the worker's 30s lease.
+    await queue.add('noop', {});
+    const claimed = await queue.claim('tok1', 30000, 'default', ['noop']);
     const originalLockUntil = claimed!.lock_until!.getTime();
 
     const renewed = await queue.renewLock(claimed!.id, 'tok1', 60000);
@@ -1015,8 +1027,8 @@ describe('MinionQueue: Inbox', () => {
     const parent = await queue.add('orchestrate', {});
     // Create child directly with waiting status so it's claimable
     const childRows = await engine.executeRaw<Record<string, unknown>>(
-      `INSERT INTO minion_jobs (name, queue, status, data, parent_job_id)
-       VALUES ('research', 'default', 'waiting', '{}', $1) RETURNING *`,
+      `INSERT INTO minion_jobs (name, queue, status, data, parent_job_id, submission_authority)
+       VALUES ('research', 'default', 'waiting', '{}', $1, '{"version":1,"kind":"application"}'::jsonb) RETURNING *`,
       [parent.id]
     );
     const childId = childRows[0].id as number;
@@ -1783,7 +1795,7 @@ describe('MinionQueue: Idempotency', () => {
       idempotency_key: 'dream:synth:test:active',
     });
     await engine.executeRaw(
-      `UPDATE minion_jobs SET status = 'active' WHERE id = $1`,
+      `UPDATE minion_jobs SET status = 'active', claim_generation = claim_generation + 1 WHERE id = $1`,
       [j1.id]
     );
     const j2 = await queue.add('sync', {}, {
@@ -2067,7 +2079,7 @@ describe('MinionQueue: v0.19.1 handleWallClockTimeouts (Layer 3 kill shot)', () 
     const job = await queue.add('noop', {}, { timeout_ms: 100 });
     await engine.executeRaw(
       `UPDATE minion_jobs
-         SET status='active',
+         SET status='active', claim_generation = claim_generation + 1,
              lock_token='wc-test',
              lock_until=now() - interval '1 second',
              started_at=now() - interval '1 second',
@@ -2089,7 +2101,7 @@ describe('MinionQueue: v0.19.1 handleWallClockTimeouts (Layer 3 kill shot)', () 
     // Force timeout_ms / timeout_at NULL on-disk (columns might or might not be set by add).
     await engine.executeRaw(
       `UPDATE minion_jobs
-         SET status='active',
+         SET status='active', claim_generation = claim_generation + 1,
              timeout_ms=NULL,
              timeout_at=NULL,
              lock_token='wc-null',
@@ -2111,7 +2123,7 @@ describe('MinionQueue: v0.19.1 handleWallClockTimeouts (Layer 3 kill shot)', () 
     const job = await queue.add('noop', {}, { timeout_ms: 100_000 });
     await engine.executeRaw(
       `UPDATE minion_jobs
-         SET status='active',
+         SET status='active', claim_generation = claim_generation + 1,
              lock_token='wc-inside',
              lock_until=now() + interval '30 seconds',
              started_at=now() - interval '10 seconds',
@@ -2235,7 +2247,7 @@ describe('MinionQueue: v0.19.1 maxWaiting — cap correctness + race (D2/H2)', (
 describe('MinionQueue: maxPending — single-flight (waiting + live-lock active)', () => {
   async function forceActive(id: number, lockUntilSql: string): Promise<void> {
     await engine.executeRaw(
-      `UPDATE minion_jobs SET status = 'active', lock_token = 'tok-mp',
+      `UPDATE minion_jobs SET status = 'active', claim_generation = claim_generation + 1, lock_token = 'tok-mp',
               lock_until = ${lockUntilSql}, started_at = now() - interval '5 minutes'
         WHERE id = $1`,
       [id],
@@ -2459,7 +2471,7 @@ describe('MinionQueue: v0.19.1 wall-clock + handleTimeouts non-interference (T1)
     const job = await queue.add('noop', {}, { timeout_ms: 100_000 });
     await engine.executeRaw(
       `UPDATE minion_jobs
-         SET status='active',
+         SET status='active', claim_generation = claim_generation + 1,
              lock_token='t1',
              lock_until=now() + interval '30 seconds',
              started_at=now() - interval '2 seconds',
@@ -3418,6 +3430,19 @@ describe('MinionQueue: per-job lock lease (#4145)', () => {
     // lock_until derives from the 300s lease, NOT the worker's 30s default.
     expect(horizon).toBeGreaterThan(250_000);
     expect(horizon).toBeLessThan(360_000);
+  });
+
+  test('a sync job gets the 5-minute default lease while an unmapped job claimed the same way keeps 30s', async () => {
+    await queue.add('sync', { sourceId: 'default' });
+    await queue.add('lease-control', {});
+    const syncJob = await queue.claim('tok-sync', 30_000, 'default', ['sync']);
+    const control = await queue.claim('tok-control', 30_000, 'default', ['lease-control']);
+    expect(syncJob!.lock_duration_ms).toBe(5 * 60_000);
+    expect(control!.lock_duration_ms).toBeNull();
+    const syncHorizon = syncJob!.lock_until!.getTime() - syncJob!.started_at!.getTime();
+    const controlHorizon = control!.lock_until!.getTime() - control!.started_at!.getTime();
+    expect(syncHorizon).toBeGreaterThan(4 * 60_000);
+    expect(controlHorizon).toBeLessThan(60_000);
   });
 
   test('an unmapped handler keeps NULL lease → worker default horizon (legacy behavior)', async () => {

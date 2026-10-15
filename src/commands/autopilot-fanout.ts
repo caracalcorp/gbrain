@@ -10,16 +10,21 @@
  *   - P0-5: each per-source cycle writes `last_full_cycle_at` in its
  *     `sources.config` JSONB on success (handled in `runCycle` exit hook,
  *     not here — this module just READS it for freshness gating).
- *   - P1-2: explicitly threads `pull: !!source.config.remote_url` so
- *     local-only sources don't try to git-pull.
+ *   - P1-2: automatic pull needs a remote and an unmanaged source
+ *     (`automaticSyncPull`), so local-only and managed sources never git-pull.
  *   - P1-3: PGLite engines default `fanoutMax=1` (PGLite is single-writer;
  *     parallel fan-out would queue uselessly behind the file lock).
- *   - P1-4: enumeration filters `local_path IS NOT NULL` so pure-DB
+ *   - P1-4: enumeration keeps sources with a `local_path`, so pure-DB
  *     sources don't get dispatched (handler would fall back to global
- *     sync.repo_path, which is wrong for them).
+ *     sync.repo_path, which is wrong for them). Connector sources (#5673)
+ *     are enumerated whatever their `local_path` once they have a recorded
+ *     sync attempt; their cycles run only CONNECTOR_SOURCE_PHASES with no
+ *     brain directory, because the freshness loop owns their sync.
  *   - P1-5: archive recheck happens in the handler (jobs.ts:1146), not
  *     here, so a source archived between fan-out and worker claim still
  *     skips cleanly.
+ *   - Missing checkout paths are skipped at dispatch time; sources.local_path
+ *     is machine-specific shared state and can legitimately point elsewhere.
  *
  * Phase-scope caveat (codex r1 P0-1): per-source cycle LOCKS let two cycles
  * RUN concurrently, but several phases (embed, orphans, purge,
@@ -30,10 +35,17 @@
  * row layer; cost duplication is the visible tradeoff).
  */
 
+import { existsSync } from 'fs';
 import type { BrainEngine, SourceRow } from '../core/engine.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
 import { SOURCE_FRESHNESS_PHASES, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
-import { sourceConfigHasRemoteUrl } from '../core/sources-load.ts';
+import { CONNECTOR_SOURCE_PHASES } from '../core/cycle/phase-scope.ts';
+import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
+import { attemptedConnectorSourceIds } from '../core/persistence/connector-state.ts';
+import { parseSourceConfig, sourceLocalPathSkipWarning } from '../core/sources-load.ts';
+import { automaticSyncPull } from '../core/persistence/automatic-sync-policy.ts';
+import { isSyncDisabledConfig } from '../core/sync-policy.ts';
+import { loadActivationPendingSourceIds, skipActivationPendingSync } from '../core/sync-policy.ts';
 import { AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES } from './autopilot-remediation-policy.ts';
 
 // #2194 fix #2: failure cooldown. A source whose autopilot-cycle keeps
@@ -66,6 +78,16 @@ export interface FanoutOpts {
   emit?: (line: string) => void;
   /** Sink for non-JSON human log lines; defaults to console.log. */
   log?: (line: string) => void;
+  /** Test seam for source checkout availability. */
+  pathExists?: (path: string) => boolean;
+}
+
+/** True only for "the sources table does not exist" (pre-v0.18 brains). */
+export function isMissingSourcesTable(e: unknown): boolean {
+  const code = (e as { code?: unknown } | null)?.code;
+  if (code === '42P01') return true;                       // Postgres undefined_table
+  const message = e instanceof Error ? e.message : String(e);
+  return /relation "?sources"? does not exist|no such table:? sources|sources table missing/i.test(message);
 }
 
 export interface FanoutResult {
@@ -82,11 +104,15 @@ export interface FanoutResult {
   skipped_cap: string[];
   /** Source ids skipped because they're in failure cooldown (#2194 fix #2). */
   skipped_cooldown: string[];
+  /** Source ids skipped because local_path is unavailable from this machine. */
+  skipped_unavailable_path: string[];
   /** True when this tick fell back to the legacy single-job path
    *  (no sources rows / engine empty). */
   legacy_fallback: boolean;
   /** True when every enumerated source is inside the freshness window. */
   all_sources_fresh: boolean;
+  /** True when every enumerated source is either fresh or skipped locally. */
+  all_sources_handled: boolean;
 }
 
 /**
@@ -341,11 +367,27 @@ export function selectSourcesForDispatch(
   floorMin = AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES,
   recentFailures: Map<string, SourceFailure> = new Map(),
   cooldownOpts: CooldownOpts = { baseMin: FAILURE_COOLDOWN_BASE_MIN, capMin: FAILURE_COOLDOWN_CAP_MIN },
-): { dispatch: SourceRow[]; skippedFresh: SourceRow[]; skippedCap: SourceRow[]; skippedCooldown: SourceRow[] } {
+  pathExists: (path: string) => boolean = () => true,
+  connectorIds: ReadonlySet<string> = new Set(),
+): {
+  dispatch: SourceRow[];
+  skippedFresh: SourceRow[];
+  skippedCap: SourceRow[];
+  skippedCooldown: SourceRow[];
+  /** Each row carries the warning that excluded it, so the caller logs it
+   *  directly instead of recomputing (a second existsSync per row). */
+  skippedUnavailablePath: Array<SourceRow & { skip_warning: string }>;
+} {
   const stale: SourceRow[] = [];
   const fresh: SourceRow[] = [];
   const cooldown: SourceRow[] = [];
+  const unavailablePath: Array<SourceRow & { skip_warning: string }> = [];
   for (const s of sources) {
+    const skipWarning = s.local_path && !connectorIds.has(s.id) ? sourceLocalPathSkipWarning(s.id, s.local_path, pathExists, s.config) : null;
+    if (skipWarning) {
+      unavailablePath.push({ ...s, skip_warning: skipWarning });
+      continue;
+    }
     if (!isSourceStale(s, now, floorMin)) { fresh.push(s); continue; }
     // #2194 fix #2: a stale source that recently failed is held in cooldown so
     // it can't re-dispatch every tick (the storm). Success clears it.
@@ -364,7 +406,7 @@ export function selectSourcesForDispatch(
   });
   const dispatch = stale.slice(0, fanoutMax);
   const skippedCap = stale.slice(fanoutMax);
-  return { dispatch, skippedFresh: fresh, skippedCap, skippedCooldown: cooldown };
+  return { dispatch, skippedFresh: fresh, skippedCap, skippedCooldown: cooldown, skippedUnavailablePath: unavailablePath };
 }
 
 /**
@@ -385,16 +427,59 @@ export async function dispatchPerSource(
   const log = opts.log ?? ((line) => console.log(line));
 
   let sources: SourceRow[];
+  let connectorIds = new Set<string>();
+  let idleConnectors = 0;
   try {
     sources = await engine.listAllSources({ localPathOnly: true });
+    // The DX O1 dispatch gate is read whether or not any checkout source
+    // exists, so a connector whose path was cleared is never folded into the
+    // legacy cycle (#5673). An unreadable gate fails closed for connectors.
+    const { connectorAwaitingFirstSync } = await import('./autopilot-dispatch.ts');
+    const attempted = await attemptedConnectorSourceIds(engine).catch(() => null);
+    connectorIds = new Set(attempted ?? []);
+    const checkouts = new Set(sources.filter(s => !isConnectorSourceKind(parseSourceConfig(s.config).kind)).map(s => s.id));
+    idleConnectors = sources.filter(s => connectorAwaitingFirstSync(s, attempted, opts.jsonMode === true, emit)).length;
+    const all = connectorIds.size ? await engine.listAllSources() : sources;
+    sources = all.filter(s => connectorIds.has(s.id) || checkouts.has(s.id));
   } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
     // Brand-new brain without sources table (pre-v0.18) — fall through
-    // to the legacy single-job path. The error path here also covers
-    // a misconfigured engine, but legacy fallback is safer than failing.
+    // to the legacy single-job path.
+    //
+    // Any OTHER error (connection timeout, pooler CONNECTION_CLOSED, …) is
+    // transient and says nothing about the brain's shape. Falling back then
+    // dispatched a legacy cycle against repoPath on a multi-source brain,
+    // which full-imported the repo root into the 'default' source and
+    // duplicated every page under a new slug prefix. Skip this tick instead;
+    // the next tick retries once the database is reachable.
+    if (!isMissingSourcesTable(e)) {
+      if (opts.jsonMode) {
+        emit(JSON.stringify({ event: 'fanout_skipped', reason: 'sources_unavailable', error: message }));
+      } else {
+        log(`[dispatch] skipped tick: could not list sources (${message}); retrying next tick`);
+      }
+      return {
+        dispatched: [],
+        coalesced: [],
+        skipped_fresh: [],
+        skipped_cap: [],
+        skipped_cooldown: [],
+        skipped_unavailable_path: [],
+        legacy_fallback: false,
+        all_sources_fresh: false,
+        all_sources_handled: false,
+      };
+    }
     if (opts.jsonMode) {
-      emit(JSON.stringify({ event: 'fanout_unavailable', error: e instanceof Error ? e.message : String(e) }));
+      emit(JSON.stringify({ event: 'fanout_unavailable', error: message }));
     }
     sources = [];
+  }
+  // Sources exist but every one is a connector awaiting its first sync: stay
+  // idle rather than falling back to the legacy cycle on the global repo path.
+  if (sources.length === 0 && idleConnectors > 0) {
+    return { dispatched: [], coalesced: [], skipped_fresh: [], skipped_cap: [], skipped_cooldown: [], skipped_unavailable_path: [],
+      legacy_fallback: false, all_sources_fresh: false, all_sources_handled: false };
   }
 
   if (sources.length === 0) {
@@ -434,8 +519,10 @@ export async function dispatchPerSource(
       skipped_fresh: [],
       skipped_cap: [],
       skipped_cooldown: [],
+      skipped_unavailable_path: [],
       legacy_fallback: true,
       all_sources_fresh: false,
+      all_sources_handled: false,
     };
   }
 
@@ -455,7 +542,8 @@ export async function dispatchPerSource(
     cooldownOpts = { baseMin: 0, capMin: FAILURE_COOLDOWN_CAP_MIN };
   }
 
-  const { dispatch, skippedFresh, skippedCap, skippedCooldown } =
+  const pathExists = opts.pathExists ?? existsSync;
+  const { dispatch, skippedFresh, skippedCap, skippedCooldown, skippedUnavailablePath } =
     selectSourcesForDispatch(
       sources,
       opts.fanoutMax,
@@ -463,23 +551,47 @@ export async function dispatchPerSource(
       AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES,
       recentFailures,
       cooldownOpts,
+      pathExists,
+      connectorIds,
     );
+
+  for (const src of skippedUnavailablePath) {
+    if (opts.jsonMode) {
+      emit(JSON.stringify({ event: 'fanout_source_path_skipped', source_id: src.id, reason: src.skip_warning }));
+    } else {
+      log(src.skip_warning);
+    }
+  }
+
+  // #5198: claimed-but-not-activated sources refuse sync until activation.
+  const activationPending = await loadActivationPendingSourceIds(engine);
 
   const dispatched: string[] = [];
   const coalesced: string[] = [];
   for (const src of dispatch) {
     try {
-      const shouldPull = sourceConfigHasRemoteUrl(src.config);
+      // #4399: config.syncEnabled=false excludes the source from automatic
+      // sync. It still gets its lint/backlinks/extract cycle and freshness
+      // stamp; only the sync phase (and the pull that feeds it) is dropped —
+      // normalizeQueuedSourcePhases passes a freshness subset through as-is.
+      // #5198: a claimed source awaiting activation is treated the same way,
+      // so its cycle does not fail on a sync that is refused by contract.
+      const pendingActivation = skipActivationPendingSync(
+        activationPending, src.id, 'fanout_sync_skipped', opts.jsonMode === true, opts.jsonMode ? emit : log,
+      );
+      const syncDisabled = isSyncDisabledConfig(src.config) || pendingActivation;
+      const connector = connectorIds.has(src.id);
+      const shouldPull = !syncDisabled && !connector && await automaticSyncPull(engine, src);
       const job = await queue.add(
         'autopilot-cycle',
         {
-          repoPath: opts.repoPath,
+          repoPath: connector ? null : opts.repoPath,
           source_id: src.id,
           pull: shouldPull,
           // Freshness is stamped by bounded deterministic work only. LLM-backed
           // source enrichment (atoms, takes, thin-page development, etc.) is
           // explicit/background work and cannot hold source freshness hostage.
-          phases: SOURCE_FRESHNESS_PHASES,
+          phases: connector ? CONNECTOR_SOURCE_PHASES : syncDisabled ? SOURCE_FRESHNESS_PHASES.filter((p) => p !== 'sync') : SOURCE_FRESHNESS_PHASES,
         },
         {
           queue: 'default',
@@ -563,8 +675,10 @@ export async function dispatchPerSource(
     skipped_fresh: skippedFresh.map(s => s.id),
     skipped_cap: skippedCap.map(s => s.id),
     skipped_cooldown: skippedCooldown.map(s => s.id),
+    skipped_unavailable_path: skippedUnavailablePath.map(s => s.id),
     legacy_fallback: false,
     all_sources_fresh: skippedFresh.length === sources.length,
+    all_sources_handled: skippedFresh.length + skippedUnavailablePath.length === sources.length,
   };
 }
 
@@ -576,6 +690,21 @@ export function isGlobalMaintenanceStale(lastGlobalAtIso: string | null, now = D
   const d = new Date(lastGlobalAtIso);
   if (!Number.isFinite(d.getTime())) return true;
   return (now - d.getTime()) / 60_000 >= floorMin;
+}
+
+/**
+ * #4578: the global maintenance job deadline. Precedence:
+ * GBRAIN_GLOBAL_MAINTENANCE_TIMEOUT_MS > config autopilot.global_maintenance_timeout_ms
+ * > the autopilot full-cycle default. Values below one minute are ignored.
+ */
+export async function resolveGlobalMaintenanceTimeoutMs(engine: BrainEngine, fallbackMs: number): Promise<number> {
+  const parse = (raw: string | null | undefined) => {
+    const n = raw ? Number(raw) : NaN;
+    return Number.isSafeInteger(n) && n >= 60_000 ? n : null;
+  };
+  return parse(process.env.GBRAIN_GLOBAL_MAINTENANCE_TIMEOUT_MS)
+    ?? parse(await engine.getConfig('autopilot.global_maintenance_timeout_ms'))
+    ?? fallbackMs;
 }
 
 /**
@@ -608,6 +737,7 @@ export async function dispatchGlobalMaintenance(
     return { dispatched: false, reason: 'fresh' };
   }
 
+  const timeoutMs = await resolveGlobalMaintenanceTimeoutMs(engine, opts.timeoutMs);
   const job = await queue.add(
     'autopilot-global-maintenance',
     { repoPath: opts.repoPath, phases: MAINTENANCE_PHASES },
@@ -618,7 +748,7 @@ export async function dispatchGlobalMaintenance(
       // brain-wide pass is still in flight — so duplicates never stack.
       idempotency_key: `autopilot-global:${opts.slot}`,
       max_attempts: 2,
-      timeout_ms: opts.timeoutMs,
+      timeout_ms: timeoutMs,
       maxPending: 1,
     },
   );
@@ -663,7 +793,7 @@ export async function maybeDispatchConnectorSyncs(
   const {
     autoSyncKey,
     authErrorAtKey,
-    lastSyncAtKey,
+    readConnectorState,
     syncFloorMinKey,
     sourceIdKey,
     isTruthy,
@@ -689,7 +819,7 @@ export async function maybeDispatchConnectorSyncs(
     const authErrorAt = await engine.getConfig(authErrorAtKey(provider));
     if (authErrorAt && cred.savedAt && authErrorAt > cred.savedAt) continue;
 
-    const lastSyncAt = await engine.getConfig(lastSyncAtKey(provider));
+    const lastSyncAt = await readConnectorState(engine, provider, sourceId, 'last_sync_at');
     if (!isConnectorSyncStale(lastSyncAt, nowMs, floorMin)) continue;
 
     const job = await queue.add(

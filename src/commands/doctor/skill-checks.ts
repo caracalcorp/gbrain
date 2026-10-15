@@ -29,6 +29,7 @@ import {
   appendAuditEventsForTransitions,
 } from '../../core/audit-skill-brain-first.ts';
 import type { Check } from '../doctor.ts';
+import { checkError, infoCheck } from './check-fix.ts';
 
 /** Quick skill conformance check — frontmatter + required sections */
 export function skillConformanceCheck(skillsDir: string): Check {
@@ -66,7 +67,7 @@ export function skillConformanceCheck(skillsDir: string): Check {
       message: `${passing}/${skills.length} pass. Failing: ${failing.join(', ')}`,
     };
   } catch {
-    return { name: 'skill_conformance', status: 'warn', message: 'Could not load or derive skills manifest' };
+    return checkError('skill_conformance', 'load or derive skills manifest');
   }
 }
 
@@ -239,8 +240,29 @@ export async function skillPreconditionsCheck(
       } catch { return 0; }
     },
     async listSourceIds() {
+      // #4278: `source:<id>`'s contract is EXISTENCE — a registered-but-not-
+      // yet-synced source is met. Includes 'default' (it always exists).
       try {
-        const rows = await engine.executeRaw<{ id: string }>(`SELECT id FROM sources WHERE id <> 'default'`);
+        const rows = await engine.executeRaw<{ id: string }>(`SELECT id FROM sources ORDER BY id`);
+        return rows.map(r => r.id);
+      } catch { return []; }
+    },
+    async listPopulatedSourceIds() {
+      // #4278: bare `source` means "a corpus exists" — any source (including
+      // 'default', where single-source brains hold everything) with >=1 live
+      // page. Pre-fix this required a non-default source, so a healthy
+      // default-only brain failed `requires: source` forever.
+      try {
+        const rows = await engine.executeRaw<{ id: string }>(
+          `SELECT s.id
+             FROM sources s
+            WHERE EXISTS (
+              SELECT 1 FROM pages p
+               WHERE p.source_id = s.id
+                 AND p.deleted_at IS NULL
+            )
+            ORDER BY s.id`,
+        );
         return rows.map(r => r.id);
       } catch { return []; }
     },
@@ -261,18 +283,34 @@ export async function skillPreconditionsCheck(
   };
 
   const unmet: string[] = [];
+  let waitsForContent = true;
   for (const skill of installed) {
     const results = await checkPreconditions(skill.requires, ctx);
     for (const r of results) {
-      if (!r.met) unmet.push(`${skill.slug}: ${r.req.raw} — ${r.hint}`);
+      if (r.met) continue;
+      unmet.push(`${skill.slug}: ${r.req.raw} — ${r.hint}`);
+      if (!(r.req.kind === 'dir' || r.req.kind === 'pages' || (r.req.kind === 'source' && !r.req.arg))) waitsForContent = false;
     }
   }
   if (unmet.length === 0) {
     return { name, status: 'ok', message: `${installed.length} skill(s) with preconditions, all met` };
   }
+  if (await ctx.countPages() === 0) {
+    return infoCheck(name,
+      `${unmet.length} skill precondition(s) wait for content: the brain has no pages yet, so skills that need a corpus stay idle until the first import or sync.`,
+      'not_applicable', undefined, { unmet: unmet.slice(0, 8) });
+  }
+  // A skill whose corpus (a page directory, a page count) does not exist yet is idle, not broken:
+  // nothing to fix until the user brings that content, so this is information (E2 keyless/day-zero honesty).
+  if (waitsForContent) {
+    return infoCheck(name,
+      `${unmet.length} skill precondition(s) wait for content this brain does not hold yet; those skills stay idle until it is imported:\n  ${unmet.slice(0, 8).join('\n  ')}`,
+      'not_applicable', undefined, { unmet });
+  }
   return {
     name,
     status: 'warn',
+    fix_unavailable_reason: 'operator_judgement',
     message:
       `${unmet.length} unmet skill precondition(s):\n  ` +
       unmet.slice(0, 8).join('\n  ') +

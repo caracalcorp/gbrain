@@ -6,25 +6,25 @@
  * '../operations.ts' here (cycle).
  */
 
+import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
+import { stampPageTrust } from '../eligibility/stamp.ts';
 import type { Operation } from './contract.ts';
-import { federatedSearchScope, parseSourceIdParam, sourceScopeOpts } from './context.ts';
-import {
-  findPrivateOnlySlugs,
-  resolveExcludePrivatePages,
-  slugHiddenFromCaller,
-} from '../search/private-visibility.ts';
+import { readPolicyOpts } from './context.ts';
+import { federatedSearchScope, parseSourceIdParam } from './context.ts';
 
 // --- Resolution & Chunks ---
 
 const resolve_slugs: Operation = {
   name: 'resolve_slugs',
-  description: 'Fuzzy-resolve a partial slug to matching page slugs',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description: 'Fuzzy-match a partial slug or title to page slugs. Use when a slug is uncertain. Needs read scope.',
   params: {
-    partial: { type: 'string', required: true, description: "Partial slug or title text to match, e.g. 'alice-ex' or 'meeting notes'. This is the search text param — there is no `text` param." },
+    partial: { type: 'string', required: true, description: "Partial slug or title, e.g. 'alice-ex'." },
     source_id: {
       type: 'string',
-      description:
-        "Scope resolution to a single source. Defaults to OperationContext.sourceId; when unset, an unqualified resolve spans every federated source (matching search/get_page). Pass '__all__' to span every source for trusted local callers; for remote callers '__all__' spans only your granted sources.",
+      description: "One source, or '__all__'.",
     },
   },
   handler: async (ctx, p) => {
@@ -35,34 +35,33 @@ const resolve_slugs: Operation = {
     // per-call source_id narrows through resolveRequestedScope.
     const sourceIdParam = parseSourceIdParam(p.source_id, 'resolve_slugs', { allowAll: true });
     const scope = federatedSearchScope(ctx, sourceIdParam);
-    const candidates = await ctx.engine.resolveSlugs(p.partial as string, scope);
-    // #4352 remediation: fuzzy resolution must not enumerate private slugs to
-    // an untrusted caller — same gate as get_page's candidate filter (trusted
-    // local + the operator opt-outs resolve to false and skip the probe).
-    if (candidates.length === 0 || !(await resolveExcludePrivatePages(ctx.engine, ctx.remote))) {
-      return candidates;
-    }
-    const hidden = await findPrivateOnlySlugs(ctx.engine, candidates, scope);
-    return candidates.filter(c => !hidden.has(c));
+    return ctx.engine.resolveSlugs(p.partial as string, await readPolicyOpts(ctx, scope));
   },
   scope: 'read',
 };
 
 const get_chunks: Operation = {
   name: 'get_chunks',
-  description: 'Get content chunks for a page',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: { exempt: 'explicit chunk read by slug, the page-read twin of get_page (CEO-17 raw-read exception)' },
+  description: 'Return a page\'s indexed content chunks (the units search ranks). Use when debugging why search did or did not match a page. Needs read scope. On page_not_found: resolve the slug with resolve_slugs.',
   params: {
     slug: { type: 'string', required: true, description: 'Slug of the page whose content chunks to return.' },
+    min_trust: MIN_TRUST_PARAM,
   },
   handler: async (ctx, p) => {
     // #2555: route through the canonical scope ladder (federated array >
     // scalar floor > nothing) instead of the pre-#2200 scalar-only pattern —
     // a federated grant could read the page via get_page but got [] here.
-    const scope = sourceScopeOpts(ctx);
+    const scope = await readPolicyOpts(ctx);
     // #4352 remediation: a `visibility: private` page's chunks read exactly
     // like a missing page's ([]) for untrusted callers — no existence oracle.
-    if (await slugHiddenFromCaller(ctx.engine, ctx.remote, p.slug as string, scope)) return [];
-    return ctx.engine.getChunks(p.slug as string, scope);
+    const chunks = await ctx.engine.getChunks(p.slug as string, scope);
+    // #5575: a chunk's tier is its page's (lowered by a fence trust marker); rows below the floor read as missing.
+    const { floor } = await resolveReadEligibility(ctx, { minTrust: p.min_trust });
+    return (await stampPageTrust(ctx.engine, chunks.map(c => ({ ...c, slug: p.slug as string })), floor))
+      .map(({ slug: _slug, ...chunk }) => chunk);
   },
   scope: 'read',
 };

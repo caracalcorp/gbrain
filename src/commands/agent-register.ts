@@ -1,3 +1,4 @@
+import { HARNESS_ADAPTERS } from '../core/harness/registry.ts';
 /**
  * gbrain agent register — mint a scoped OAuth client + access token and print
  * the exact MCP wiring for a harness (cathedral-6, spec PR-6 "shared brain").
@@ -62,7 +63,7 @@ import {
 
 // ── constants ─────────────────────────────────────────────────────────────
 
-export const REGISTER_HARNESSES = ['claude-code', 'codex', 'opencode', 'openclaw'] as const;
+export const REGISTER_HARNESSES = HARNESS_ADAPTERS.filter(a => a.legacyRegister).map(a => a.id) as readonly ['claude-code', 'codex', 'opencode', 'openclaw'][number][];
 export type RegisterHarness = (typeof REGISTER_HARNESSES)[number];
 export const REGISTER_PRESETS = ['daily-driver', 'coding-agent'] as const;
 export type RegisterPreset = (typeof REGISTER_PRESETS)[number];
@@ -292,8 +293,8 @@ export function resolvePreset(flags: AgentRegisterArgs): ResolvedPreset {
         scopes: explicit(flags.scopes, 'read write'),
         writeSource: explicit(flags.source, 'default'),
         federatedRead: flags.federatedRead ?? 'snapshot',
-        // starter is literally "the ~20-op daily-driver set" (mcp/surface.ts).
-        surface: explicit(flags.surface, 'starter'),
+        // S0/D4: no narrowing on any install path; pass --surface starter for a capped harness.
+        surface: explicit(flags.surface, 'full'),
         workspaceDerived: false,
       };
     case 'coding-agent': {
@@ -317,10 +318,10 @@ export function resolvePreset(flags: AgentRegisterArgs): ResolvedPreset {
         scopes: explicit(flags.scopes, 'read write'),
         writeSource,
         federatedRead: [writeSource, ...flags.federatedRead.filter(s => s !== writeSource)],
-        // starter, not full: `full` exposes brain-wide unscoped code-intel
-        // reads to a scoped client. Widen per client via
-        // `gbrain auth rescope-client --surface full`.
-        surface: explicit(flags.surface, 'starter'),
+        // S0/D4: full like every other install path. Code-intel reads are
+        // source-scoped for remote callers (readPolicyOpts / routeCodeIntelScope),
+        // so full no longer reaches past the client's grant.
+        surface: explicit(flags.surface, 'full'),
         workspaceDerived,
       };
     }
@@ -660,7 +661,10 @@ async function mintAndProbe(
 ): Promise<RegisterOutput> {
   const { GBrainOAuthProvider } = await import('../core/oauth-provider.ts');
   // The tx-scoped sql is dead after COMMIT — the exchange runs on the OUTER engine.
-  const provider = new GBrainOAuthProvider({ sql: sqlQueryForEngine(engine) });
+  const provider = new GBrainOAuthProvider({
+    sql: sqlQueryForEngine(engine),
+    transaction: fn => engine.transaction(tx => fn(sqlQueryForEngine(tx))),
+  });
 
   let accessToken: string | undefined;
   let tokenExpiresAt: string | undefined;
@@ -944,10 +948,10 @@ PRESETS
                  SNAPSHOT of all current non-archived sources EXCLUDING other
                  agents' *-workspace sources (agent scratch — share one via an
                  explicit --federated-read). New sources need a re-grant via
-                 \`gbrain auth rescope-client\`. Surface: starter.
+                 \`gbrain auth rescope-client\`. Surface: full.
   coding-agent   write-isolated: writes land in <name>${WORKSPACE_SUFFIX} (auto-created,
                  DB-only). Requires --federated-read (the project sources it may
-                 read). Surface: starter.
+                 read). Surface: full.
 
 NOTES
   Runs on the BRAIN HOST (a thin client is refused). Every block embeds the

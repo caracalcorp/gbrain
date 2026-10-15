@@ -5,7 +5,7 @@
       "args": [
         "serve",
         "--surface",
-        "starter",
+        "full",
         "--source-guard"
       ],
       "cwd": ".",
@@ -20,6 +20,7 @@
         "GBRAIN_BIN",
         "GBRAIN_BRAIN_ID",
         "GBRAIN_CHAT_FALLBACK_CHAIN",
+        "GBRAIN_CHAT_FALLBACK_ON_REFUSAL",
         "GBRAIN_CHAT_MODEL",
         "GBRAIN_DATABASE_URL",
         "GBRAIN_EMBEDDING_DIMENSIONS",
@@ -39,6 +40,7 @@
         "GBRAIN_REMOTE_CLIENT_SECRET",
         "GBRAIN_RETRIEVAL_REFLEX",
         "GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS",
+        "GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER",
         "GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS",
         "GBRAIN_SOURCE",
         "GBRAIN_SURFACE",
@@ -46,12 +48,14 @@
         "GOOGLE_GENERATIVE_AI_API_KEY",
         "GROQ_API_KEY",
         "HOME",
+        "JEV_TYPESAFE_API_KEY",
         "LITELLM_API_KEY",
         "LITELLM_BASE_URL",
         "LLAMA_SERVER_API_KEY",
         "LLAMA_SERVER_BASE_URL",
         "LLAMA_SERVER_RERANKER_API_KEY",
         "LLAMA_SERVER_RERANKER_BASE_URL",
+        "LMSTUDIO_API_KEY",
         "LMSTUDIO_BASE_URL",
         "MINIMAX_API_KEY",
         "MISTRAL_API_KEY",
@@ -68,8 +72,8 @@
         "PERPLEXITY_API_KEY",
         "PPLX_API_KEY",
         "TOGETHER_API_KEY",
+        "TYPESAFE_API_KEY",
         "VOYAGE_API_KEY",
-        "ZEROENTROPY_API_KEY",
         "ZHIPUAI_API_KEY"
       ]
     }

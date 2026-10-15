@@ -13,12 +13,16 @@ import { join } from 'path';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import {
-  hasDatabase, setupDB, teardownDB, getEngine, getConn,
-  importFixtures, importFixture, time, dumpDBState, FIXTURES_PATH,
+  hasDatabase, setupDB, setupLegacyEmbeddingDB, teardownDB, getEngine, getConn,
+  importFixtures, importFixture, dumpDBState, FIXTURES_PATH,
 } from './helpers.ts';
 import { operationsByName, operations } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
 import { importFromContent } from '../../src/core/import-file.ts';
+import { LEGACY_EMBEDDING_CONFIG } from '../helpers/legacy-embedding-config.ts';
+import { configureGateway } from '../../src/core/ai/gateway.ts';
+import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
+import { cliDiagnostic, fixtureDiagnostic } from '../helpers/fixture-diagnostics.ts';
 
 // Skip all E2E tests if no database is configured
 const skip = !hasDatabase();
@@ -141,7 +145,8 @@ describeE2E('E2E: Page CRUD', () => {
   });
 
   test('delete_page removes page and others survive', async () => {
-    await callOp('delete_page', { slug: 'sources/crustdata-sarah-chen' });
+    const current = await callOp('get_page', { slug: 'sources/crustdata-sarah-chen' }) as any;
+    await callOp('delete_page', { slug: current.slug, expected_revision: current.revision });
     const stats = await callOp('get_stats') as any;
     expect(stats.page_count).toBe(15);
 
@@ -502,7 +507,9 @@ describeE2E('E2E: Versions', () => {
 
     // Revert to first version
     const firstVersion = versions[versions.length - 1];
-    await callOp('revert_version', { slug: 'people/sarah-chen', version_id: firstVersion.id });
+    const current = await callOp('get_page', { slug: 'people/sarah-chen' }) as any;
+    await callOp('revert_version', { slug: current.slug, version_id: firstVersion.id,
+      expected_revision: current.revision });
 
     const reverted = await callOp('get_page', { slug: 'people/sarah-chen' }) as any;
     expect(reverted.compiled_truth).not.toContain('(Modified)');
@@ -834,7 +841,7 @@ describeE2E('E2E: Idempotency', () => {
 
 describeE2E('E2E: Setup Journey', () => {
   beforeAll(async () => {
-    await setupDB();
+    await setupLegacyEmbeddingDB();
   }, 30_000);
   afterAll(teardownDB);
 
@@ -850,7 +857,8 @@ describeE2E('E2E: Setup Journey', () => {
     // inits in the file honor persisted config per D5 (no flag needed).
     const result = Bun.spawnSync({
       cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!,
-            '--embedding-model', 'openai:text-embedding-3-large'],
+            '--embedding-model', LEGACY_EMBEDDING_CONFIG.embedding_model,
+            '--embedding-dimensions', String(LEGACY_EMBEDDING_CONFIG.embedding_dimensions)],
       cwd: cliCwd,
       env: cliEnv(),
       timeout: 15_000,
@@ -1098,7 +1106,42 @@ describeE2E('E2E: RLS Verification', () => {
     }
   });
 
-  test('gbrain doctor fails with exit 1 when a public table is missing RLS', async () => {
+  // #4939: doctor fails a missing-RLS table only when the public schema may be
+  // reachable with the anon key (PostgREST roles or a Supabase URL). The
+  // fail-path tests below create the PostgREST `anon` role for their duration.
+  async function withPostgrestRole<T>(fn: () => Promise<T>): Promise<T> {
+    const conn = getConn();
+    const existed = (await conn.unsafe(`SELECT 1 FROM pg_roles WHERE rolname = 'anon'`)).length > 0;
+    if (!existed) await conn.unsafe(`CREATE ROLE anon NOLOGIN`);
+    try { return await fn(); } finally { if (!existed) await conn.unsafe(`DROP ROLE IF EXISTS anon`); }
+  }
+
+  test('gbrain doctor warns, not fails, on a missing-RLS table when nothing exposes the public schema (#4939)', async () => {
+    const conn = getConn();
+    const tbl = `gbrain_rls_plain_pg_${suffix}`;
+    try {
+      Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cwd: cliCwd, env: cliEnv(), timeout: 15_000,
+      });
+      expect((await conn.unsafe(`SELECT 1 FROM pg_roles WHERE rolname IN ('anon','authenticated','authenticator','service_role')`)).length).toBe(0);
+      await conn.unsafe(`CREATE TABLE public.${tbl} (id int)`);
+      await conn.unsafe(`ALTER TABLE public.${tbl} DISABLE ROW LEVEL SECURITY`);
+      const result = Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'doctor', '--json'],
+        cwd: cliCwd, env: cliEnv(), timeout: 20_000,
+      });
+      const rls = JSON.parse(new TextDecoder().decode(result.stdout)).checks.find((c: any) => c.name === 'rls');
+      expect(rls.status).toBe('warn');
+      expect(rls.message).toContain(tbl);
+      expect(rls.message).toContain('No PostgREST exposure detected');
+      expect(rls.message).toContain('ENABLE ROW LEVEL SECURITY');
+    } finally {
+      await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
+    }
+  }, 60_000);
+
+  test('gbrain doctor fails with exit 1 when a public table is missing RLS', () => withPostgrestRole(async () => {
     const conn = getConn();
     const tbl = `gbrain_rls_regression_${suffix}`;
     try {
@@ -1141,7 +1184,7 @@ describeE2E('E2E: RLS Verification', () => {
       const v35sql = (MIGRATIONS.find(m => m.version === 35)?.sqlFor as any)?.postgres;
       if (v35sql) await conn.unsafe(v35sql);
     }
-  }, 60_000);
+  }), 60_000);
 
   test('GBRAIN:RLS_EXEMPT comment with valid reason exempts a non-RLS public table', async () => {
     const conn = getConn();
@@ -1170,7 +1213,7 @@ describeE2E('E2E: RLS Verification', () => {
     }
   }, 60_000);
 
-  test('GBRAIN:RLS_EXEMPT comment WITHOUT reason= still fails doctor', async () => {
+  test('GBRAIN:RLS_EXEMPT comment WITHOUT reason= still fails doctor', () => withPostgrestRole(async () => {
     const conn = getConn();
     const tbl = `gbrain_rls_exempt_bad_${suffix}`;
     try {
@@ -1196,9 +1239,9 @@ describeE2E('E2E: RLS Verification', () => {
     } finally {
       await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
     }
-  }, 60_000);
+  }), 60_000);
 
-  test('Non-exempt unrelated COMMENT on a no-RLS table still fails doctor', async () => {
+  test('Non-exempt unrelated COMMENT on a no-RLS table still fails doctor', () => withPostgrestRole(async () => {
     const conn = getConn();
     const tbl = `gbrain_rls_comment_${suffix}`;
     try {
@@ -1222,7 +1265,7 @@ describeE2E('E2E: RLS Verification', () => {
     } finally {
       await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
     }
-  }, 60_000);
+  }), 60_000);
 
   // Regression test for the v24 self-healing guard. If an operator manually
   // drops budget_ledger and/or budget_reservations (they are migration-only
@@ -1343,50 +1386,56 @@ describeE2E('E2E: Doctor Command', () => {
   // entries from in-flight workspaces (e.g. v0.31.x santiago) would make the
   // minions_migration check fail and exit 1, masking real DB-health failures.
   let gbrainHome: string;
+  let doctorDatabase: Awaited<ReturnType<typeof isolatedPersistencePostgres>> | undefined;
+  let doctorUrl: string;
 
   beforeAll(async () => {
-    await setupDB();
-    await importFixtures();
+    // The shared reset preserves OAuth clients and other durable state. The
+    // delegated-grant fixture deliberately leaves an empty confidential hash,
+    // which doctor correctly rejects. A healthy-brain assertion owns its DB.
+    configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: {} });
+    doctorDatabase = await isolatedPersistencePostgres(process.env.DATABASE_URL!);
+    const [{ name }] = await doctorDatabase.engine.executeRaw<{ name: string }>('SELECT current_database() AS name');
+    const url = new URL(process.env.DATABASE_URL!);
+    url.pathname = `/${name}`;
+    doctorUrl = url.toString();
+    await importFixtures(doctorDatabase.engine);
     // Isolate GBRAIN_HOME to a per-block tempdir so the developer's
     // ~/.gbrain/migrations/completed.jsonl ledger doesn't leak in. Without
     // this, doctor reads the dev machine state — partial v0.21/v0.22.4/v0.28.0
     // migration entries from in-flight workspaces — and surfaces them as the
     // 'minions_migration' [FAIL] check, exiting with code 1.
     gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-doctor-e2e-'));
-    // Cross-file isolation: prior E2E files can leave non-default `sources`
-    // rows (e.g. 'delta' from autopilot/sources tests). Doctor's
-    // sync_freshness + cycle_freshness checks then FAIL on those orphans,
-    // exit 1, breaking 'doctor exits 0 on healthy DB'. setupDB TRUNCATEs
-    // sources but schema.sql re-seeds 'default' via initSchema; clean any
-    // other rows so the doctor sees a clean single-source brain.
-    const conn = getConn();
-    await conn`DELETE FROM sources WHERE id != 'default'`;
   }, 30_000);
   afterAll(async () => {
-    await teardownDB();
+    await doctorDatabase?.close();
     if (gbrainHome) rmSync(gbrainHome, { recursive: true, force: true });
   });
 
   const cliCwd = join(import.meta.dir, '../..');
   const cliEnv = () => ({
     ...process.env,
-    DATABASE_URL: process.env.DATABASE_URL!,
-    GBRAIN_DATABASE_URL: process.env.DATABASE_URL!,
+    DATABASE_URL: doctorUrl,
+    GBRAIN_DATABASE_URL: doctorUrl,
+    GBRAIN_DIRECT_DATABASE_URL: doctorUrl,
     GBRAIN_HOME: gbrainHome,
   });
 
   test('gbrain doctor exits 0 on healthy DB', () => {
     // Init first so config exists for CLI. Pin --embedding-model explicitly
-    // so the spawned doctor doesn't pick a different default (e.g. ZE-1280d
-    // when ZEROENTROPY_API_KEY is in env) that mismatches the 1536d schema
-    // setupDB initialized, producing a WARN-status embedding_width_consistency
-    // check and exit 1. Mirrors the same pattern in 'Setup Journey'.
-    Bun.spawnSync({
+    // so the spawned doctor doesn't pick a different default (e.g. Voyage-1024d
+    // when VOYAGE_API_KEY is in env) that mismatches the fixture's
+    // 1536d schema. Mirrors the same pattern in 'Setup Journey'.
+    const init = Bun.spawnSync({
       cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive',
-            '--url', process.env.DATABASE_URL!,
-            '--embedding-model', 'openai:text-embedding-3-large'],
+            '--url', doctorUrl,
+            '--embedding-model', LEGACY_EMBEDDING_CONFIG.embedding_model,
+            '--embedding-dimensions', String(LEGACY_EMBEDDING_CONFIG.embedding_dimensions)],
       cwd: cliCwd, env: cliEnv(), timeout: 15_000,
     });
+    expect(init.exitCode, cliDiagnostic('doctor fixture init', {
+      exitCode: init.exitCode, stdout: new TextDecoder().decode(init.stdout), stderr: new TextDecoder().decode(init.stderr),
+    }, [doctorUrl])).toBe(0);
     const result = Bun.spawnSync({
       cmd: ['bun', 'run', 'src/cli.ts', 'doctor'],
       cwd: cliCwd,
@@ -1396,8 +1445,9 @@ describeE2E('E2E: Doctor Command', () => {
     if (result.exitCode !== 0) {
       const stdout = new TextDecoder().decode(result.stdout);
       const stderr = new TextDecoder().decode(result.stderr);
-      console.error('doctor stdout:', stdout.slice(-2000));
-      console.error('doctor stderr:', stderr.slice(-1000));
+      const failedChecks = stdout.split('\n').filter(line => /^\s*\[FAIL\]/.test(line));
+      console.error(fixtureDiagnostic('doctor failed checks', failedChecks.join('\n') || '(none rendered)', [doctorUrl]));
+      console.error(cliDiagnostic('doctor', { exitCode: result.exitCode, stdout, stderr }, [doctorUrl]));
     }
     expect(result.exitCode).toBe(0);
   }, 60_000);
@@ -1414,6 +1464,11 @@ describeE2E('E2E: Doctor Command', () => {
     expect(parsed.status).toBeDefined();
     expect(Array.isArray(parsed.checks)).toBe(true);
     expect(parsed.checks.length).toBeGreaterThan(0);
+    expect(result.exitCode, cliDiagnostic('doctor --json', {
+      exitCode: result.exitCode, stdout, stderr: new TextDecoder().decode(result.stderr),
+    }, [doctorUrl])).toBe(0);
+    expect(parsed.checks.filter((check: { status: string }) => check.status === 'fail')).toEqual([]);
+    expect(parsed.checks.find((check: { name: string }) => check.name === 'oauth_confidential_client_health')?.status).toBe('ok');
     for (const check of parsed.checks) {
       expect(['ok', 'warn', 'fail']).toContain(check.status);
       expect(typeof check.name).toBe('string');
@@ -1541,40 +1596,4 @@ describeE2E('E2E: Parallel Import', () => {
     expect(stats.page_count).toBe(seqPageCount);
     expect(stats.chunk_count).toBe(seqChunkCount);
   }, 60_000);
-});
-
-// ─────────────────────────────────────────────────────────────────
-// Performance Baselines
-// ─────────────────────────────────────────────────────────────────
-
-describeE2E('E2E: Performance Baselines', () => {
-  beforeAll(async () => {
-    await setupDB();
-  }, 30_000);
-  afterAll(teardownDB);
-
-  test('import + search + link performance', async () => {
-    const [_, importMs] = await time(importFixtures);
-
-    const searchTimes: number[] = [];
-    for (const q of ['NovaMind', 'hybrid search', 'Stanford', 'investor', 'compiled truth']) {
-      const [__, ms] = await time(() => callOp('search', { query: q }));
-      searchTimes.push(ms);
-    }
-
-    const [___, linkMs] = await time(async () => {
-      await callOp('add_link', { from: 'people/sarah-chen', to: 'companies/novamind' });
-      await callOp('get_backlinks', { slug: 'companies/novamind' });
-    });
-
-    searchTimes.sort((a, b) => a - b);
-    const p50 = searchTimes[Math.floor(searchTimes.length * 0.5)];
-    const p99 = searchTimes[searchTimes.length - 1];
-
-    console.log('\n  Performance Baselines:');
-    console.log(`    Import 13 fixtures: ${importMs.toFixed(0)}ms`);
-    console.log(`    Search p50: ${p50.toFixed(0)}ms`);
-    console.log(`    Search p99: ${p99.toFixed(0)}ms`);
-    console.log(`    Link + backlink: ${linkMs.toFixed(0)}ms`);
-  }, 30_000);
 });

@@ -1,3 +1,5 @@
+import { parseSubmissionAuthority, type SubmissionAuthority } from './submission-authority.ts';
+import { parseSpendAuthorization, type JobSpendContext, type SpendAuthorization } from './spend-record.ts';
 /**
  * Minions — BullMQ-inspired Postgres-native job queue for GBrain.
  *
@@ -39,6 +41,12 @@ export interface MinionJob {
   status: MinionJobStatus;
   priority: number;
   data: Record<string, unknown>;
+  /** Internal authority column; never accepted from job data or remote options. */
+  submission_authority?: SubmissionAuthority | null;
+  /** Submit-time spend authorization (spend-authorization.ts); never read from job data. */
+  spend_authorization?: SpendAuthorization | null;
+  /** The column holds a value the strict parser rejects; the worker refuses to run the job. */
+  spend_authorization_invalid?: true;
 
   // Retry
   max_attempts: number;
@@ -264,6 +272,10 @@ export interface MinionJobContext {
   id: number;
   name: string;
   data: Record<string, unknown>;
+  /** Internal authority column; never accepted from job data or remote options. */
+  submission_authority?: SubmissionAuthority | null;
+  /** Set by runWithJobSpend for a spend-authorized job: its group record and meter key. */
+  spend?: JobSpendContext;
   attempts_made: number;
   /** AbortSignal for cooperative cancellation (fires on timeout, cancel, pause, or lock loss). */
   signal: AbortSignal;
@@ -426,15 +438,14 @@ export const ABORT_REASON_TIMEOUT = 'timeout';
 
 // --- Errors ---
 
-/** Throw this from a handler to skip all retry logic and go straight to 'dead'. */
-export class UnrecoverableError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'UnrecoverableError';
-  }
-}
+export { JobDeferredError, UnrecoverableError } from './errors.ts';
 
 // --- Row Mapping ---
+
+function spendAuthorizationFields(raw: unknown): Pick<MinionJob, 'spend_authorization' | 'spend_authorization_invalid'> {
+  try { return { spend_authorization: parseSpendAuthorization(raw) }; }
+  catch { return { spend_authorization: null, spend_authorization_invalid: true }; }
+}
 
 export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
   return {
@@ -443,6 +454,8 @@ export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
     queue: row.queue as string,
     status: row.status as MinionJobStatus,
     priority: row.priority as number,
+    submission_authority: parseSubmissionAuthority(row.submission_authority),
+    ...spendAuthorizationFields(row.spend_authorization),
     data: (typeof row.data === 'string' ? JSON.parse(row.data) : row.data ?? {}) as Record<string, unknown>,
     max_attempts: row.max_attempts as number,
     attempts_made: row.attempts_made as number,
@@ -558,9 +571,9 @@ export interface SubagentHandlerData {
    */
   source_id?: string;
   /**
-   * #4217 — when true, a job whose put_page writes were ALL attempted-and-
-   * failed FAILS (UnrecoverableError → dead, idempotency key released)
-   * instead of reporting `completed` with zero pages. Set by the dream
+   * When true, a job must complete at least one put_page write or FAIL
+   * (UnrecoverableError → dead, idempotency key released) instead of
+   * reporting `completed` with zero pages. Set by the dream
    * synthesize + patterns fan-outs (jobs whose entire purpose is writing
    * pages). Left unset for open-ended `gbrain agent run` jobs, where one
    * rejected write plus a useful read-only answer is a legitimate
@@ -568,6 +581,14 @@ export interface SubagentHandlerData {
    * Same trust story as `allowed_slug_prefixes` (PROTECTED_JOB_NAMES).
    */
   require_writes?: boolean;
+  /**
+   * #5540 — only meaningful with `require_writes: true`. A clean finish
+   * (`end_turn`) with zero attempted put_page calls completes instead of
+   * dead-lettering when at least one tool execution completed. All attempted
+   * writes failing, a dirty stop, or a prose-only finish still fail. Workers
+   * that predate the field ignore it and keep the strict behavior.
+   */
+  allow_clean_zero_writes?: boolean;
   /**
    * #4216 — synthesis execution mode. 'oneshot' = single structured
    * completion + programmatic validated writes, falling back to the agentic
@@ -584,6 +605,14 @@ export interface SubagentHandlerData {
    * discipline. Set by the dream fan-out alongside `mode`.
    */
   oneshot_slug_suffix?: string;
+  /**
+   * #6160 — the namespaces a oneshot synthesis child may write (the cycle's
+   * resolved reflections and originals prefixes). Oneshot validation uses
+   * them as its task shapes instead of guessing from the allow-list's
+   * spelling, so root-level and custom namespaces validate. Absent on jobs
+   * queued by older builds, which keep the allow-list derivation.
+   */
+  oneshot_task_prefixes?: string[];
   /**
    * v0.41 Approach C: opt out of the auto-generated tool-usage preamble
    * that `buildSystemPrompt()` splices into `system`. Default behavior
@@ -751,4 +780,10 @@ export interface SubagentResult {
   written_refs?: Array<{ slug: string; status: 'complete' | 'failed' }>;
   /** #4216 — true when a retried oneshot job finalized from a prior invocation's ledger. */
   recovered?: boolean;
+  /**
+   * #5590 — true when the oneshot model answered with the explicit skip
+   * contract (`{"pages":[],"skipped":true}`): a legitimate zero-write
+   * completion that `require_writes` must not dead-letter.
+   */
+  oneshot_skipped?: boolean;
 }
